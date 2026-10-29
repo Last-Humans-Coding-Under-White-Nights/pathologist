@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 trace-db = { workspace = true }
+trace-ir = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true
 rusqlite.workspace = true

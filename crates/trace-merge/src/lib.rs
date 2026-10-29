@@ -10,10 +10,14 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trace_db::{MultiInstance, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
+use trace_db::{MultiInstance, SequencingMarker, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
+
+/// Call-order graph ids read from an input at a time.
+const CFG_READ_CHUNK: i64 = 1024;
 
 // Use the same projections for capability checks and ingestion. Additive v7
 // flow metadata is optional here because the merger only preserves call graphs.
@@ -25,6 +29,9 @@ const READ_TARGET_DEPENDENCIES: &str =
     "SELECT target_id, dependency_id FROM target_dependencies ORDER BY target_id, dependency_id";
 const READ_FUNCTIONS: &str = "SELECT id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep, is_weak, target_id \
              FROM functions ORDER BY id";
+/// Each call-order event's sites, by event, in site order.
+const READ_EVENT_SITES: &str =
+    "SELECT event_id, call_site_id FROM cfg_event_sites ORDER BY event_id, ordinal";
 const READ_CALL_SITES: &str = "SELECT id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct \
              FROM call_sites ORDER BY id";
 const READ_CALL_EDGES: &str = "SELECT id, call_site_id, caller_fn_id, callee_fn_id, resolution \
@@ -35,7 +42,6 @@ const READ_DIAGNOSTICS: &str =
 // contributes no rows; a table that is present must have these columns.
 const READ_EXECUTION_CONTEXTS: &str = "SELECT kind, entry_fn_id, call_site_id, api_fn_id, param_index, model, multi_instance, self_concurrent \
              FROM execution_contexts ORDER BY id";
-
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
     pub output: PathBuf,
@@ -77,6 +83,99 @@ pub enum WarningKind {
     /// An input exported before `execution_contexts` existed: it contributes
     /// no execution contexts to the merged database.
     MissingExecutionContexts,
+    /// An input analysed without `--sequencing` while another was: its
+    /// functions have no call-order graph in the merged database.
+    MissingSequencing,
+}
+
+/// A key per merged call site (by index), equal for the sites of two inputs
+/// that one body compiled alike gave: the same caller, position, callee
+/// spelling and directness, and the same count of such sites before it in
+/// its input. Sites of one input share a key only when they are
+/// alternatives of one event (`alternatives`: the sites of each event with
+/// several) and spelled alike, as a merged input lists another input's
+/// copy of a header body's call: they count as the one site each input
+/// had, so merging a merged input again keys them as merging the inputs at
+/// once does.
+fn site_keys(
+    sites: &[DbCallSite],
+    input_sites: &[std::ops::Range<usize>],
+    alternatives: &[Vec<usize>],
+) -> Vec<u32> {
+    type Key<'s> = (
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        &'s str,
+        i64,
+    );
+    fn key(cs: &DbCallSite) -> Key<'_> {
+        (
+            cs.caller_fn_id,
+            cs.file_id,
+            cs.line,
+            cs.col,
+            cs.expansion_file_id,
+            cs.expansion_line,
+            cs.expansion_col,
+            cs.callee_text.as_str(),
+            cs.is_direct,
+        )
+    }
+    // Each alternative's earliest equal alternative.
+    let mut first: FxHashMap<usize, usize> = FxHashMap::default();
+    let root = |first: &FxHashMap<usize, usize>, mut s: usize| {
+        while let Some(&p) = first.get(&s) {
+            s = p;
+        }
+        s
+    };
+    for event in alternatives {
+        let mut by_key: FxHashMap<Key<'_>, usize> = FxHashMap::default();
+        for &site in event {
+            let earlier = *by_key.entry(key(&sites[site])).or_insert(site);
+            let (a, b) = (root(&first, site), root(&first, earlier));
+            if a != b {
+                first.insert(a.max(b), a.min(b));
+            }
+        }
+    }
+    let mut ids: FxHashMap<(Key<'_>, u32), u32> = FxHashMap::default();
+    let mut keys = vec![0; sites.len()];
+    for range in input_sites {
+        let mut repeats: FxHashMap<Key<'_>, u32> = FxHashMap::default();
+        for i in range.clone() {
+            let earlier = root(&first, i);
+            if earlier != i {
+                keys[i] = keys[earlier];
+                continue;
+            }
+            let key = key(&sites[i]);
+            let repeat = repeats.entry(key).or_default();
+            let next = ids.len() as u32;
+            keys[i] = *ids.entry((key, *repeat)).or_insert(next);
+            *repeat += 1;
+        }
+    }
+    keys
+}
+
+/// Prepare each `(table, query)` an input is read with, failing with the
+/// first table it lacks a column of.
+fn require_reads(conn: &Connection, path: &Path, reads: &[(&str, &str)]) -> Result<()> {
+    for (table, query) in reads {
+        conn.prepare(query).map_err(|error| {
+            anyhow::anyhow!(
+                "missing trace-merge capability in {} ({table}): {error}; re-analyze the input with the current trace version",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +416,8 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut conns = Vec::new();
     // Per input: whether it has the `execution_contexts` table.
     let mut has_contexts_table: Vec<bool> = Vec::new();
+    // Per input: whether `trace analyze --sequencing` wrote it.
+    let mut input_sequencing: Vec<SequencingMarker> = Vec::new();
     for path in &inputs {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
@@ -342,33 +443,41 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
         // Preparing every ingestion query checks required tables and columns,
         // including empty inputs, before any output is created or replaced.
-        for (table, query) in [
-            ("files", READ_FILES),
-            ("link_targets", READ_TARGETS),
-            ("target_sources", READ_TARGET_SOURCES),
-            ("target_dependencies", READ_TARGET_DEPENDENCIES),
-            ("functions", READ_FUNCTIONS),
-            ("call_sites", READ_CALL_SITES),
-            ("call_edges", READ_CALL_EDGES),
-            ("diagnostics", READ_DIAGNOSTICS),
-        ] {
-            conn.prepare(query).map_err(|error| {
-                anyhow::anyhow!(
-                    "missing trace-merge capability in {} ({table}): {error}; re-analyze the input with the current trace version",
-                    path.display()
-                )
-            })?;
-        }
+        require_reads(
+            &conn,
+            path,
+            &[
+                ("files", READ_FILES),
+                ("link_targets", READ_TARGETS),
+                ("target_sources", READ_TARGET_SOURCES),
+                ("target_dependencies", READ_TARGET_DEPENDENCIES),
+                ("functions", READ_FUNCTIONS),
+                ("call_sites", READ_CALL_SITES),
+                ("call_edges", READ_CALL_EDGES),
+                ("diagnostics", READ_DIAGNOSTICS),
+            ],
+        )?;
         let has_contexts = trace_db::table_exists(&conn, "execution_contexts")?;
         if has_contexts {
-            conn.prepare(READ_EXECUTION_CONTEXTS).map_err(|error| {
-                anyhow::anyhow!(
-                    "missing trace-merge capability in {} (execution_contexts): {error}; re-analyze the input with the current trace version",
-                    path.display()
-                )
-            })?;
+            require_reads(
+                &conn,
+                path,
+                &[("execution_contexts", READ_EXECUTION_CONTEXTS)],
+            )?;
         }
         has_contexts_table.push(has_contexts);
+        let sequencing = SequencingMarker::read(&conn).with_context(|| {
+            format!(
+                "failed to read the call-sequencing marker of {}",
+                path.display()
+            )
+        })?;
+        // Read only from an input analysed with `--sequencing`, whose
+        // tables must then have every column.
+        if sequencing != SequencingMarker::Absent {
+            require_reads(&conn, path, &trace_db::CFG_READS)?;
+        }
+        input_sequencing.push(sequencing);
         conns.push(conn);
     }
 
@@ -700,8 +809,11 @@ pub fn merge_databases<P: AsRef<Path>>(
     // 4. Call Sites Ingestion & Remapping
     let mut unified_call_sites: Vec<DbCallSite> = Vec::new();
     let mut cs_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
+    // Per input: its sites' indices in `unified_call_sites`.
+    let mut input_sites: Vec<std::ops::Range<usize>> = Vec::with_capacity(inputs.len());
 
     for (db_idx, conn) in conns.iter().enumerate() {
+        let first_site = unified_call_sites.len();
         let mut stmt = conn.prepare(READ_CALL_SITES)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbCallSite {
@@ -746,6 +858,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                 is_direct: cs.is_direct,
             });
         }
+        input_sites.push(first_site..unified_call_sites.len());
     }
     report.call_sites_total = unified_call_sites.len();
 
@@ -1033,6 +1146,124 @@ pub fn merge_databases<P: AsRef<Path>>(
     }
     let unified_contexts = unify_execution_contexts(carried_contexts);
 
+    // 5c. Call-order graphs, carried over with remapped ids. A function
+    // keeps one graph per distinct body, numbered in input order, as
+    // `trace analyze` keeps configuration variants (both through
+    // `trace_ir::add_variant`): a body several inputs share (a header
+    // function merged above) is kept once when they compile it alike and
+    // once more per different graph. Inputs share no call sites, so bodies
+    // are compared with each site standing for its key (`site_keys`). An
+    // event none of whose sites was carried is spliced out, leaving an
+    // `omitted_sites` gap. Graphs are read a chunk of ids at a time, and a
+    // kept graph is held once, beside the hash of its keyed form; neither
+    // side of a comparison is copied to compare it.
+    let mut unified_cfgs: BTreeMap<trace_ir::FnId, Vec<trace_ir::FunctionCfg>> = BTreeMap::new();
+    let mut cfg_hashes: FxHashMap<trace_ir::FnId, Vec<u64>> = FxHashMap::default();
+    let any_sequenced = input_sequencing
+        .iter()
+        .any(|&s| s != SequencingMarker::Absent);
+    let site_key = if any_sequenced {
+        // The sites of each event with several, in site order.
+        let mut alternatives: Vec<Vec<usize>> = Vec::new();
+        for (db_idx, conn) in conns.iter().enumerate() {
+            if input_sequencing[db_idx] == SequencingMarker::Absent {
+                continue;
+            }
+            let mut stmt = conn.prepare(READ_EVENT_SITES)?;
+            let mut rows = stmt.query([])?;
+            let mut event = None;
+            let mut group = Vec::new();
+            while let Some(r) = rows.next()? {
+                let (id, site): (i64, i64) = (r.get(0)?, r.get(1)?);
+                if event != Some(id) {
+                    event = Some(id);
+                    if group.len() > 1 {
+                        alternatives.push(std::mem::take(&mut group));
+                    }
+                    group.clear();
+                }
+                if let Some(&merged) = cs_remap[db_idx].get(&site) {
+                    group.push(merged as usize - 1);
+                }
+            }
+            if group.len() > 1 {
+                alternatives.push(group);
+            }
+        }
+        site_keys(&unified_call_sites, &input_sites, &alternatives)
+    } else {
+        Vec::new()
+    };
+    // A merged site's key.
+    let merged_key = |s: trace_ir::CallSiteId| trace_ir::CallSiteId(site_key[s.0 as usize - 1]);
+    for (db_idx, conn) in conns.iter().enumerate() {
+        if input_sequencing[db_idx] == SequencingMarker::Absent {
+            if any_sequenced {
+                report.warnings.push(MergeWarning {
+                    kind: WarningKind::MissingSequencing,
+                    message: format!(
+                        "input {} was analysed without --sequencing; its functions have no call-order graph (re-analyze it with `trace analyze --sequencing` to include them)",
+                        inputs[db_idx].display()
+                    ),
+                    symbol: None,
+                    file_id: None,
+                    line: 0,
+                });
+            }
+            continue;
+        }
+        let files = &file_remap[db_idx];
+        // Every graph's files are checked to be in `files` before it is
+        // mapped.
+        let map_file = |f: trace_ir::FileId| trace_ir::FileId(files[&i64::from(f.0)] as u32);
+        let map_site = |s: trace_ir::CallSiteId| {
+            cs_remap[db_idx]
+                .get(&i64::from(s.0))
+                .map(|&id| trace_ir::CallSiteId(id as u32))
+        };
+        let last: i64 =
+            conn.query_row("SELECT COALESCE(MAX(id), 0) FROM cfg_functions", [], |r| {
+                r.get(0)
+            })?;
+        for first in (1..=last).step_by(CFG_READ_CHUNK as usize) {
+            let chunk =
+                trace_db::CfgId(first)..=trace_db::CfgId(first.saturating_add(CFG_READ_CHUNK - 1));
+            for stored in trace_db::read_cfgs(conn, chunk)? {
+                let cfg = stored.cfg;
+                if let Some(file) = cfg.files().find(|f| !files.contains_key(&i64::from(f.0))) {
+                    bail!(
+                        "call-order graph {} of {} names file id {}, which is not in its files table",
+                        stored.id,
+                        inputs[db_idx].display(),
+                        file.0
+                    );
+                }
+                let function = *fn_remap[db_idx]
+                    .get(&i64::from(cfg.function.0))
+                    .context("missing remapped fn_id for cfg_functions")?;
+                let function = trace_ir::FnId(function as u32);
+                let kept = unified_cfgs.entry(function).or_default();
+                let hashes = cfg_hashes.entry(function).or_default();
+                let added = trace_ir::add_variant(
+                    kept,
+                    Some(hashes),
+                    &cfg,
+                    function,
+                    map_site,
+                    map_file,
+                    merged_key,
+                );
+                if let Err(at) = added {
+                    // Its sites may call what the kept graph's do not (a
+                    // callback this input passes): they join the kept
+                    // events as alternatives. Their keys repeat the kept
+                    // ones, so the keyed form and its hash are unchanged.
+                    kept[at].add_alternatives_from(&cfg, map_site);
+                }
+            }
+        }
+    }
+
     // 6. Diagnostics Ingestion
     let mut unified_diagnostics: Vec<DbDiagnostic> = Vec::new();
     for (db_idx, conn) in conns.iter().enumerate() {
@@ -1072,6 +1303,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             WarningKind::WeakOverride => "info",
             WarningKind::DuplicateInput => "warning",
             WarningKind::MissingExecutionContexts => "info",
+            WarningKind::MissingSequencing => "info",
         };
         let new_diag_id = (unified_diagnostics.len() + 1) as i64;
         unified_diagnostics.push(DbDiagnostic {
@@ -1113,6 +1345,9 @@ pub fn merge_databases<P: AsRef<Path>>(
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
         out_conn.execute_batch(TABLES_V8)?;
         let mut strings = trace_db::TextPool::new(&out_conn)?;
+        if any_sequenced {
+            strings.seed_sequencing()?;
+        }
 
         // Record analysis_run for the merge
         let options_json = serde_json::json!({
@@ -1122,6 +1357,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             "external_calls_unresolved": report.external_calls_unresolved,
             "ambiguous_calls": report.ambiguous_calls,
             "warnings_count": report.warnings.len(),
+            "call_sequencing": SequencingMarker::merged(&input_sequencing).to_json(),
         })
         .to_string();
 
@@ -1220,6 +1456,8 @@ pub fn merge_databases<P: AsRef<Path>>(
                 ])?;
             }
         }
+
+        trace_db::export_cfg(&out_conn, unified_cfgs.values().flatten(), &mut strings)?;
 
         // Bulk insert call edges
         {

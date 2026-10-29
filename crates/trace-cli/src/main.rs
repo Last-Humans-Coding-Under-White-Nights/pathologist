@@ -115,6 +115,10 @@ enum Commands {
         /// Maximum number of configuration variants to explore per translation unit (#59).
         #[arg(long, default_value_t = 4)]
         explore_budget: usize,
+        /// Record per-function call-order graphs for `inspect sequence`
+        /// (opt-in; see docs/ANALYSIS.md, "Call sequencing").
+        #[arg(long)]
+        sequencing: bool,
         /// Solver work budget in worklist pops. The default scales with the
         /// PAG constraint count (800 000 + 6/constraint); 0 = unlimited.
         /// `TRACE_SOLVE_BUDGET_POPS` overrides this for experimentation.
@@ -293,6 +297,67 @@ enum InspectCommands {
         #[arg(long = "callgraph-filter")]
         callgraph_filter: Option<PathBuf>,
     },
+    /// Bounded call sequence of a function, from a call, or between two
+    /// calls, from a database analysed with `--sequencing`.
+    ///
+    /// Callees are inlined up to `--depth`; loops stay back edges, and
+    /// unknown callees, omitted bodies, recursion, thread/task starts and IPC
+    /// bridges are shown as boundaries. With `--to-*`, the relation of the
+    /// two calls is reported (docs/ANALYSIS.md, "Call sequencing").
+    Sequence {
+        /// Function name, C++ qualified suffix, or FILE:LINE: every variant
+        /// of its body.
+        #[arg(long, conflicts_with_all = ["line", "col", "callee"])]
+        function: Option<String>,
+        /// File path substring locating the starting call (or narrowing
+        /// `--function` to the bodies compiled from or written in it).
+        #[arg(long)]
+        file: Option<String>,
+        /// Line of the starting call (its spelling or macro invocation).
+        #[arg(long, requires = "file")]
+        line: Option<i64>,
+        /// Column of the starting call, when the line holds several.
+        #[arg(long, requires = "line")]
+        col: Option<i64>,
+        /// Callee name of the starting call, when the line holds several.
+        #[arg(long, requires = "line")]
+        callee: Option<String>,
+        /// File path substring locating the second call.
+        #[arg(long = "to-file", requires = "to_line")]
+        to_file: Option<String>,
+        /// Line of the second call.
+        #[arg(
+            long = "to-line",
+            requires_all = ["to_file", "line"],
+            conflicts_with = "function"
+        )]
+        to_line: Option<i64>,
+        /// Column of the second call.
+        #[arg(long = "to-col", requires = "to_line")]
+        to_col: Option<i64>,
+        /// Callee name of the second call.
+        #[arg(long = "to-callee", requires = "to_line")]
+        to_callee: Option<String>,
+        /// Call levels inlined below the starting function.
+        #[arg(long, default_value_t = trace_db::SequenceOptions::default().depth)]
+        depth: u32,
+        /// Events shown across all inlined functions.
+        #[arg(long = "max-events", default_value_t = trace_db::SequenceOptions::default().max_events)]
+        max_events: usize,
+        /// Function graphs shown, the starting ones included.
+        #[arg(long = "max-frames", default_value_t = trace_db::SequenceOptions::default().max_frames)]
+        max_frames: usize,
+        /// Targets of one call considered for inlining.
+        #[arg(long = "max-targets", default_value_t = trace_db::SequenceOptions::default().max_targets)]
+        max_targets: usize,
+        /// Inline the callbacks thread and task starts run (still unordered
+        /// against the starter).
+        #[arg(long = "inline-contexts")]
+        inline_contexts: bool,
+        /// Output format: `text`, `json`, `graphviz`, or `mermaid`.
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -398,6 +463,7 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            sequencing,
             solve_budget_pops,
             solve_budget_secs,
         } => run_analyze(
@@ -426,6 +492,7 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            sequencing,
             solve_budget_pops,
             solve_budget_secs,
         ),
@@ -472,6 +539,7 @@ fn run_analyze(
     no_ipc: bool,
     explore: bool,
     explore_budget: usize,
+    sequencing: bool,
     solve_budget_pops: Option<u64>,
     solve_budget_secs: Option<u64>,
 ) -> Result<()> {
@@ -582,7 +650,8 @@ fn run_analyze(
     }
     opts = opts
         .with_explore(explore)
-        .with_explore_budget(explore_budget);
+        .with_explore_budget(explore_budget)
+        .with_call_sequencing(sequencing);
 
     let mut effective_ignored_macros = Vec::new();
     if ignore_logging {
@@ -1100,6 +1169,62 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             );
             print!("{out}");
         }
+        InspectCommands::Sequence {
+            function,
+            file,
+            line,
+            col,
+            callee,
+            to_file,
+            to_line,
+            to_col,
+            to_callee,
+            depth,
+            max_events,
+            max_frames,
+            max_targets,
+            inline_contexts,
+            format,
+        } => {
+            let scope = match (function, file, line) {
+                (Some(name), file, _) => {
+                    trace_db::resolve_sequence_function(&conn, &name, file.as_deref())?
+                }
+                (None, Some(file), Some(line)) => {
+                    let from = trace_db::resolve_event(&conn, &file, line, col, callee.as_deref())?;
+                    match (to_file, to_line) {
+                        (Some(to_file), Some(to_line)) => {
+                            let to = trace_db::resolve_event(
+                                &conn,
+                                &to_file,
+                                to_line,
+                                to_col,
+                                to_callee.as_deref(),
+                            )?;
+                            trace_db::SequenceScope::Between(from, to)
+                        }
+                        _ => trace_db::SequenceScope::From(from),
+                    }
+                }
+                _ => {
+                    // A database that cannot answer says so before the usage.
+                    trace_db::require_sequencing(&conn)?;
+                    anyhow::bail!("give --function NAME, or --file FILE --line N")
+                }
+            };
+            let graph = trace_db::sequence_graph(
+                &conn,
+                &scope,
+                &trace_db::SequenceOptions {
+                    depth,
+                    max_events,
+                    max_frames,
+                    max_targets,
+                    inline_contexts,
+                },
+            )?;
+            print!("{}", trace_db::render_sequence(&graph, format.to_render())?);
+        }
     }
     Ok(())
 }
@@ -1176,6 +1301,19 @@ mod compiler_options_tests {
     }
 
     #[test]
+    fn sequencing_is_opt_in() {
+        let sequencing = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["trace", "analyze", "."].iter().chain(args)).unwrap();
+            let Commands::Analyze { sequencing, .. } = cli.command else {
+                panic!("analyze");
+            };
+            sequencing
+        };
+        assert!(!sequencing(&[]));
+        assert!(sequencing(&["--sequencing"]));
+    }
+
+    #[test]
     fn fallback_flags_require_explicit_discovery_and_driver() {
         for extra in [
             vec!["--compiler", "clang"],
@@ -1185,5 +1323,26 @@ mod compiler_options_tests {
             let args = ["trace", "analyze", "."].into_iter().chain(extra);
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod sequence_options_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    fn parses(extra: &[&str]) -> bool {
+        let args = ["trace", "inspect", "x.db", "sequence"].iter().chain(extra);
+        Cli::try_parse_from(args).is_ok()
+    }
+
+    #[test]
+    fn a_second_call_needs_a_starting_call() {
+        let to = ["--to-file", "b.c", "--to-line", "12"];
+        assert!(!parses(&to), "--to-line without --line");
+        assert!(parses(
+            &[&["--file", "b.c", "--line", "10"][..], &to[..]].concat()
+        ));
+        assert!(!parses(&[&["--function", "run"][..], &to[..]].concat()));
     }
 }

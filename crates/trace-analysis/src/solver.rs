@@ -987,6 +987,11 @@ fn solve(
     let resolve_started = std::time::Instant::now();
     let mut resolved_callees = 0usize;
     for cs in &program.symbols.call_sites {
+        // A call in an operand never evaluated never runs: no edge, no
+        // argument flow (docs/ANALYSIS.md, "Unevaluated operands").
+        if cs.unevaluated {
+            continue;
+        }
         // Direct sites: lowering saw the TU-local binding, so scope-first
         // resolution is exact per C visibility rules (file-`static` shadows
         // same-name externals inside its own TU).

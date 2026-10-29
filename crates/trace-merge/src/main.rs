@@ -47,6 +47,7 @@ fn main() -> Result<()> {
         let mut weak_overrides = Vec::new();
         let mut duplicates = Vec::new();
         let mut without_contexts = Vec::new();
+        let mut without_sequencing = Vec::new();
 
         for w in &report.warnings {
             match w.kind {
@@ -55,6 +56,7 @@ fn main() -> Result<()> {
                 WarningKind::WeakOverride => weak_overrides.push(w),
                 WarningKind::DuplicateInput => duplicates.push(w),
                 WarningKind::MissingExecutionContexts => without_contexts.push(w),
+                WarningKind::MissingSequencing => without_sequencing.push(w),
             }
         }
 
@@ -81,6 +83,10 @@ fn main() -> Result<()> {
 
         for w in &without_contexts {
             eprintln!("    [no-execution-contexts] {}", w.message);
+        }
+
+        for w in &without_sequencing {
+            eprintln!("    [no-sequencing] {}", w.message);
         }
 
         if cli.verbose {

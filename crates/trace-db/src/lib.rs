@@ -1,5 +1,36 @@
 //! SQLite export for trace analysis results.
 
+/// Database row ids the read APIs name, each typed by its table so one
+/// cannot stand for another; they serialize as the bare id.
+macro_rules! row_id {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+        #[serde(transparent)]
+        pub struct $name(pub i64);
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl rusqlite::ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                self.0.to_sql()
+            }
+        }
+
+        impl rusqlite::types::FromSql for $name {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
+                i64::column_result(value).map(Self)
+            }
+        }
+    };
+}
+
 mod export;
 mod filter;
 mod inspect;

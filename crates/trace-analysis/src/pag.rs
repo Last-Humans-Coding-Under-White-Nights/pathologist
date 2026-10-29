@@ -287,7 +287,9 @@ impl Pag {
             }
         }
         for cs in &program.symbols.call_sites {
-            if cs.is_direct {
+            // An unevaluated call never runs (docs/ANALYSIS.md,
+            // "Unevaluated operands").
+            if cs.is_direct || cs.unevaluated {
                 continue;
             }
             if let Some(&target) = self.call_targets.get(&cs.id) {
@@ -764,7 +766,7 @@ impl Pag {
             Vec<&trace_ir::CallSite>,
         > = FxHashMap::default();
         for cs in &program.symbols.call_sites {
-            if cs.receiver_class.is_none() && !cs.args_bound_past_this {
+            if cs.unevaluated || (cs.receiver_class.is_none() && !cs.args_bound_past_this) {
                 continue;
             }
             if let Some(dst_var) = cs.return_dst {
@@ -831,7 +833,12 @@ impl Pag {
     /// named by string constants in the name-argument node. Wired here
     /// (not in `apply_fn_model`) so later-arriving string constants still fire.
     fn build_dlsym_constraints(&mut self, program: &Program, models: &ModelLookup) {
-        for cs in &program.symbols.call_sites {
+        for cs in program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|cs| !cs.unevaluated)
+        {
             let Some(model) = models.model(&cs.callee_name, EffectGroup::Dlsym) else {
                 continue;
             };
@@ -983,7 +990,9 @@ impl Pag {
             }
         }
         for cs in &program.symbols.call_sites {
-            if cs.is_direct {
+            // An unevaluated call never runs (docs/ANALYSIS.md,
+            // "Unevaluated operands").
+            if cs.is_direct || cs.unevaluated {
                 continue;
             }
             if let Some(var) = cs.callee_var {

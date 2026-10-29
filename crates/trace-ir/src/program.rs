@@ -621,6 +621,12 @@ pub struct Program {
     /// Macros whose expansions are ignored during lowering (no call sites,
     /// flow constraints, or local variables).
     pub ignored_macros: Vec<String>,
+    /// Whether per-function call-order graphs are recorded (`--sequencing`;
+    /// docs/ANALYSIS.md, "Call sequencing (control-flow sidecar)").
+    pub call_sequencing: bool,
+    /// Call-order graphs by function; several entries are configuration
+    /// variants of one body. Ordered keys keep export deterministic.
+    pub cfgs: BTreeMap<FnId, Vec<crate::FunctionCfg>>,
 }
 
 impl Program {
@@ -660,6 +666,37 @@ impl Program {
             }
         }
         self.fn_returns = IndexMap::new();
+    }
+
+    /// List each `(source, added)`'s `added` as another target record of the
+    /// invocation `source` belongs to, in every graph naming `source`. For
+    /// post-merge site expansion; a source is never an earlier `added`.
+    pub fn attach_alternative_sites(&mut self, pairs: &[(CallSiteId, CallSiteId)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        // Each source's additions, tagged with their pair's position.
+        let mut added_to: FxHashMap<CallSiteId, Vec<(usize, CallSiteId)>> = FxHashMap::default();
+        for (at, &(source, added)) in pairs.iter().enumerate() {
+            added_to.entry(source).or_default().push((at, added));
+        }
+        let mut extra = Vec::new();
+        for event in self
+            .cfgs
+            .values_mut()
+            .flatten()
+            .flat_map(|cfg| &mut cfg.events)
+        {
+            extra.clear();
+            for site in &event.sites {
+                if let Some(added) = added_to.get(site) {
+                    extra.extend_from_slice(added);
+                }
+            }
+            // In pair order, as if each pair were applied in turn.
+            extra.sort_by_key(|&(at, _)| at);
+            event.add_alternative_sites(extra.iter().map(|&(_, added)| added));
+        }
     }
 
     /// Dependency roots whose headers contribute declarations but whose
@@ -1188,12 +1225,62 @@ mod tests {
             expansion_span: None,
             is_direct: false,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
             receiver: None,
             tu: None,
         }
+    }
+
+    fn one_event_cfg(function: u32, site: u32) -> crate::FunctionCfg {
+        crate::FunctionCfg {
+            function: FnId(function),
+            tu: None,
+            variant: 0,
+            entry: crate::BlockId(0),
+            exit: crate::BlockId(1),
+            exceptional_exit: None,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+            events: vec![crate::CallEvent {
+                block: crate::BlockId(2),
+                kind: crate::EventKind::Call,
+                occurrence: source_site(site, "call").occurrence(),
+                sites: vec![CallSiteId(site)],
+            }],
+            order: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn alternative_site_joins_the_event_in_every_variant() {
+        let mut program = Program::default();
+        program
+            .cfgs
+            .insert(FnId(1), vec![one_event_cfg(1, 4), one_event_cfg(1, 4)]);
+        program.cfgs.insert(FnId(2), vec![one_event_cfg(2, 5)]);
+        program.attach_alternative_sites(&[
+            (CallSiteId(4), CallSiteId(9)),
+            (CallSiteId(4), CallSiteId(10)),
+        ]);
+        for cfg in &program.cfgs[&FnId(1)] {
+            assert_eq!(
+                cfg.events[0].sites,
+                [CallSiteId(4), CallSiteId(9), CallSiteId(10)]
+            );
+        }
+        assert_eq!(program.cfgs[&FnId(2)][0].events[0].sites, [CallSiteId(5)]);
+    }
+
+    #[test]
+    fn alternative_of_an_unsequenced_site_is_ignored() {
+        let mut program = Program::default();
+        program.cfgs.insert(FnId(1), vec![one_event_cfg(1, 4)]);
+        program.attach_alternative_sites(&[(CallSiteId(6), CallSiteId(9))]);
+        assert_eq!(program.cfgs[&FnId(1)][0].events[0].sites, [CallSiteId(4)]);
     }
 
     #[test]

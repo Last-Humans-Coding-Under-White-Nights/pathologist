@@ -1,5 +1,171 @@
 # Evaluation Report
 
+## Unevaluated operands: #249 — 2026-10-28
+
+Calls in an operand the language never evaluates are tagged at lowering
+and get no call edge, argument or return flow
+([Unevaluated operands](ANALYSIS.md#unevaluated-operands)). On the pinned
+corpora only camera moves, by 9 edges, every one from a `decltype` operand:
+
+| Corpus | Count | Before | After |
+|--------|-------|-------:|------:|
+| camera | `edges_indirect` | 449 | 442 |
+| camera | `edges_external` | 46032 | 46030 |
+| camera | `edges_total` | 115754 | 115745 |
+
+- 7 indirect edges from `UnifiedPipelineThreadpool::Submit`
+  (`unified_pipeline_threadpool.h:70`, `using ReturnType =
+  decltype(f(args...));`) to the lambdas handed to it. The task really runs
+  them later through `std::bind` and `std::packaged_task`, which no model
+  covers; the removed edges came only from the type query.
+- `capture_session.cpp:1407` `decltype(StreamIntentMap_.find(...)) itr;`
+  (`std::unordered_map::find`) and `hcamera_service.cpp:3310`
+  `decltype(args.size()) index` (`vector::size`).
+
+HDF and hiview are unchanged; argument-flow edges and execution contexts are
+unchanged on all three.
+
+## Call-order sidecar: #248 — 2026-10-27
+
+What `trace analyze --sequencing` costs and what `trace inspect sequence`
+answers in, on the three pinned corpora (clean checkouts at the revisions in
+`scripts/eval_expected.json`) and the repository fixtures. Semantics live in
+[Call sequencing](ANALYSIS.md#call-sequencing-control-flow-sidecar); the
+tables in [Call sequencing tables](SQLITE_SCHEMA.md#call-sequencing-tables).
+
+**Setup.** Linux x86-64, 8 vCPUs (Intel Xeon, Skylake), 11 GiB RAM, release
+build (`cargo build --release -p trace-cli`), minimal export,
+`trace analyze <root> --jobs 8 [--sequencing]` run from the corpus root,
+with no solver budget variable set (the call-edge and argument-flow totals
+match `eval_expected.json` anyway). Wall time is the median of three runs
+per configuration; peak RSS is `/usr/bin/time -v` "Maximum resident set
+size" (all three runs within 2 %). Table bytes come from SQLite's `dbstat`
+(table pages, then the pages of the indexes on that table). The baseline is
+`1b6b5cf`, the commit before the feature, built the same way.
+
+**Flag off.** `python3 scripts/eval_check.py` passes all 106 checks, so the
+expectations are unchanged. Against the baseline, the logical rows of every
+analysis table are identical
+(`scripts/compare_analysis_databases.py`) on all three corpora. The only
+differences are the `"call_sequencing": false` key in
+`analysis_run.options_json` and the seven empty `cfg_*` tables with their
+indexes: 15 pages, 61,440 bytes per database. Wall time and peak RSS are
+within run-to-run noise:
+
+| Corpus | Baseline wall | Flag off wall | Baseline peak RSS | Flag off peak RSS |
+|---|---:|---:|---:|---:|
+| HDF | 14.60 s | 13.73 s | 329 MiB | 332 MiB |
+| HiView | 5.17 s | 5.06 s | 185 MiB | 187 MiB |
+| Camera | 22.19 s | 21.38 s | 579 MiB | 579 MiB |
+
+**Flag on: indexing cost.** Same binary, flag off vs on:
+
+| Corpus | Wall off → on | Peak RSS off → on | DB bytes off → on | `cfg_*` bytes (tables + indexes) |
+|---|---:|---:|---:|---:|
+| HDF | 14.05 → 14.40 s (+2.5 %) | 331 → 365 MiB (+10 %) | 47.1 → 62.6 MB (+33 %) | 8.9 + 6.5 MB |
+| HiView | 5.01 → 5.44 s (+8.6 %) | 186 → 198 MiB (+6 %) | 24.1 → 29.5 MB (+23 %) | 3.2 + 2.2 MB |
+| Camera | 20.97 → 22.12 s (+5.5 %) | 573 → 613 MiB (+7 %) | 62.7 → 83.2 MB (+33 %) | 11.8 + 8.4 MB |
+| `tests/fixtures` | 0.42 → 0.43 s | 34 → 37 MiB | 2.3 → 2.9 MB | 0.39 + 0.28 MB |
+
+The growth is almost entirely the `cfg_*` pages; `strings` gains the 26 kind
+tags, plus the text of the call sites the export now retains (HDF 111, HiView 683, Camera 2,384
+rows).
+
+**Rows per table** (flag on):
+
+| Table | HDF rows | HDF bytes | HiView rows | HiView bytes | Camera rows | Camera bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| `cfg_functions` | 10,776 | 270 K + 115 K | 8,093 | 197 K + 86 K | 19,815 | 500 K + 205 K |
+| `cfg_blocks` | 129,875 | 2.41 M + 1.41 M | 39,441 | 692 K + 406 K | 145,019 | 2.65 M + 1.58 M |
+| `cfg_edges` | 180,147 | 2.79 M + 2.45 M | 40,514 | 573 K + 504 K | 183,249 | 2.84 M + 2.50 M |
+| `cfg_events` | 70,332 | 2.11 M + 1.68 M | 34,507 | 971 K + 803 K | 104,493 | 3.08 M + 2.63 M |
+| `cfg_event_sites` | 77,103 | 979 K + 860 K | 39,348 | 463 K + 410 K | 127,786 | 1.68 M + 1.48 M |
+| `cfg_event_order` | 25,277 | 307 K | 25,406 | 299 K | 77,609 | 1.04 M |
+| `cfg_gaps` | 2,096 | 53 K + 29 K | 138 | 4 K + 4 K | 813 | 25 K + 12 K |
+
+Bytes are table + indexes (`cfg_event_order` has only its primary key).
+Graphs with at least one event: HDF 9,389, HiView 6,292, Camera 15,668; the
+largest graph holds 101, 105 and 214 events. Graphs with a gap (`partial`):
+HDF 355, HiView 117, Camera 670. By gap kind:
+
+| Corpus | `parse_error` | `unordered_branch` | `initializer_order` | `unsupported_construct` |
+|---|---:|---:|---:|---:|
+| HDF | 1,379 | 659 | 34 | 24 |
+| HiView | 14 | 49 | 75 | 0 |
+| Camera | 31 | 626 | 156 | 0 |
+
+No `depth_exceeded`, `unresolved_goto` or `omitted_sites` gap occurs on the
+corpora. Each `parse_error` gap is an `ERROR` subtree inside a function body,
+whose events form one unordered group; HDF has most of them.
+
+**What else the flag changes.** Compared with the flag-off database of the
+same binary, `call_edges`, `arg_flow_edges`, `execution_contexts`, the flow
+graph and every other analysis table are identical. `call_sites` gains the
+direct sites without call edges or argument flow that an event names (HDF 277,
+HiView 1,244, Camera 5,088). `flow_call_expressions` and `flow_call_origins`
+gain exactly the rows of those sites, and nothing else (HDF 277 and 0, HiView
+1,244 and 212, Camera 5,088 and 511 rows). Two `--sequencing` runs of each
+corpus gave identical logical rows in every table.
+
+**`trace inspect sequence` latency.** One process per query (opening the
+database included), median of three, text output. Twenty functions per corpus:
+the ten with the most events and ten from the middle of the graph list.
+`between` relates the first and last event of variant 0 of each of them.
+
+| Corpus | `--function`, depth 1 (median / max) | depth 3 | `between` | Flag-off error |
+|---|---:|---:|---:|---:|
+| HDF | 21 / 31 ms | 23 / 34 ms | 60 / 72 ms (15 of 20) | 7 ms |
+| HiView | 18 / 32 ms | 22 / 38 ms | 33 / 47 ms | 5 ms |
+| Camera | 26 / 97 ms | 27 / 145 ms | 73 / 151 ms | 4 ms |
+
+The default budgets (200 events, 32 frames, 4 targets) bound the output:
+the largest text view was 51 KB. These figures are after two fixes this
+measurement found in the query:
+
+- The text and flowchart views grouped a block's unordered events by walking
+  every path of its local order. A block of `g(a(), b());` statements is a
+  chain of order diamonds, with 2^n paths, so HDF hdi-gen's
+  `CServiceDriverCodeEmitter::EmitDriverBind` (101 events in one block) did
+  not finish in ten minutes. Each walk now visits an event once
+  (`text_view_of_a_diamond_chain_finishes`).
+- The statements loading a graph's events, targets, contexts and local order
+  selected `cfg_events` by `cfg_id`, which has no index, so every frame scanned
+  the whole table. Camera queries took 0.25 s at the median and up to 8.2 s.
+  They now reach events through `cfg_blocks(cfg_id)` and `cfg_events(block_id)`
+  (`loading_a_graph_is_indexed`). No index or table was added.
+
+The five HDF `between` queries that failed started or ended at a call spelled
+in a logging macro's body (`DealFormat` or `udk_log` in `HDF_LOG_WRAPPER`,
+`hdf_log_adapter.h:35` and `:36`). Each of those spelling positions is shared
+by 14,852 events, so the query correctly reports an ambiguous position. The
+error first listed all 14,852 candidates; it now lists ten, counts the rest,
+and suggests an invocation position. Naming the
+invocation position instead (`--file`/`--line` of the macro use, with
+`--callee DealFormat` and `--to-callee udk_log`) resolves both calls. The
+relation it reports is `may_both`, not `may_precede`: the macro's
+`do { ... } while (0)` is kept as a loop with a back edge, because constant
+conditions are not folded.
+
+**`trace-merge`.** Merging the three corpus databases:
+
+| Inputs | Wall | Peak RSS | Output bytes | Marker | Graphs / events |
+|---|---:|---:|---:|---|---:|
+| all unsequenced | 3.33 s | 208 MiB | 37.1 MB | `false` | 0 / 0 |
+| all sequenced | 7.39 s | 284 MiB | 79.5 MB | `true` | 38,684 / 209,332 |
+| HiView unsequenced | 7.01 s | 271 MiB | 73.5 MB | `"partial"` | 30,591 / 174,825 |
+
+The merged graph and event counts are the sums of the inputs' counts (single
+runs). The mixed merge adds one `MissingSequencing` diagnostic, and
+`inspect sequence` on it prints the partial-capability notice. On a merged
+database the `EmitDriverBind` query above takes 30–40 ms at depth 3.
+
+**Not measured.** `--full-export` and `--explore` runs with the flag;
+`scripts/profile_memory.py` phase breakdowns (only whole-process peak RSS
+above); macOS; and corpora beyond the three pinned ones. Latency covers 20
+functions per corpus, not every function, and only the text format. Whether
+to turn the flag on by default is left open: the indexing cost above is
+small, but the database grows by about a third.
+
 ## C++ call sites and unresolved callgraphs — 2026-10-15
 
 Baseline: `f9ac344`; candidate: the C++ call-site and callgraph fixes on

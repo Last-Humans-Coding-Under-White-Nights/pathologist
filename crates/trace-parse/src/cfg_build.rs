@@ -1,0 +1,3282 @@
+//! Call-order control-flow graph of one function body (`--sequencing`).
+//!
+//! Lowering records which syntax node emitted which call sites
+//! ([`CfgRecorder`]). Once a body is walked, [`build_function_cfg`] walks the
+//! same tree again and places each node's sites, as events, in blocks and in
+//! a block-local sequenced-before order. Semantics and limits:
+//! docs/ANALYSIS.md, "Call sequencing (control-flow sidecar)".
+
+use super::{last_segment_of, node_span, operator_call, LowerContext, MAX_AST_WALK_DEPTH};
+use crate::node_metadata::NodeMetadata;
+use crate::parse::node_text;
+use rustc_hash::FxHashMap as HashMap;
+use std::ops::Range;
+use trace_ir::{
+    Block, BlockId, BlockKind, CallEvent, CallOccurrence, CallSite, CallSiteId, CfgEdge, EdgeKind,
+    EventId, EventKind, FnId, FunctionCfg, Gap, GapKind, Program,
+};
+use tree_sitter::Node;
+
+/// Call sites by the syntax node whose lowering emitted them, as
+/// `call_sites` index ranges in emission order.
+#[derive(Default)]
+pub(super) struct CfgRecorder {
+    /// A node records after the nodes its lowering walked, so an earlier
+    /// entry claims a site before a later one.
+    owned: Vec<(usize, Range<usize>)>,
+    /// Destructor sites of the automatic object a declarator declares;
+    /// these claim before `owned`.
+    destructors: Vec<(usize, Range<usize>)>,
+}
+
+/// Lengths of a recorder's lists, to drop what was recorded after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RecorderMark(usize, usize);
+
+impl CfgRecorder {
+    pub(super) fn own(&mut self, node: Node, sites: Range<usize>) {
+        if !sites.is_empty() {
+            self.owned.push((node.id(), sites));
+        }
+    }
+
+    pub(super) fn destructors(&mut self, node: Node, sites: Range<usize>) {
+        if !sites.is_empty() {
+            self.destructors.push((node.id(), sites));
+        }
+    }
+
+    pub(super) fn mark(&self) -> RecorderMark {
+        RecorderMark(self.owned.len(), self.destructors.len())
+    }
+
+    pub(super) fn truncate(&mut self, mark: RecorderMark) {
+        self.owned.truncate(mark.0);
+        self.destructors.truncate(mark.1);
+    }
+}
+
+/// Build the graph of `function`'s body from the sites lowered for it since
+/// `first_site`, and add it to `program.cfgs`. `prologue` holds the
+/// member-initializer lists, which run before the body; with
+/// `function_try`, the body is a constructor's function-try-block
+/// (`A::A() try : m_(f()) {...}`) and they run inside its `try`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_function_cfg(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    function: FnId,
+    first_site: usize,
+    body: Option<Node>,
+    prologue: &[Node],
+    function_try: bool,
+) {
+    let Some(recorder) = &ctx.cfg_recorder else {
+        return;
+    };
+    let (mut cfg, spans) = {
+        let mut builder = Builder::new(
+            &program.symbols.call_sites,
+            recorder,
+            source,
+            function,
+            first_site,
+            ctx.is_cpp,
+            ctx.is_cpp && ctx.cpp_standard >= 201703,
+        );
+        // A lambda's body nests in the walk that lowered it.
+        builder.depth = ctx.ast_depth;
+        builder.run(body, prologue, function_try);
+        (builder.cfg, builder.spans)
+    };
+    for (slot, node) in spans {
+        let span = Some(node_span(program, ctx, node));
+        match slot {
+            SpanSlot::Block(b) => cfg.blocks[b.0 as usize].span = span,
+            SpanSlot::Gap(g) => cfg.gaps[g].span = span,
+        }
+    }
+    debug_assert!(
+        {
+            let mut seen = rustc_hash::FxHashSet::default();
+            cfg.edges.iter().all(|e| seen.insert(*e))
+        },
+        "the walk added an edge twice: {:?}",
+        cfg.edges
+    );
+    cfg.compact();
+    program.cfgs.entry(function).or_default().push(cfg);
+}
+
+/// The widest frontier a group restores before each of its members; a
+/// wider one is joined first ([`Builder::join`]), so a group stores at most
+/// this many order pairs per event.
+const JOIN_WIDTH: usize = 1;
+
+enum SpanSlot {
+    Block(BlockId),
+    Gap(usize),
+}
+
+enum ScopeKind {
+    Block,
+    Loop {
+        exit: BlockId,
+        next: BlockId,
+        next_kind: EdgeKind,
+    },
+    Switch {
+        exit: BlockId,
+        head: BlockId,
+        has_default: bool,
+    },
+    Try {
+        landing: BlockId,
+    },
+}
+
+struct Scope {
+    kind: ScopeKind,
+    /// Unique among the walk's scopes, to key [`Builder::cleanups`].
+    serial: u32,
+    /// The compound statement the scope is, for `goto` targets.
+    node: Option<usize>,
+    /// Destructor sites of the automatic objects declared so far, one entry
+    /// per object in declaration order.
+    objects: Vec<Vec<usize>>,
+}
+
+/// A label's block and the compound statements around it, innermost first.
+struct Label {
+    block: BlockId,
+    enclosing: Vec<usize>,
+    /// Once the walk has passed the label: how many objects each open
+    /// scope had declared there, outermost first. A `goto` back to it
+    /// destroys the objects its scope declared since.
+    live: Option<Vec<usize>>,
+}
+
+struct Builder<'s, 'a> {
+    sites: &'s [CallSite],
+    source: &'a str,
+    cpp: bool,
+    /// C++17 sequencing rules for callees, assignments, shifts and
+    /// subscripts.
+    cpp17: bool,
+    /// Sites by the node that owns them, taken as the node is visited.
+    owned: HashMap<usize, Vec<usize>>,
+    destructors: HashMap<usize, Vec<usize>>,
+    /// The function's sites no record claims, in emission order.
+    unclaimed: Vec<usize>,
+    cfg: FunctionCfg,
+    has_pred: Vec<bool>,
+    /// Blocks a path from the entry reaches over the edges made so far
+    /// ([`Self::reach`]).
+    reached: Vec<bool>,
+    /// Each block's out-edges so far: how many, and the latest's target.
+    out_degree: Vec<u32>,
+    last_successor: Vec<BlockId>,
+    /// Each block's innermost `try` landing as it was made: where its
+    /// calls throw to, through a cleanup block destroying the objects the
+    /// exception leaves ([`Self::unwinding_to`]). An enclosing `try`
+    /// reaches the block through that landing.
+    landing: Vec<Option<BlockId>>,
+    /// The `exception` edges made, so each is made once.
+    exception_edges: rustc_hash::FxHashSet<(BlockId, BlockId)>,
+    /// Bumped whenever the set of live automatic objects changes; each
+    /// block's value when its events last took their exception edge.
+    live: u32,
+    thrown_at: Vec<u32>,
+    /// Cleanup blocks by the target their chain leads to, the serial of
+    /// the scope of the object they destroy and that object's count of
+    /// objects up to it in the scope ([`Self::unwinding_to`]).
+    cleanups: HashMap<(BlockId, u32, usize), BlockId>,
+    /// Each cleanup block and the destructor sites of its object: filled
+    /// once the body is walked, so its events never fall inside a group or
+    /// gap the walk is making.
+    pending_cleanups: Vec<(BlockId, Vec<usize>)>,
+    /// Objects whose declarator the walk passed before their initializer
+    /// (`if (G b = G())`): their destructor sites, by the initializer node
+    /// whose events build them. They are live once it has run.
+    unbuilt: Vec<(usize, Vec<usize>)>,
+    /// While a `throw` destroys the objects it leaves: a destructor
+    /// throwing then terminates, so its events take no exception edge.
+    unwinding: bool,
+    /// While [`Self::unwind_since`] destroys `scopes[s].objects[k]`:
+    /// `(s, k)`. That object, and those destroyed before it, are no
+    /// longer live should its destructor throw.
+    dying: Option<(usize, usize)>,
+    /// A constructor's function-try-block: its node, then the block in the
+    /// `try` the prologue runs in.
+    function_try: Option<usize>,
+    prologue_in_try: Option<BlockId>,
+    /// The block events go to; `None` after a jump, until a block that can
+    /// be reached starts.
+    cur: Option<BlockId>,
+    /// The latest events of `cur`, sequenced before the next event.
+    frontier: Vec<EventId>,
+    /// How many constructs the walk is in whose events must stay in the
+    /// block they start in: an unordered group's operand (its siblings
+    /// start there) and the prologue (its block's edges are made).
+    unsplit: u32,
+    /// How many [unevaluated](Self::never_run) groups the walk is in: a
+    /// site tagged `unevaluated` there joins that group's gap.
+    quiet: u32,
+    /// Each event made so far that never runs: no later event is ordered
+    /// after it.
+    inert: Vec<bool>,
+    scopes: Vec<Scope>,
+    serials: u32,
+    labels: HashMap<&'a str, Label>,
+    depth: u32,
+    spans: Vec<(SpanSlot, Node<'a>)>,
+}
+
+impl<'s, 'a> Builder<'s, 'a> {
+    fn new(
+        sites: &'s [CallSite],
+        recorder: &CfgRecorder,
+        source: &'a str,
+        function: FnId,
+        first_site: usize,
+        cpp: bool,
+        cpp17: bool,
+    ) -> Self {
+        let first_site = first_site.min(sites.len());
+        let ours = |i: usize| sites[i].caller == function;
+        // `free[k]` leads to the first site at or after `first_site + k` that
+        // is the function's and still unclaimed (`k == n`: none). Records nest,
+        // so a claimed site is stepped over once, not once per enclosing
+        // record.
+        let n = sites.len() - first_site;
+        let mut free: Vec<usize> = (0..=n)
+            .map(|k| {
+                if k < n && !ours(first_site + k) {
+                    k + 1
+                } else {
+                    k
+                }
+            })
+            .collect();
+        fn find(free: &mut [usize], k: usize) -> usize {
+            let mut root = k;
+            while free[root] != root {
+                root = free[root];
+            }
+            let mut k = k;
+            while free[k] != root {
+                k = std::mem::replace(&mut free[k], root);
+            }
+            root
+        }
+        let mut claim = |records: &[(usize, Range<usize>)]| {
+            let mut by_node: HashMap<usize, Vec<usize>> = HashMap::default();
+            for (node, range) in records {
+                let start = range.start.max(first_site) - first_site;
+                let end = range.end.min(sites.len()).saturating_sub(first_site);
+                if start >= end {
+                    continue;
+                }
+                let mut k = find(&mut free, start);
+                while k < end {
+                    by_node.entry(*node).or_default().push(first_site + k);
+                    free[k] = k + 1;
+                    k = find(&mut free, k + 1);
+                }
+            }
+            by_node
+        };
+        let destructors = claim(&recorder.destructors);
+        let owned = claim(&recorder.owned);
+        // A claimed site no longer leads to itself.
+        let unclaimed = (0..n)
+            .filter(|&k| ours(first_site + k) && free[k] == k)
+            .map(|k| first_site + k)
+            .collect();
+        let mut builder = Self {
+            sites,
+            source,
+            cpp,
+            cpp17,
+            owned,
+            destructors,
+            unclaimed,
+            cfg: FunctionCfg {
+                function,
+                tu: None,
+                variant: 0,
+                entry: BlockId(0),
+                exit: BlockId(1),
+                exceptional_exit: None,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                events: Vec::new(),
+                order: Vec::new(),
+                gaps: Vec::new(),
+            },
+            has_pred: Vec::new(),
+            reached: Vec::new(),
+            out_degree: Vec::new(),
+            last_successor: Vec::new(),
+            landing: Vec::new(),
+            exception_edges: Default::default(),
+            live: 0,
+            thrown_at: Vec::new(),
+            cleanups: HashMap::default(),
+            pending_cleanups: Vec::new(),
+            unbuilt: Vec::new(),
+            unwinding: false,
+            dying: None,
+            function_try: None,
+            prologue_in_try: None,
+            cur: None,
+            frontier: Vec::new(),
+            unsplit: 0,
+            quiet: 0,
+            inert: Vec::new(),
+            scopes: Vec::new(),
+            serials: 0,
+            labels: HashMap::default(),
+            depth: 0,
+            spans: Vec::new(),
+        };
+        let entry = builder.new_block(BlockKind::Entry);
+        builder.reached[entry.0 as usize] = true;
+        builder.new_block(BlockKind::Exit);
+        builder
+    }
+
+    fn run(&mut self, body: Option<Node<'a>>, prologue: &[Node<'a>], function_try: bool) {
+        let entry = self.cfg.entry;
+        // Filled last, once the body has taken the sites it owns.
+        let head = self.new_block(BlockKind::Ordinary);
+        self.edge(entry, head, EdgeKind::Fallthrough);
+        let start = self.new_block(BlockKind::Ordinary);
+        self.edge(head, start, EdgeKind::Fallthrough);
+        self.start(start);
+        if let Some(body) = body {
+            self.collect_labels(body);
+            self.function_try = function_try.then(|| body.id());
+            self.visit(body);
+        }
+        let exit = self.cfg.exit;
+        self.jump(exit, EdgeKind::Fallthrough);
+        self.fill_cleanups();
+        // The initializers of a function-try-block run in its `try`, in a
+        // block made there.
+        let head = self.prologue_in_try.take().unwrap_or(head);
+        self.fill_prologue(head, prologue);
+    }
+
+    // ---- blocks, edges and events ----
+
+    fn new_block(&mut self, kind: BlockKind) -> BlockId {
+        let id = BlockId(self.cfg.blocks.len() as u32);
+        self.cfg.blocks.push(Block {
+            kind,
+            span: None,
+            events: Vec::new(),
+        });
+        self.has_pred.push(false);
+        self.reached.push(false);
+        self.out_degree.push(0);
+        self.last_successor.push(id);
+        let landing = self.innermost_landing();
+        self.landing.push(landing);
+        self.thrown_at.push(u32::MAX);
+        id
+    }
+
+    /// The scope index of the `try` whose landing is `landing`, or of the
+    /// innermost `try` around the walk (`landing` `None`), if any.
+    fn try_scope(&self, landing: Option<BlockId>) -> Option<usize> {
+        self.scopes.iter().rposition(|s| match s.kind {
+            ScopeKind::Try { landing: l } => landing.is_none_or(|x| x == l),
+            _ => false,
+        })
+    }
+
+    /// The landing of the innermost `try` around the walk, if any.
+    fn innermost_landing(&self) -> Option<BlockId> {
+        let at = self.try_scope(None)?;
+        match self.scopes[at].kind {
+            ScopeKind::Try { landing } => Some(landing),
+            _ => unreachable!("a try scope"),
+        }
+    }
+
+    /// The first scope whose objects an exception thrown now destroys on
+    /// its way to the innermost handler: the one after the innermost `try`,
+    /// or the outermost when it leaves the function.
+    fn handler_scope(&self) -> usize {
+        self.try_scope(None).map_or(0, |at| at + 1)
+    }
+
+    /// An `exception` edge, unless `from` already has it.
+    fn exception_edge(&mut self, from: BlockId, to: BlockId) {
+        if self.exception_edges.insert((from, to)) {
+            self.edge(from, to, EdgeKind::Exception);
+        }
+    }
+
+    /// Where an exception thrown now leaves for `target`, the landing of
+    /// the `try` at `scopes[from - 1]` (or the exceptional exit, `from` 0):
+    /// the cleanup block destroying the latest live object of
+    /// `scopes[from..]`, which leads on to the one destroying the object
+    /// before it, and so on to `target` (innermost first, in reverse
+    /// declaration order, as [`Self::unwind`] destroys them); `target`
+    /// itself when none is live. The chain is shared: a throw that leaves
+    /// fewer objects for the same target enters it further down, so the
+    /// blocks are one per object, not one per set of live objects.
+    fn unwinding_to(&mut self, from: usize, target: BlockId) -> BlockId {
+        // From the latest live object back: the first that has its cleanup
+        // already, and where the objects after it start.
+        let mut next = target;
+        let mut resume = (from, 0);
+        'found: for at in (from..self.scopes.len()).rev() {
+            let serial = self.scopes[at].serial;
+            for count in (1..=self.live_count(at)).rev() {
+                if let Some(&cleanup) = self.cleanups.get(&(target, serial, count)) {
+                    next = cleanup;
+                    resume = (at, count);
+                    break 'found;
+                }
+            }
+        }
+        for at in resume.0..self.scopes.len() {
+            let first = if at == resume.0 { resume.1 } else { 0 };
+            let serial = self.scopes[at].serial;
+            for count in first + 1..=self.live_count(at) {
+                let cleanup = self.new_block(BlockKind::Ordinary);
+                // Its own edge leads on.
+                self.landing[cleanup.0 as usize] = None;
+                self.exception_edge(cleanup, next);
+                let sites = self.scopes[at].objects[count - 1].clone();
+                self.pending_cleanups.push((cleanup, sites));
+                self.cleanups.insert((target, serial, count), cleanup);
+                next = cleanup;
+            }
+        }
+        next
+    }
+
+    /// How many of `scopes[at]`'s objects are live: those declared so far,
+    /// less those [`Self::unwind_since`] is destroying.
+    fn live_count(&self, at: usize) -> usize {
+        match self.dying {
+            Some((scope, _)) if at > scope => 0,
+            Some((scope, object)) if at == scope => object,
+            _ => self.scopes[at].objects.len(),
+        }
+    }
+
+    /// The events of the cleanup blocks [`Self::unwinding_to`] made that a
+    /// path reaches. One nothing reaches (a throw from code after a
+    /// `return`) holds none: its edge becomes a fallthrough, so
+    /// [`FunctionCfg::compact`] removes it.
+    fn fill_cleanups(&mut self) {
+        for (cleanup, sites) in std::mem::take(&mut self.pending_cleanups) {
+            let b = cleanup.0 as usize;
+            if !self.reached[b] {
+                if let Some(e) = self.cfg.edges.iter_mut().find(|e| e.from == cleanup) {
+                    e.kind = EdgeKind::Fallthrough;
+                }
+                continue;
+            }
+            self.start(cleanup);
+            self.emit_unordered(&sites, Some(EventKind::Destroy));
+            // An empty frontier never splits the block.
+            debug_assert_eq!(self.cur, Some(cleanup));
+        }
+        self.cur = None;
+        self.frontier.clear();
+    }
+
+    /// Where an exception thrown at this point of the walk goes: through
+    /// the objects it leaves to the innermost handler, or out of the
+    /// function.
+    fn unwinding_target(&mut self) -> BlockId {
+        let from = self.handler_scope();
+        let target = self.throw_target();
+        self.unwinding_to(from, target)
+    }
+
+    fn block_at(&mut self, node: Node<'a>) -> BlockId {
+        let b = self.new_block(BlockKind::Ordinary);
+        self.spans.push((SpanSlot::Block(b), node));
+        b
+    }
+
+    fn edge(&mut self, from: BlockId, to: BlockId, kind: EdgeKind) {
+        self.cfg.edges.push(CfgEdge { from, to, kind });
+        self.has_pred[to.0 as usize] = true;
+        let f = from.0 as usize;
+        self.out_degree[f] += 1;
+        self.last_successor[f] = to;
+        if self.reached[f] {
+            self.reach(to);
+        }
+    }
+
+    /// Mark `b` reached, and what its edges so far lead to. A block is
+    /// almost always reached before its own edges are made, or has one;
+    /// one reached later with more (a loop head or label after code no
+    /// path reaches) spreads over every edge.
+    fn reach(&mut self, mut b: BlockId) {
+        loop {
+            let at = b.0 as usize;
+            if self.reached[at] {
+                return;
+            }
+            self.reached[at] = true;
+            match self.out_degree[at] {
+                0 => return,
+                1 => b = self.last_successor[at],
+                _ => break,
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for e in &self.cfg.edges {
+                let (from, to) = (e.from.0 as usize, e.to.0 as usize);
+                if self.reached[from] && !self.reached[to] {
+                    self.reached[to] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, b: BlockId) {
+        self.cur = Some(b);
+        self.frontier.clear();
+    }
+
+    /// Continue at `b` when something reaches it.
+    fn enter(&mut self, b: BlockId) {
+        if self.has_pred[b.0 as usize] {
+            self.start(b);
+        } else {
+            self.cur = None;
+        }
+    }
+
+    /// Leave the current block for `to`; what follows is unreachable until
+    /// a reachable block starts.
+    fn jump(&mut self, to: BlockId, kind: EdgeKind) {
+        if let Some(from) = self.cur.take() {
+            self.edge(from, to, kind);
+        }
+        self.frontier.clear();
+    }
+
+    fn current(&mut self) -> BlockId {
+        match self.cur {
+            Some(b) => b,
+            None => {
+                let b = self.new_block(BlockKind::Ordinary);
+                self.start(b);
+                b
+            }
+        }
+    }
+
+    /// Before a group that starts each of its members after the frontier:
+    /// when the frontier is wider than [`JOIN_WIDTH`], continue in a new
+    /// block behind a `sequenced` edge, which orders every event so far
+    /// before the group without a pair per two events. Not where the walk
+    /// is [unsplit](Self::unsplit).
+    fn join(&mut self) {
+        let Some(from) = self.cur else {
+            return;
+        };
+        if self.frontier.len() <= JOIN_WIDTH || self.unsplit > 0 {
+            return;
+        }
+        let to = self.new_block(BlockKind::Ordinary);
+        self.landing[to.0 as usize] = self.landing[from.0 as usize];
+        self.edge(from, to, EdgeKind::Sequenced);
+        self.start(to);
+    }
+
+    fn emit(&mut self, kind: EventKind, occurrence: CallOccurrence, sites: Vec<CallSiteId>) {
+        let block = self.current();
+        // Any call may throw: to the block's landing, destroying the
+        // objects live at the call on the way. A block whose objects
+        // change between its calls takes an edge for each set.
+        // An event that never runs, and a destructor run while a `throw`
+        // unwinds (one throwing then terminates), throw nowhere.
+        let b = block.0 as usize;
+        let throws = self.quiet == 0 && !self.unwinding;
+        if let Some(landing) = self.landing[b].filter(|_| throws && self.thrown_at[b] != self.live)
+        {
+            self.thrown_at[b] = self.live;
+            let from = self
+                .try_scope(Some(landing))
+                .map_or(self.scopes.len(), |at| at + 1);
+            let target = self.unwinding_to(from, landing);
+            self.exception_edge(block, target);
+        }
+        let id = EventId(self.cfg.events.len() as u32);
+        self.cfg.events.push(CallEvent {
+            block,
+            kind,
+            occurrence,
+            sites,
+        });
+        self.cfg.blocks[block.0 as usize].events.push(id);
+        for &before in &self.frontier {
+            self.cfg.order.push((before, id));
+        }
+        self.frontier.clear();
+        self.frontier.push(id);
+    }
+
+    /// Emit the sites at `indices`, one event per invocation, unordered
+    /// among themselves and after the current frontier.
+    fn emit_unordered(&mut self, indices: &[usize], kind: Option<EventKind>) {
+        let invocations = invocations(self.sites, indices);
+        if invocations.len() > 1 {
+            self.join();
+        }
+        let before = std::mem::take(&mut self.frontier);
+        let first = self.cfg.events.len();
+        for invocation in invocations {
+            let kind = kind.unwrap_or_else(|| event_kind(&self.sites[invocation.first]));
+            self.frontier.clone_from(&before);
+            self.emit(kind, invocation.occurrence, invocation.sites);
+        }
+        self.sinks_since(first, before);
+    }
+
+    /// The frontier after a group whose events are those since `first`,
+    /// each a sink: `before` when it emitted none.
+    /// Events that [never run](Self::never_run) are no sinks.
+    fn sinks_since(&mut self, first: usize, before: Vec<EventId>) {
+        let last = self.cfg.events.len();
+        let inert = &self.inert;
+        let mut sinks = (first..last)
+            .filter(|&e| !inert.get(e).copied().unwrap_or(false))
+            .peekable();
+        if sinks.peek().is_none() {
+            self.frontier = before;
+        } else {
+            let sinks: Vec<EventId> = sinks.map(|e| EventId(e as u32)).collect();
+            self.frontier = sinks;
+        }
+    }
+
+    fn gap(&mut self, kind: GapKind, node: Option<Node<'a>>, first_event: usize) {
+        let events = (self.cfg.events.len() > first_event).then(|| {
+            (
+                EventId(first_event as u32),
+                EventId(self.cfg.events.len() as u32 - 1),
+            )
+        });
+        if let Some(node) = node {
+            self.spans.push((SpanSlot::Gap(self.cfg.gaps.len()), node));
+        }
+        self.cfg.gaps.push(Gap {
+            kind,
+            span: None,
+            events,
+        });
+    }
+
+    // ---- what nodes own ----
+
+    /// The node's own events, after everything evaluated before them.
+    fn own(&mut self, node: Node<'a>) {
+        if let Some(indices) = self.owned.remove(&node.id()) {
+            let kind = (node.cached_kind() == "delete_expression").then_some(EventKind::Delete);
+            self.emit_sites(&indices, kind, Some(node));
+        }
+        if let Some(indices) = self.destructors.remove(&node.id()) {
+            match initializer_after(node) {
+                Some(value) => self.unbuilt.push((value.id(), indices)),
+                None => self.declare(indices),
+            }
+        }
+        if let Some(at) = self.unbuilt.iter().position(|&(id, _)| id == node.id()) {
+            let (_, indices) = self.unbuilt.swap_remove(at);
+            self.declare(indices);
+        }
+    }
+
+    /// An automatic object of the innermost scope, live from now on.
+    fn declare(&mut self, indices: Vec<usize>) {
+        match self.scopes.last_mut() {
+            Some(scope) => {
+                scope.objects.push(indices);
+                self.live += 1;
+            }
+            None => self.unclaimed.extend(indices),
+        }
+    }
+
+    /// Destructor events of the objects of `scopes[from..]`, innermost
+    /// first and in reverse declaration order.
+    fn unwind(&mut self, from: usize) {
+        self.unwind_since(from, 0);
+    }
+
+    /// [`Self::unwind`], keeping the first `kept` objects of
+    /// `scopes[from]`.
+    fn unwind_since(&mut self, from: usize, kept: usize) {
+        if self.cur.is_none() {
+            return;
+        }
+        let outer = self.dying;
+        for scope in (from..self.scopes.len()).rev() {
+            let first = if scope == from { kept } else { 0 };
+            for object in (first..self.scopes[scope].objects.len()).rev() {
+                self.dying = Some((scope, object));
+                self.live += 1;
+                // An object's base destructors are one unordered group: the
+                // IR does not say which bases are virtual, so their order is
+                // not claimed (docs/ANALYSIS.md, "Statements").
+                let sites = std::mem::take(&mut self.scopes[scope].objects[object]);
+                self.emit_unordered(&sites, Some(EventKind::Destroy));
+                self.scopes[scope].objects[object] = sites;
+            }
+        }
+        if self.dying != outer {
+            self.dying = outer;
+            self.live += 1;
+        }
+    }
+
+    fn push_scope(&mut self, kind: ScopeKind, node: Option<Node<'a>>) {
+        self.serials += 1;
+        self.scopes.push(Scope {
+            kind,
+            serial: self.serials,
+            node: node.map(|n| n.id()),
+            objects: Vec::new(),
+        });
+    }
+
+    /// Leave the innermost scope normally.
+    fn pop_scope(&mut self) {
+        self.unwind(self.scopes.len() - 1);
+        self.drop_scope();
+    }
+
+    /// Drop the innermost scope, its objects no longer live.
+    fn drop_scope(&mut self) -> Option<Scope> {
+        let scope = self.scopes.pop();
+        if scope.as_ref().is_some_and(|s| !s.objects.is_empty()) {
+            self.live += 1;
+        }
+        scope
+    }
+
+    fn fill_prologue(&mut self, head: BlockId, prologue: &[Node<'a>]) {
+        self.start(head);
+        // `head` already has its successors, and the unreached sites are
+        // unordered with all of it: it stays one block.
+        self.unsplit += 1;
+        let first = self.cfg.events.len();
+        for &node in prologue {
+            self.flatten(node);
+        }
+        // Sites of nodes the walk never reached: default member
+        // initializers, written in the class.
+        let mut rest: Vec<usize> = std::mem::take(&mut self.unclaimed);
+        rest.extend(self.owned.drain().flat_map(|(_, v)| v));
+        rest.extend(self.destructors.drain().flat_map(|(_, v)| v));
+        rest.extend(self.unbuilt.drain(..).flat_map(|(_, v)| v));
+        rest.sort_unstable();
+        self.frontier.clear();
+        self.emit_sites(&rest, None, None);
+        self.unsplit -= 1;
+        // Where an unreached site runs is not known either.
+        if self.cfg.events.len() > first + 1 || !rest.is_empty() {
+            self.gap(GapKind::InitializerOrder, prologue.first().copied(), first);
+        }
+    }
+
+    /// Every event of `node`'s subtree, as one unordered group.
+    fn flatten(&mut self, node: Node<'a>) {
+        self.join();
+        let before = self.frontier.clone();
+        let first = self.cfg.events.len();
+        let mut stack = vec![node];
+        let mut cursor = node.walk();
+        while let Some(n) = stack.pop() {
+            self.frontier.clone_from(&before);
+            self.own(n);
+            let at = stack.len();
+            stack.extend(n.children(&mut cursor));
+            stack[at..].reverse();
+        }
+        self.sinks_since(first, before);
+    }
+
+    /// A construct whose order is not modeled: its events as one unordered
+    /// group, under a gap.
+    fn opaque(&mut self, node: Node<'a>, kind: GapKind) {
+        let first = self.cfg.events.len();
+        self.flatten(node);
+        self.gap(kind, Some(node), first);
+        // Every opaque kind may hide a control transfer. With no event
+        // under it to mark where, the block ends at it with an
+        // `unsupported` edge, the walk going on in a new block.
+        if self.cfg.events.len() == first {
+            if let Some(from) = self.cur {
+                let (exit, next) = (self.cfg.exit, self.new_block(BlockKind::Ordinary));
+                self.edge(from, exit, EdgeKind::Unsupported);
+                self.edge(from, next, EdgeKind::Fallthrough);
+                self.start(next);
+            }
+        }
+    }
+}
+
+/// The alternative-target sites of one syntactic invocation.
+struct Invocation {
+    occurrence: CallOccurrence,
+    /// Index of the first of `sites` in `call_sites`.
+    first: usize,
+    sites: Vec<CallSiteId>,
+}
+
+/// The sites at `indices` grouped by invocation, in first-seen order.
+///
+/// An automatic object's lifecycle sites share the declaration's occurrence,
+/// one site name per class providing the members (`Both both;` with bases
+/// `A` and `B` runs `A::A` and `B::B`): each class's is a separate
+/// invocation, its overloads alternatives of that one. So is the constructor
+/// a smart-pointer factory runs (`std::make_shared<S>(a)` and `S::S`), never
+/// an alternative target of the factory call it shares a position with.
+fn invocations(sites: &[CallSite], indices: &[usize]) -> Vec<Invocation> {
+    let mut groups: Vec<Invocation> = Vec::new();
+    let subobject = |i: usize| sites[i].exact_receiver.then_some(&sites[i].callee_name);
+    for &i in indices {
+        let occurrence = sites[i].occurrence();
+        // Almost always one group: a linear scan beats hashing.
+        match groups
+            .iter_mut()
+            .find(|g| g.occurrence == occurrence && subobject(g.first) == subobject(i))
+        {
+            Some(group) => group.sites.push(sites[i].id),
+            None => groups.push(Invocation {
+                occurrence,
+                first: i,
+                sites: vec![sites[i].id],
+            }),
+        }
+    }
+    groups
+}
+
+/// What a site's callee name says it runs: `A::A` constructs, `A::~A`
+/// destroys.
+fn event_kind(site: &CallSite) -> EventKind {
+    let name = site.callee_name.as_str();
+    let Some((scope, member)) = name.rsplit_once("::") else {
+        return EventKind::Call;
+    };
+    if member.starts_with('~') {
+        return EventKind::Destroy;
+    }
+    let class = last_segment_of(scope);
+    let class = class.split('<').next().unwrap_or(class);
+    if class == member {
+        EventKind::Construct
+    } else {
+        EventKind::Call
+    }
+}
+
+impl<'a> Builder<'_, 'a> {
+    fn visit(&mut self, node: Node<'a>) {
+        self.visit_in(node, false);
+    }
+
+    /// `in_parens`: `node` is a parenthesized expression's operand.
+    fn visit_in(&mut self, node: Node<'a>, in_parens: bool) {
+        if self.depth >= MAX_AST_WALK_DEPTH {
+            self.opaque(node, GapKind::DepthExceeded);
+            return;
+        }
+        self.depth += 1;
+        self.visit_node(node, in_parens);
+        self.depth -= 1;
+    }
+
+    fn visit_node(&mut self, node: Node<'a>, in_parens: bool) {
+        if node.is_error() {
+            self.opaque(node, GapKind::ParseError);
+            return;
+        }
+        match node.cached_kind() {
+            // A GNU statement expression.
+            "compound_statement" if in_parens => {
+                self.opaque(node, GapKind::UnsupportedConstruct);
+            }
+            "compound_statement" => {
+                self.push_scope(ScopeKind::Block, Some(node));
+                self.sequence(node);
+                self.own(node);
+                self.pop_scope();
+            }
+            "co_return_statement"
+            | "co_await_expression"
+            | "co_yield_statement"
+            | "seh_try_statement"
+            | "seh_leave_statement" => self.opaque(node, GapKind::UnsupportedConstruct),
+            "if_statement" => self.if_statement(node),
+            "while_statement" => self.while_statement(node),
+            "do_statement" => self.do_statement(node),
+            "for_statement" => self.for_statement(node),
+            "for_range_loop" => self.for_range_loop(node),
+            "switch_statement" => self.switch_statement(node),
+            "case_statement" => self.case_statement(node),
+            "break_statement" => self.break_statement(),
+            "continue_statement" => self.continue_statement(),
+            "return_statement" => {
+                self.sequence(node);
+                self.own(node);
+                self.unwind(0);
+                let exit = self.cfg.exit;
+                self.jump(exit, EdgeKind::Return);
+            }
+            "goto_statement" => self.goto_statement(node),
+            "labeled_statement" => self.labeled_statement(node),
+            "try_statement" => self.try_statement(node),
+            "throw_statement" => {
+                self.sequence(node);
+                self.own(node);
+                // Leaving for a handler destroys the objects of the scopes
+                // left on the way.
+                let handler = self.handler_scope();
+                self.unwinding = true;
+                self.unwind(handler);
+                self.unwinding = false;
+                let target = self.throw_target();
+                // A call before it may already have taken the block there.
+                if let Some(b) = self.cur.take() {
+                    self.exception_edge(b, target);
+                }
+                self.frontier.clear();
+            }
+            // A local class's members and a GNU nested function run when
+            // called, not where they are written.
+            "field_declaration_list" | "function_definition" => {
+                let first = self.cfg.events.len();
+                self.flatten(node);
+                if self.cfg.events.len() > first {
+                    self.gap(GapKind::UnsupportedConstruct, Some(node), first);
+                }
+            }
+            "lambda_expression" => {
+                // The body is the lambda's own graph; init-captures are this
+                // function's.
+                if let Some(captures) = node.cached_field("captures") {
+                    self.unordered(captures.named_children(&mut captures.walk()), node);
+                }
+                self.own(node);
+            }
+            "gnu_asm_expression" => {
+                self.unordered(node.named_children(&mut node.walk()), node);
+                self.own(node);
+                if let Some(labels) = node.cached_field("goto_labels") {
+                    self.asm_goto(node, labels);
+                }
+            }
+            // `noexcept(e)`, `typeid(e)` and C `typeof(e)` parse as calls.
+            "call_expression" if operator_call(self.cpp, self.source, node).is_some() => {
+                if let Some(arguments) = node.cached_field("arguments") {
+                    self.operand(arguments);
+                }
+                self.own(node);
+            }
+            "requires_expression" => self.operand(node),
+            "sizeof_expression" | "alignof_expression" | "decltype" => {
+                let operand = node
+                    .cached_field("value")
+                    .or_else(|| node.cached_field("type"))
+                    .or_else(|| node.named_child(0));
+                if let Some(operand) = operand {
+                    self.operand(operand);
+                }
+                self.own(node);
+            }
+            "call_expression" => {
+                let function = node.cached_field("function");
+                // Before C++17 the callee is one more unsequenced operand.
+                let callee = if self.cpp17 {
+                    if let Some(function) = function {
+                        self.visit(function);
+                    }
+                    None
+                } else {
+                    function
+                };
+                let mut cursor = node.walk();
+                let args = node
+                    .cached_field("arguments")
+                    .map(|arguments| arguments.named_children(&mut cursor));
+                self.unordered(callee.into_iter().chain(args.into_iter().flatten()), node);
+                let first = self.cfg.events.len();
+                self.own(node);
+                // Control may come back to a `setjmp` from any later call.
+                if function.is_some_and(|f| is_nonlocal_jump(node_text(self.source, &f))) {
+                    self.gap(GapKind::UnsupportedConstruct, Some(node), first);
+                }
+            }
+            "binary_expression" => {
+                let operator = node.cached_field("operator").map(|o| o.kind());
+                match operator {
+                    Some(op @ ("&&" | "||" | "and" | "or")) => {
+                        self.short_circuit(node, matches!(op, "&&" | "and"));
+                    }
+                    Some("<<" | ">>") if self.cpp17 => self.sequence(node),
+                    _ => self.unordered(node.named_children(&mut node.walk()), node),
+                }
+                self.own(node);
+            }
+            "assignment_expression" => {
+                let (left, right) = (node.cached_field("left"), node.cached_field("right"));
+                if self.cpp17 {
+                    for side in [right, left].into_iter().flatten() {
+                        self.visit(side);
+                    }
+                } else {
+                    self.unordered([left, right].into_iter().flatten(), node);
+                }
+                self.own(node);
+            }
+            "subscript_expression" if self.cpp17 => {
+                self.sequence(node);
+                self.own(node);
+            }
+            "initializer_list" if self.cpp => {
+                self.sequence(node);
+                self.own(node);
+            }
+            "conditional_expression" => {
+                self.conditional(node);
+                self.own(node);
+            }
+            "generic_expression" => {
+                self.generic_selection(node);
+                self.own(node);
+            }
+            "declaration" if initializes_once(self.source, node) => {
+                self.once_only_declaration(node);
+                self.own(node);
+            }
+            kind if is_sequenced(kind) => {
+                self.sequence(node);
+                self.own(node);
+            }
+            _ => {
+                self.unordered(node.named_children(&mut node.walk()), node);
+                self.own(node);
+            }
+        }
+    }
+
+    /// Each named child in turn.
+    fn sequence(&mut self, node: Node<'a>) {
+        let in_parens = node.cached_kind() == "parenthesized_expression";
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.visit_in(child, in_parens);
+        }
+    }
+
+    /// Operands evaluated in no specified order: each starts after what
+    /// precedes the group, and what follows waits for all of them. A branch
+    /// inside one makes the others' order relative to it unknown.
+    fn unordered(&mut self, operands: impl IntoIterator<Item = Node<'a>>, node: Node<'a>) {
+        let mut operands = operands.into_iter();
+        let Some(first_operand) = operands.next() else {
+            return;
+        };
+        let Some(second_operand) = operands.next() else {
+            self.visit(first_operand);
+            return;
+        };
+        self.join();
+        let block = Some(self.current());
+        let before = self.frontier.clone();
+        let first = self.cfg.events.len();
+        // The frontier each operand ended with, tagged with its end block.
+        let mut ends: Vec<(Option<BlockId>, EventId)> = Vec::new();
+        for operand in [first_operand, second_operand].into_iter().chain(operands) {
+            if self.cur == block {
+                self.frontier.clone_from(&before);
+            } else {
+                self.frontier.clear();
+            }
+            self.unsplit += 1;
+            self.visit(operand);
+            self.unsplit -= 1;
+            let end = self.cur;
+            ends.extend(self.frontier.iter().map(|&e| (end, e)));
+        }
+        self.frontier.clear();
+        for (end, e) in ends {
+            if end == self.cur && !self.frontier.contains(&e) {
+                self.frontier.push(e);
+            }
+        }
+        if self.cur != block {
+            self.gap(GapKind::UnorderedBranch, Some(node), first);
+        }
+    }
+
+    // ---- expressions that branch ----
+
+    fn short_circuit(&mut self, node: Node<'a>, and: bool) {
+        if let Some(left) = node.cached_field("left") {
+            self.visit(left);
+        }
+        let test = self.current();
+        let (right_kind, skip_kind) = if and {
+            (EdgeKind::BranchTrue, EdgeKind::BranchFalse)
+        } else {
+            (EdgeKind::BranchFalse, EdgeKind::BranchTrue)
+        };
+        let right = self.new_block(BlockKind::Ordinary);
+        let join = self.new_block(BlockKind::Ordinary);
+        self.edge(test, right, right_kind);
+        self.edge(test, join, skip_kind);
+        self.start(right);
+        if let Some(operand) = node.cached_field("right") {
+            self.visit(operand);
+        }
+        self.jump(join, EdgeKind::Fallthrough);
+        self.start(join);
+    }
+
+    fn conditional(&mut self, node: Node<'a>) {
+        if let Some(condition) = node.cached_field("condition") {
+            self.visit(condition);
+        }
+        let test = self.current();
+        let join = self.new_block(BlockKind::Ordinary);
+        for (field, kind) in [
+            ("consequence", EdgeKind::BranchTrue),
+            ("alternative", EdgeKind::BranchFalse),
+        ] {
+            let arm = self.new_block(BlockKind::Ordinary);
+            self.edge(test, arm, kind);
+            self.start(arm);
+            if let Some(operand) = node.cached_field(field) {
+                self.visit(operand);
+            }
+            self.jump(join, EdgeKind::Fallthrough);
+        }
+        self.enter(join);
+    }
+
+    /// `_Generic(control, T: a, default: b)`: the controlling expression is
+    /// [never evaluated](Self::unevaluated); exactly one association is
+    /// evaluated, each an arm of its own.
+    fn generic_selection(&mut self, node: Node<'a>) {
+        let mut cursor = node.walk();
+        let mut operands = node
+            .named_children(&mut cursor)
+            .filter(|c| c.cached_kind() != "type_descriptor");
+        let Some(control) = operands.next() else {
+            return;
+        };
+        let associations: Vec<Node<'a>> = operands.collect();
+        self.operand(control);
+        if associations.is_empty() {
+            return;
+        }
+        let test = self.current();
+        let join = self.new_block(BlockKind::Ordinary);
+        for association in associations {
+            let arm = self.new_block(BlockKind::Ordinary);
+            self.edge(test, arm, EdgeKind::SwitchCase);
+            self.start(arm);
+            self.visit(association);
+            self.jump(join, EdgeKind::Fallthrough);
+        }
+        self.enter(join);
+    }
+
+    /// The operand of an operator that may not evaluate it. Lowering tags
+    /// the calls of one the language never evaluates (`CallSite::unevaluated`;
+    /// docs/ANALYSIS.md, "Unevaluated operands"): those
+    /// [never run](Self::never_run). The calls of one that may be evaluated
+    /// (`typeid(e)`, a `sizeof` operand of possibly variably modified type)
+    /// [may run](Self::may_run).
+    fn operand(&mut self, operand: Node<'a>) {
+        let (runs, never) = self.owned_sites(operand);
+        if runs {
+            self.may_run(operand);
+        } else if never {
+            self.never_run(Some(operand), |b| b.flatten(operand));
+        } else {
+            self.visit(operand);
+        }
+    }
+
+    /// The events `body` makes, which never run: one unordered group under
+    /// an `unevaluated` gap over `node` that orders nothing after it.
+    fn never_run(&mut self, node: Option<Node<'a>>, body: impl FnOnce(&mut Self)) {
+        // Split first, so `before` names the block the walk goes on in.
+        self.join();
+        let before = self.frontier.clone();
+        let first = self.cfg.events.len();
+        self.quiet += 1;
+        body(self);
+        self.quiet -= 1;
+        let last = self.cfg.events.len();
+        if last > first {
+            self.inert.resize(last, false);
+            self.inert[first..last].fill(true);
+            self.gap(GapKind::Unevaluated, node, first);
+        }
+        self.frontier = before;
+    }
+
+    /// Emit the sites at `indices` as [`Self::emit_unordered`] does; those
+    /// lowering tagged `unevaluated` (a member initializer's operand, say,
+    /// which the walk flattens) first, as a group that
+    /// [never runs](Self::never_run), unless the walk is in one already.
+    fn emit_sites(&mut self, indices: &[usize], kind: Option<EventKind>, node: Option<Node<'a>>) {
+        let sites = self.sites;
+        if self.quiet > 0 || !indices.iter().any(|&i| sites[i].unevaluated) {
+            self.emit_unordered(indices, kind);
+            return;
+        }
+        let (never, runs): (Vec<usize>, Vec<usize>) =
+            indices.iter().partition(|&&i| sites[i].unevaluated);
+        self.never_run(node, |b| b.emit_unordered(&never, kind));
+        if !runs.is_empty() {
+            self.emit_unordered(&runs, kind);
+        }
+    }
+
+    /// An operand that may or may not be evaluated: a branch beside a
+    /// bypass, both joining after it.
+    fn may_run(&mut self, operand: Node<'a>) {
+        if !self.owned_sites(operand).0 {
+            self.visit(operand);
+            return;
+        }
+        let test = self.current();
+        let run = self.new_block(BlockKind::Ordinary);
+        let join = self.new_block(BlockKind::Ordinary);
+        self.edge(test, run, EdgeKind::BranchTrue);
+        self.edge(test, join, EdgeKind::BranchFalse);
+        self.start(run);
+        self.visit(operand);
+        self.jump(join, EdgeKind::Fallthrough);
+        self.start(join);
+    }
+
+    // ---- statements ----
+
+    /// A `static` or `thread_local` local: each declarator's initializer
+    /// (its calls and its construction) runs on the first pass only.
+    fn once_only_declaration(&mut self, node: Node<'a>) {
+        let mut cursor = node.walk();
+        let declarators: Vec<usize> = node
+            .children_by_field_name("declarator", &mut cursor)
+            .map(|d| d.id())
+            .collect();
+        for child in node.named_children(&mut cursor) {
+            if declarators.contains(&child.id()) {
+                self.may_run(child);
+            } else {
+                self.visit(child);
+            }
+        }
+    }
+
+    /// Whether some node of `node`'s subtree owns sites not yet taken that
+    /// may run (a destructor's among them), and whether one owns any that
+    /// lowering tagged `unevaluated`.
+    fn owned_sites(&self, node: Node<'a>) -> (bool, bool) {
+        let (mut runs, mut never) = (false, false);
+        let mut stack = vec![node];
+        let mut cursor = node.walk();
+        while let Some(n) = stack.pop() {
+            if self.destructors.contains_key(&n.id()) {
+                runs = true;
+            }
+            for &i in self.owned.get(&n.id()).into_iter().flatten() {
+                if self.sites[i].unevaluated {
+                    never = true;
+                } else {
+                    runs = true;
+                }
+            }
+            if runs {
+                break;
+            }
+            stack.extend(n.children(&mut cursor));
+        }
+        (runs, never)
+    }
+
+    fn if_statement(&mut self, node: Node<'a>) {
+        // A condition's declaration lives until the statement ends.
+        self.push_scope(ScopeKind::Block, None);
+        if let Some(condition) = node.cached_field("condition") {
+            self.visit(condition);
+        }
+        let test = self.current();
+        let join = self.new_block(BlockKind::Ordinary);
+        let then = self.new_block(BlockKind::Ordinary);
+        self.edge(test, then, EdgeKind::BranchTrue);
+        self.start(then);
+        if let Some(consequence) = node.cached_field("consequence") {
+            self.visit(consequence);
+        }
+        self.jump(join, EdgeKind::Fallthrough);
+        match node.cached_field("alternative") {
+            Some(alternative) => {
+                let other = self.new_block(BlockKind::Ordinary);
+                self.edge(test, other, EdgeKind::BranchFalse);
+                self.start(other);
+                self.visit(alternative);
+                self.jump(join, EdgeKind::Fallthrough);
+            }
+            None => self.edge(test, join, EdgeKind::BranchFalse),
+        }
+        self.enter(join);
+        self.pop_scope();
+    }
+
+    fn while_statement(&mut self, node: Node<'a>) {
+        // A condition's declaration lives for one iteration: the end of the
+        // body and `continue` destroy it in a block of their own before the
+        // next evaluation, a false condition and `break` at the exit.
+        self.push_scope(ScopeKind::Block, None);
+        let head = self.block_at(node);
+        self.jump(head, EdgeKind::Fallthrough);
+        self.start(head);
+        if let Some(condition) = node.cached_field("condition") {
+            self.visit(condition);
+        }
+        let test = self.current();
+        let body = self.new_block(BlockKind::Ordinary);
+        let exit = self.new_block(BlockKind::Ordinary);
+        self.edge(test, body, EdgeKind::BranchTrue);
+        self.edge(test, exit, EdgeKind::BranchFalse);
+        let scope = self.scopes.len() - 1;
+        if self.scopes[scope].objects.is_empty() {
+            self.loop_body(node, body, exit, head, EdgeKind::BackEdge);
+        } else {
+            let latch = self.new_block(BlockKind::Ordinary);
+            self.loop_body(node, body, exit, latch, EdgeKind::Fallthrough);
+            self.jump(latch, EdgeKind::Fallthrough);
+            self.enter(latch);
+            self.unwind(scope);
+        }
+        self.jump(head, EdgeKind::BackEdge);
+        self.enter(exit);
+        self.pop_scope();
+    }
+
+    fn do_statement(&mut self, node: Node<'a>) {
+        let body = self.block_at(node);
+        self.jump(body, EdgeKind::Fallthrough);
+        let test = self.new_block(BlockKind::Ordinary);
+        let exit = self.new_block(BlockKind::Ordinary);
+        self.loop_body(node, body, exit, test, EdgeKind::Fallthrough);
+        self.jump(test, EdgeKind::Fallthrough);
+        self.enter(test);
+        if let Some(condition) = node.cached_field("condition") {
+            self.visit(condition);
+        }
+        if let Some(end) = self.cur {
+            self.edge(end, body, EdgeKind::BackEdge);
+        }
+        self.jump(exit, EdgeKind::BranchFalse);
+        self.enter(exit);
+    }
+
+    fn for_statement(&mut self, node: Node<'a>) {
+        // The init-statement's declarations live until the loop ends. (The
+        // grammar parses no declaration as a `for` condition.)
+        self.push_scope(ScopeKind::Block, None);
+        if let Some(init) = node.cached_field("initializer") {
+            self.visit(init);
+        }
+        let head = self.block_at(node);
+        self.jump(head, EdgeKind::Fallthrough);
+        self.start(head);
+        let condition = node.cached_field("condition");
+        if let Some(condition) = condition {
+            self.visit(condition);
+        }
+        let test = self.current();
+        let body = self.new_block(BlockKind::Ordinary);
+        let exit = self.new_block(BlockKind::Ordinary);
+        let update = self.new_block(BlockKind::Ordinary);
+        if condition.is_some() {
+            self.edge(test, body, EdgeKind::BranchTrue);
+            self.edge(test, exit, EdgeKind::BranchFalse);
+        } else {
+            self.edge(test, body, EdgeKind::Fallthrough);
+        }
+        self.loop_body(node, body, exit, update, EdgeKind::Fallthrough);
+        self.jump(update, EdgeKind::Fallthrough);
+        self.enter(update);
+        if let Some(step) = node.cached_field("update") {
+            self.visit(step);
+        }
+        self.jump(head, EdgeKind::BackEdge);
+        self.enter(exit);
+        self.pop_scope();
+    }
+
+    fn for_range_loop(&mut self, node: Node<'a>) {
+        self.push_scope(ScopeKind::Block, None);
+        for field in ["initializer", "right"] {
+            if let Some(child) = node.cached_field(field) {
+                self.visit(child);
+            }
+        }
+        let head = self.block_at(node);
+        self.jump(head, EdgeKind::Fallthrough);
+        let body = self.new_block(BlockKind::Ordinary);
+        let exit = self.new_block(BlockKind::Ordinary);
+        self.edge(head, body, EdgeKind::BranchTrue);
+        self.edge(head, exit, EdgeKind::BranchFalse);
+        self.loop_body(node, body, exit, head, EdgeKind::BackEdge);
+        self.jump(head, EdgeKind::BackEdge);
+        self.enter(exit);
+        self.pop_scope();
+    }
+
+    /// Walk a loop's body from `body`; `break` goes to `exit`, `continue`
+    /// to `next`. A range-for variable lives in the body.
+    fn loop_body(
+        &mut self,
+        node: Node<'a>,
+        body: BlockId,
+        exit: BlockId,
+        next: BlockId,
+        next_kind: EdgeKind,
+    ) {
+        self.push_scope(
+            ScopeKind::Loop {
+                exit,
+                next,
+                next_kind,
+            },
+            None,
+        );
+        // Every loop reaches its body: a `do` body through its back edge
+        // even when nothing before the loop does.
+        self.start(body);
+        self.push_scope(ScopeKind::Block, None);
+        if node.cached_kind() == "for_range_loop" {
+            if let Some(declarator) = node.cached_field("declarator") {
+                self.own(declarator);
+            }
+        }
+        if let Some(statement) = node.cached_field("body") {
+            self.visit(statement);
+        }
+        self.pop_scope();
+        self.drop_scope();
+    }
+
+    fn switch_statement(&mut self, node: Node<'a>) {
+        self.push_scope(ScopeKind::Block, None);
+        if let Some(condition) = node.cached_field("condition") {
+            self.visit(condition);
+        }
+        let head = self.current();
+        let exit = self.new_block(BlockKind::Ordinary);
+        self.push_scope(
+            ScopeKind::Switch {
+                exit,
+                head,
+                has_default: false,
+            },
+            None,
+        );
+        // Only a case label reaches the statements of the body.
+        self.cur = None;
+        if let Some(body) = node.cached_field("body") {
+            self.visit(body);
+        }
+        let Some(Scope {
+            kind: ScopeKind::Switch { has_default, .. },
+            ..
+        }) = self.drop_scope()
+        else {
+            unreachable!("switch scope");
+        };
+        if !has_default {
+            self.edge(head, exit, EdgeKind::SwitchCase);
+        }
+        self.jump(exit, EdgeKind::Fallthrough);
+        self.enter(exit);
+        self.pop_scope();
+    }
+
+    fn case_statement(&mut self, node: Node<'a>) {
+        let label = self.block_at(node);
+        self.jump(label, EdgeKind::Fallthrough);
+        let value = node.cached_field("value");
+        let switch = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find_map(|s| match &mut s.kind {
+                ScopeKind::Switch {
+                    head, has_default, ..
+                } => Some((head, has_default)),
+                _ => None,
+            });
+        if let Some((head, has_default)) = switch {
+            *has_default |= value.is_none();
+            let head = *head;
+            self.edge(head, label, EdgeKind::SwitchCase);
+        }
+        self.enter(label);
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if Some(child.id()) != value.map(|v| v.id()) {
+                self.visit(child);
+            }
+        }
+    }
+
+    fn break_statement(&mut self) {
+        let target = self
+            .scopes
+            .iter()
+            .rposition(|s| matches!(s.kind, ScopeKind::Loop { .. } | ScopeKind::Switch { .. }));
+        let Some(at) = target else {
+            return;
+        };
+        self.unwind(at + 1);
+        let exit = match self.scopes[at].kind {
+            ScopeKind::Loop { exit, .. } | ScopeKind::Switch { exit, .. } => exit,
+            _ => unreachable!(),
+        };
+        self.jump(exit, EdgeKind::Fallthrough);
+    }
+
+    fn continue_statement(&mut self) {
+        let target = self
+            .scopes
+            .iter()
+            .rposition(|s| matches!(s.kind, ScopeKind::Loop { .. }));
+        let Some(at) = target else {
+            return;
+        };
+        self.unwind(at + 1);
+        let ScopeKind::Loop {
+            next, next_kind, ..
+        } = self.scopes[at].kind
+        else {
+            unreachable!();
+        };
+        self.jump(next, next_kind);
+    }
+
+    fn goto_statement(&mut self, node: Node<'a>) {
+        let label = node
+            .cached_field("label")
+            .filter(|_| !node.has_error())
+            .map(|l| node_text(self.source, &l));
+        let Some(label) = label else {
+            // `goto *p;`
+            self.unsupported_exit(node, GapKind::UnsupportedConstruct);
+            return;
+        };
+        if !self.goto_label(label) {
+            self.unsupported_exit(node, GapKind::UnresolvedGoto);
+        }
+    }
+
+    /// Jump to `label`, destroying the objects of the scopes left; false,
+    /// with nothing done, when the body has no such label.
+    fn goto_label(&mut self, label: &str) -> bool {
+        let Some(target) = self.labels.get(label) else {
+            return false;
+        };
+        let block = target.block;
+        // Leave the scopes the label is not inside.
+        let keep = self
+            .scopes
+            .iter()
+            .rposition(|s| s.node.is_some_and(|n| target.enclosing.contains(&n)))
+            .map_or(0, |at| at + 1);
+        // Back to a label already passed, the innermost scope around both
+        // also loses the objects it declared after the label (C++ destroys
+        // them when the jump crosses their declarations). A forward jump
+        // cannot skip one in valid C++, so it keeps the scope whole.
+        let since = keep
+            .checked_sub(1)
+            .and_then(|at| Some((at, *target.live.as_ref()?.get(at)?)));
+        let (at, kept) = since.unwrap_or((keep, 0));
+        self.unwind_since(at, kept);
+        self.jump(block, EdgeKind::Fallthrough);
+        true
+    }
+
+    /// `asm goto (... : labels)`: a branch to each label, each through a
+    /// block of its own destroying what the jump leaves, and a fallthrough
+    /// past it. A label the body lacks leaves through `unsupported`.
+    fn asm_goto(&mut self, node: Node<'a>, labels: Node<'a>) {
+        let from = self.current();
+        let mut unresolved = false;
+        let mut cursor = labels.walk();
+        for label in labels.children_by_field_name("label", &mut cursor) {
+            let name = node_text(self.source, &label);
+            if !self.labels.contains_key(name) {
+                unresolved = true;
+                continue;
+            }
+            let arm = self.new_block(BlockKind::Ordinary);
+            self.edge(from, arm, EdgeKind::SwitchCase);
+            self.start(arm);
+            self.goto_label(name);
+        }
+        if unresolved {
+            let first = self.cfg.events.len();
+            self.gap(GapKind::UnresolvedGoto, Some(node), first);
+            let exit = self.cfg.exit;
+            self.edge(from, exit, EdgeKind::Unsupported);
+        }
+        let next = self.new_block(BlockKind::Ordinary);
+        self.edge(from, next, EdgeKind::Fallthrough);
+        self.start(next);
+    }
+
+    fn unsupported_exit(&mut self, node: Node<'a>, kind: GapKind) {
+        let first = self.cfg.events.len();
+        self.gap(kind, Some(node), first);
+        let exit = self.cfg.exit;
+        self.jump(exit, EdgeKind::Unsupported);
+    }
+
+    fn labeled_statement(&mut self, node: Node<'a>) {
+        let label = node.cached_field("label");
+        let live: Vec<usize> = self.scopes.iter().map(|s| s.objects.len()).collect();
+        let block = label
+            .and_then(|l| self.labels.get_mut(node_text(self.source, &l)))
+            .map(|l| {
+                l.live = Some(live);
+                l.block
+            });
+        if let Some(block) = block {
+            // Made before the walk: it throws where the label is.
+            self.landing[block.0 as usize] = self.innermost_landing();
+            self.jump(block, EdgeKind::Fallthrough);
+            self.start(block);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if Some(child.id()) != label.map(|l| l.id()) {
+                self.visit(child);
+            }
+        }
+    }
+
+    /// Give every label of the body its block before the walk, so a `goto`
+    /// may jump forward.
+    fn collect_labels(&mut self, body: Node<'a>) {
+        // Each node with how many of `compounds` enclose it.
+        let mut stack = vec![(body, 0)];
+        // The compound statements around the node walked, outermost first.
+        let mut compounds: Vec<usize> = Vec::new();
+        let mut cursor = body.walk();
+        while let Some((n, depth)) = stack.pop() {
+            compounds.truncate(depth);
+            if matches!(
+                n.cached_kind(),
+                "lambda_expression" | "field_declaration_list" | "function_definition"
+            ) {
+                continue;
+            }
+            if n.cached_kind() == "labeled_statement" {
+                if let Some(label) = n.cached_field("label") {
+                    let name = node_text(self.source, &label);
+                    if !self.labels.contains_key(name) {
+                        let block = self.block_at(n);
+                        let enclosing = compounds.iter().rev().copied().collect();
+                        self.labels.insert(
+                            name,
+                            Label {
+                                block,
+                                enclosing,
+                                live: None,
+                            },
+                        );
+                    }
+                }
+            }
+            if n.cached_kind() == "compound_statement" {
+                compounds.push(n.id());
+            }
+            let at = stack.len();
+            stack.extend(n.named_children(&mut cursor).map(|c| (c, compounds.len())));
+            stack[at..].reverse();
+        }
+    }
+
+    fn throw_target(&mut self) -> BlockId {
+        if let Some(landing) = self.innermost_landing() {
+            return landing;
+        }
+        match self.cfg.exceptional_exit {
+            Some(b) => b,
+            None => {
+                let b = self.new_block(BlockKind::ExceptionalExit);
+                self.cfg.exceptional_exit = Some(b);
+                b
+            }
+        }
+    }
+
+    fn try_statement(&mut self, node: Node<'a>) {
+        let landing = self.new_block(BlockKind::Landing);
+        let exit = self.new_block(BlockKind::Ordinary);
+        // The body's blocks, made inside, throw to the landing (a nested
+        // `try`'s to its own, which passes on what its handlers do not
+        // catch).
+        self.push_scope(ScopeKind::Try { landing }, None);
+        let body = self.block_at(node);
+        self.jump(body, EdgeKind::Fallthrough);
+        self.enter(body);
+        if self.function_try == Some(node.id()) {
+            // `try : m_(f()) { ... }`: the initializers come first, in a
+            // block of their own, filled with the prologue once the walk is
+            // done.
+            self.prologue_in_try = Some(body);
+            let next = self.new_block(BlockKind::Ordinary);
+            self.jump(next, EdgeKind::Fallthrough);
+            self.enter(next);
+        }
+        if let Some(statement) = node.cached_field("body") {
+            self.visit(statement);
+        }
+        self.drop_scope();
+        self.jump(exit, EdgeKind::Fallthrough);
+        let mut catch_all = false;
+        let mut cursor = node.walk();
+        for clause in node.named_children(&mut cursor) {
+            if clause.cached_kind() != "catch_clause" {
+                continue;
+            }
+            let handler = self.block_at(clause);
+            self.edge(landing, handler, EdgeKind::Fallthrough);
+            self.start(handler);
+            self.push_scope(ScopeKind::Block, None);
+            if let Some(params) = clause.cached_field("parameters") {
+                catch_all |= is_catch_all(params);
+                for param in params.named_children(&mut params.walk()) {
+                    self.own(param);
+                    if let Some(declarator) = param.cached_field("declarator") {
+                        self.own(declarator);
+                    }
+                }
+            }
+            if let Some(statement) = clause.cached_field("body") {
+                self.visit(statement);
+            }
+            self.pop_scope();
+            self.jump(exit, EdgeKind::Fallthrough);
+        }
+        // On through the objects the statement's scopes hold, when an
+        // exception reaches the landing at all: a function-try-block's
+        // initializers, filled last, may throw to it.
+        let reached = self.reached[landing.0 as usize] || self.function_try == Some(node.id());
+        if !catch_all && reached {
+            let outer = self.unwinding_target();
+            self.exception_edge(landing, outer);
+        }
+        self.enter(exit);
+    }
+}
+
+/// The initializer written after `declarator` when it is a declaration's
+/// declarator with its `value` beside it (a condition's `G b = G()`), not
+/// inside it (`init_declarator`): what builds the object it declares.
+fn initializer_after(declarator: Node) -> Option<Node> {
+    let parent = declarator.parent()?;
+    let value = parent.child_by_field_name("value")?;
+    let is_declarator = parent
+        .child_by_field_name("declarator")
+        .is_some_and(|d| d.id() == declarator.id());
+    (is_declarator && value.start_byte() >= declarator.end_byte()).then_some(value)
+}
+
+/// A handler's parameter list is `(...)`: the ellipsis is the list's own
+/// token, not one inside a declaration (`catch (Fault<Ts...> &)`).
+fn is_catch_all(params: Node) -> bool {
+    params.named_child_count() == 0
+        && params
+            .children(&mut params.walk())
+            .any(|c| c.kind() == "...")
+}
+
+/// `callee` names a `setjmp` or `longjmp`, written plain, from the global
+/// namespace (`::longjmp`) or from `std` (`std::longjmp`).
+fn is_nonlocal_jump(callee: &str) -> bool {
+    let name: String = callee.chars().filter(|c| !c.is_whitespace()).collect();
+    let name = name.strip_prefix("::").unwrap_or(&name);
+    let name = name.strip_prefix("std::").unwrap_or(name);
+    matches!(
+        name,
+        "setjmp"
+            | "_setjmp"
+            | "sigsetjmp"
+            | "__sigsetjmp"
+            | "__builtin_setjmp"
+            | "longjmp"
+            | "_longjmp"
+            | "siglongjmp"
+            | "__builtin_longjmp"
+    )
+}
+
+/// A block-scope declaration whose initializers run once, not on every
+/// pass: `static` (the classification `storage_for` makes `FnStatic`) or
+/// thread storage.
+fn initializes_once(source: &str, declaration: Node) -> bool {
+    super::declaration_is_static(declaration)
+        || ["thread_local", "_Thread_local", "__thread"]
+            .into_iter()
+            .any(|keyword| super::has_storage_specifier(source, declaration, keyword))
+}
+
+/// Node kinds whose named children are evaluated in order.
+fn is_sequenced(kind: &str) -> bool {
+    kind.ends_with("_statement")
+        || matches!(
+            kind,
+            "declaration"
+                | "init_declarator"
+                | "condition_clause"
+                | "init_statement"
+                | "else_clause"
+                | "parenthesized_expression"
+                | "comma_expression"
+                | "translation_unit"
+        )
+}
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use std::collections::VecDeque;
+    use trace_ir::{BlockId, EdgeKind, EventId, EventKind, FunctionCfg, GapKind};
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/call_sequence")
+            .join(name)
+    }
+
+    /// One fixture file lowered as its own unit.
+    fn lower_with(name: &str, opts: PreprocessOptions) -> UnitIndex {
+        let path = fixture(name);
+        let root = path.parent().unwrap().to_path_buf();
+        let headers: Vec<PathBuf> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "h"))
+            .collect();
+        let graph = IncludeGraph::build(&root, std::slice::from_ref(&path), &headers);
+        let opts = project_preprocess_opts(&root, &opts, &graph);
+        index_source_file(
+            &path,
+            &root,
+            &graph,
+            &opts,
+            &IndexSourceCache::new(),
+            None,
+            &HeaderOrder::default(),
+        )
+    }
+
+    fn lower(name: &str) -> UnitIndex {
+        lower_with(name, PreprocessOptions::new().with_call_sequencing(true))
+    }
+
+    /// The graph of `function`, with the unit to read site names from.
+    struct Graph<'u> {
+        unit: &'u UnitIndex,
+        cfg: &'u FunctionCfg,
+    }
+
+    fn graph<'u>(unit: &'u UnitIndex, function: &str) -> Graph<'u> {
+        let id = unit
+            .functions
+            .iter()
+            .find(|f| f.name == function && f.is_defined)
+            .unwrap_or_else(|| panic!("no function {function}"))
+            .id;
+        let cfg = unit
+            .cfgs
+            .iter()
+            .find(|c| c.function == id)
+            .unwrap_or_else(|| panic!("no graph for {function}"));
+        Graph { unit, cfg }
+    }
+
+    impl Graph<'_> {
+        fn callee(&self, event: EventId) -> &str {
+            let site = self.cfg.events[event.0 as usize].sites[0];
+            let site = self.unit.call_sites.iter().find(|s| s.id == site).unwrap();
+            site.callee_name.as_str()
+        }
+
+        /// Events, edges, order and gaps, for failure messages.
+        fn dump(&self) -> String {
+            let mut out = String::new();
+            for (i, e) in self.cfg.events.iter().enumerate() {
+                out += &format!(
+                    "e{i} {} {:?} b{} line {}\n",
+                    self.callee(EventId(i as u32)),
+                    e.kind,
+                    e.block.0,
+                    e.occurrence.span.line
+                );
+            }
+            for e in &self.cfg.edges {
+                out += &format!("b{} -> b{} {:?}\n", e.from.0, e.to.0, e.kind);
+            }
+            out + &format!("order {:?}\ngaps {:?}\n", self.cfg.order, self.cfg.gaps)
+        }
+
+        fn all(&self, callee: &str) -> Vec<EventId> {
+            (0..self.cfg.events.len() as u32)
+                .map(EventId)
+                .filter(|&e| self.callee(e) == callee)
+                .collect()
+        }
+
+        /// The one event calling `callee`.
+        fn ev(&self, callee: &str) -> EventId {
+            let all = self.all(callee);
+            assert_eq!(
+                all.len(),
+                1,
+                "events calling {callee}: {all:?}\n{:#?}",
+                self.cfg
+            );
+            all[0]
+        }
+
+        /// The one event calling `callee` written on `line`.
+        fn ev_at(&self, callee: &str, line: u32) -> EventId {
+            let all: Vec<_> = self
+                .all(callee)
+                .into_iter()
+                .filter(|&e| self.cfg.events[e.0 as usize].occurrence.span.line == line)
+                .collect();
+            assert_eq!(all.len(), 1, "events calling {callee} at {line}: {all:?}");
+            all[0]
+        }
+
+        fn block(&self, e: EventId) -> BlockId {
+            self.cfg.events[e.0 as usize].block
+        }
+
+        fn kind(&self, e: EventId) -> EventKind {
+            self.cfg.events[e.0 as usize].kind
+        }
+
+        /// A path of immediate sequenced-before pairs from `a` to `b`.
+        fn sequenced(&self, a: EventId, b: EventId) -> bool {
+            let mut seen = vec![a];
+            let mut work = vec![a];
+            while let Some(x) = work.pop() {
+                for &(from, to) in &self.cfg.order {
+                    if from == x && !seen.contains(&to) {
+                        if to == b {
+                            return true;
+                        }
+                        seen.push(to);
+                        work.push(to);
+                    }
+                }
+            }
+            false
+        }
+
+        fn unordered(&self, a: EventId, b: EventId) -> bool {
+            self.block(a) == self.block(b) && !self.sequenced(a, b) && !self.sequenced(b, a)
+        }
+
+        /// Blocks reachable in one or more steps from `from`, never entering
+        /// `avoid`, over edges `keep` admits.
+        fn reach(
+            &self,
+            from: BlockId,
+            avoid: Option<BlockId>,
+            keep: impl Fn(EdgeKind) -> bool,
+        ) -> Vec<BlockId> {
+            let mut seen = Vec::new();
+            let mut work = VecDeque::from([from]);
+            while let Some(x) = work.pop_front() {
+                for e in &self.cfg.edges {
+                    if e.from == x && keep(e.kind) && Some(e.to) != avoid && !seen.contains(&e.to) {
+                        seen.push(e.to);
+                        work.push_back(e.to);
+                    }
+                }
+            }
+            seen
+        }
+
+        fn block_path(&self, from: BlockId, to: BlockId, avoid: Option<BlockId>) -> bool {
+            self.reach(from, avoid, |_| true).contains(&to)
+        }
+
+        /// Some execution may invoke `a` and later `b`.
+        fn may_precede(&self, a: EventId, b: EventId) -> bool {
+            (self.block(a) == self.block(b) && self.sequenced(a, b))
+                || self.block_path(self.block(a), self.block(b), None)
+        }
+
+        fn exclusive(&self, a: EventId, b: EventId) -> bool {
+            !self.may_precede(a, b) && !self.may_precede(b, a) && self.block(a) != self.block(b)
+        }
+
+        fn covered(&self, e: EventId) -> bool {
+            self.cfg
+                .gaps
+                .iter()
+                .any(|g| g.events.is_some_and(|(lo, hi)| lo <= e && e <= hi))
+        }
+
+        /// `b` runs only after `a` (when it runs, and nothing between
+        /// throws): same-block order, or dominance over normal edges.
+        fn guaranteed(&self, a: EventId, b: EventId) -> bool {
+            if self.covered(a) || self.covered(b) {
+                return false;
+            }
+            let (ba, bb) = (self.block(a), self.block(b));
+            if ba == bb {
+                return self.sequenced(a, b);
+            }
+            let normal = |k: EdgeKind| k != EdgeKind::Exception;
+            let entry = self.cfg.entry;
+            self.reach(entry, None, normal).contains(&bb)
+                && !self.reach(entry, Some(ba), normal).contains(&bb)
+        }
+
+        fn edge(&self, from: BlockId, to: BlockId, kind: EdgeKind) -> bool {
+            self.cfg
+                .edges
+                .iter()
+                .any(|e| e.from == from && e.to == to && e.kind == kind)
+        }
+
+        fn gap(&self, kind: GapKind) -> bool {
+            self.cfg.gaps.iter().any(|g| g.kind == kind)
+        }
+    }
+
+    #[test]
+    fn straight_line_calls_are_sequenced() {
+        let unit = lower("straight.c");
+        let g = graph(&unit, "run");
+        let (prepare, work, finish) = (g.ev("prepare"), g.ev("work"), g.ev("finish"));
+        assert!(g.sequenced(prepare, work));
+        assert!(g.sequenced(work, finish));
+        assert!(g.guaranteed(prepare, finish));
+        assert!(!g.sequenced(finish, prepare));
+        assert!(g.cfg.gaps.is_empty());
+    }
+
+    #[test]
+    fn sequencing_off_records_no_graphs() {
+        let unit = lower_with("straight.c", PreprocessOptions::new());
+        assert!(unit.cfgs.is_empty());
+    }
+
+    #[test]
+    fn if_else_arms_are_exclusive() {
+        let unit = lower("branches.c");
+        let g = graph(&unit, "run");
+        let (prepare, send, recover, finish) = (
+            g.ev("prepare"),
+            g.ev("send"),
+            g.ev("recover"),
+            g.ev("finish"),
+        );
+        assert!(g.exclusive(send, recover));
+        assert!(g.guaranteed(prepare, finish));
+        assert!(g.guaranteed(prepare, send));
+        assert!(g.may_precede(send, finish));
+        assert!(!g.guaranteed(send, finish));
+        assert!(!g.guaranteed(recover, finish));
+        assert!(!g.block_path(g.block(send), g.block(recover), None));
+        assert!(!g.cfg.order.contains(&(send, recover)));
+    }
+
+    #[test]
+    fn short_circuit_branches_and_arguments_are_unordered() {
+        let unit = lower("shortcircuit.c");
+        let g = graph(&unit, "both");
+        let (a, b) = (g.ev("a"), g.ev("b"));
+        assert!(g.edge(g.block(a), g.block(b), EdgeKind::BranchTrue));
+        assert!(g.guaranteed(a, b));
+        assert!(!g.may_precede(b, a));
+
+        let g = graph(&unit, "args");
+        let (f, gg, h) = (g.ev("f"), g.ev("g"), g.ev("h"));
+        assert!(g.unordered(gg, h));
+        assert!(g.sequenced(gg, f));
+        assert!(g.sequenced(h, f));
+
+        let g = graph(&unit, "sum");
+        let (f1, gg, k) = (g.ev("f1"), g.ev("g"), g.ev("k"));
+        assert!(g.sequenced(gg, f1));
+        assert!(g.unordered(f1, k));
+        assert!(g.unordered(gg, k));
+
+        let g = graph(&unit, "comma");
+        assert!(g.sequenced(g.ev("p"), g.ev("q")));
+    }
+
+    #[test]
+    fn cpp17_sequences_receivers_and_assignments() {
+        let unit = lower("args_order.cpp");
+        let g = graph(&unit, "receiver");
+        let (make, arg) = (g.ev("make"), g.ev("arg"));
+        assert!(g.sequenced(make, arg));
+        let g = graph(&unit, "assign");
+        let (lhs, rhs) = (g.ev("lhs"), g.ev("rhs"));
+        assert!(g.sequenced(rhs, lhs));
+        assert!(!g.sequenced(lhs, rhs));
+    }
+
+    #[test]
+    fn c_and_older_cpp_leave_receivers_and_assignments_unordered() {
+        let c = lower("args_order.c");
+        let cpp14 = lower_with(
+            "args_order.cpp",
+            PreprocessOptions::new()
+                .with_call_sequencing(true)
+                .with_define("__cplusplus", "201402L"),
+        );
+        for unit in [&c, &cpp14] {
+            let g = graph(unit, "receiver");
+            assert!(g.unordered(g.ev("make"), g.ev("arg")));
+            let g = graph(unit, "assign");
+            assert!(g.unordered(g.ev("lhs"), g.ev("rhs")));
+        }
+    }
+
+    #[test]
+    fn loops_keep_back_edges_and_jump_targets() {
+        let unit = lower("loops.c");
+        let g = graph(&unit, "for_loop");
+        let (init, more, step, body) = (g.ev("init"), g.ev("more"), g.ev("step"), g.ev("body"));
+        let (again, stop, skip, after) =
+            (g.ev("again"), g.ev("stop_now"), g.ev("skip"), g.ev("after"));
+        assert!(g.guaranteed(init, more));
+        assert!(!g.may_precede(more, init));
+        assert!(g.edge(g.block(step), g.block(more), EdgeKind::BackEdge));
+        assert!(g.may_precede(body, step));
+        assert!(g.may_precede(body, body));
+        assert!(!g.guaranteed(body, after));
+        // `continue` reaches the update without the rest of the body.
+        assert!(g.block_path(g.block(again), g.block(step), Some(g.block(skip))));
+        // `break` leaves without the update or the condition.
+        assert!(g.block_path(g.block(stop), g.block(after), Some(g.block(more))));
+
+        let g = graph(&unit, "do_loop");
+        let (body, more, after) = (g.ev("body"), g.ev("more"), g.ev("after"));
+        assert!(g.guaranteed(body, more));
+        assert!(g.edge(g.block(more), g.block(body), EdgeKind::BackEdge));
+        assert!(g.guaranteed(body, after));
+
+        let g = graph(&unit, "while_loop");
+        let (more, body, after) = (g.ev("more"), g.ev("body"), g.ev("after"));
+        assert!(g.guaranteed(more, body));
+        assert!(g.may_precede(body, body));
+        assert!(!g.guaranteed(body, after));
+        assert!(g.guaranteed(more, after));
+    }
+
+    /// A `do` body entered only through its back edge is the block the
+    /// back edge returns to.
+    #[test]
+    fn a_do_back_edge_returns_to_the_body_events() {
+        let unit = lower("loops.c");
+        let g = graph(&unit, "unreachable_do");
+        let (handle, more) = (g.ev("handle"), g.ev("more"));
+        assert!(
+            g.edge(g.block(more), g.block(handle), EdgeKind::BackEdge),
+            "{}",
+            g.dump()
+        );
+    }
+
+    /// In Duff's device the `do` body is entered only through case labels;
+    /// the back edge still returns to the body, not to an orphan block.
+    #[test]
+    fn a_do_back_edge_in_duffs_device_returns_to_the_body_events() {
+        let unit = lower("loops.c");
+        let g = graph(&unit, "duff");
+        let (handle, odd, more) = (g.ev("handle"), g.ev("handle_odd"), g.ev("more"));
+        assert!(
+            g.edge(g.block(more), g.block(handle), EdgeKind::BackEdge),
+            "{}",
+            g.dump()
+        );
+        assert!(g.may_precede(odd, handle), "{}", g.dump());
+    }
+
+    #[test]
+    fn a_recursive_call_is_an_event_of_its_own_function() {
+        let unit = lower("recursion.c");
+        let g = graph(&unit, "walk");
+        let (walk, leaf) = (g.ev("walk"), g.ev("leaf"));
+        assert!(g.may_precede(walk, leaf));
+        assert!(!g.guaranteed(walk, leaf));
+    }
+
+    #[test]
+    fn return_switch_and_goto_route_control() {
+        let unit = lower("early_exit.c");
+        let g = graph(&unit, "early");
+        let (check, fail, done) = (g.ev("check"), g.ev("fail"), g.ev("done"));
+        assert!(g.exclusive(fail, done));
+        assert!(g.guaranteed(check, done));
+        assert!(g.edge(g.block(fail), g.cfg.exit, EdgeKind::Return));
+
+        let g = graph(&unit, "cases");
+        let (a, b, c, after) = (g.ev("a"), g.ev("b"), g.ev("c"), g.ev("after"));
+        assert!(g.edge(g.block(a), g.block(b), EdgeKind::Fallthrough));
+        assert!(g.may_precede(a, b));
+        assert!(!g.guaranteed(a, b));
+        assert!(g.exclusive(b, c));
+        assert!(g.exclusive(a, c));
+        assert!(!g.guaranteed(b, after));
+
+        let g = graph(&unit, "jump");
+        let (check, work, cleanup) = (g.ev("check"), g.ev("work"), g.ev("cleanup"));
+        assert!(g.guaranteed(check, cleanup));
+        assert!(g.may_precede(work, cleanup));
+        assert!(!g.guaranteed(work, cleanup));
+        assert!(g.block_path(g.block(check), g.block(cleanup), Some(g.block(work))));
+    }
+
+    #[test]
+    fn a_switch_without_default_may_skip_every_case() {
+        let unit = lower("early_exit.c");
+        let g = graph(&unit, "cases");
+        let (a, after) = (g.ev("a"), g.ev("after"));
+        let head = g
+            .cfg
+            .edges
+            .iter()
+            .find(|e| e.to == g.block(a) && e.kind == EdgeKind::SwitchCase)
+            .unwrap()
+            .from;
+        assert!(g.edge(head, g.block(after), EdgeKind::SwitchCase));
+    }
+
+    #[test]
+    fn macro_expansions_are_distinct_sequenced_events() {
+        let unit = lower("macro_calls.c");
+        let g = graph(&unit, "twice");
+        // An argument spelled once and substituted twice: two invocations,
+        // each its own site, at one source position.
+        let steps = g.all("step");
+        assert_eq!(steps.len(), 2, "{:#?}", g.cfg);
+        let (first, second) = (steps[0], steps[1]);
+        assert_ne!(
+            g.cfg.events[first.0 as usize].sites,
+            g.cfg.events[second.0 as usize].sites
+        );
+        assert!(g.sequenced(first, second));
+
+        let g = graph(&unit, "logs");
+        let (a, b) = (g.ev("a"), g.ev("b"));
+        assert!(g.guaranteed(a, b));
+        let logs = g.all("log_it");
+        assert_eq!(logs.len(), 2);
+        assert!(g.sequenced(a, logs[0]));
+        assert!(g.sequenced(logs[0], b));
+    }
+
+    #[test]
+    fn automatic_objects_are_destroyed_at_every_scope_exit() {
+        let unit = lower("lifecycle.cpp");
+        let g = graph(&unit, "scoped");
+        let (ctor, work, dtor, after) = (
+            g.ev("Guard::Guard"),
+            g.ev("work"),
+            g.ev("Guard::~Guard"),
+            g.ev("after"),
+        );
+        assert_eq!(g.kind(ctor), EventKind::Construct);
+        assert_eq!(g.kind(dtor), EventKind::Destroy);
+        assert!(g.guaranteed(ctor, work));
+        assert!(g.guaranteed(work, dtor));
+        assert!(g.guaranteed(dtor, after));
+
+        let g = graph(&unit, "early");
+        let (fail, work) = (g.ev("fail"), g.ev("work"));
+        let dtors = g.all("Guard::~Guard");
+        assert_eq!(dtors.len(), 2, "{:#?}", g.cfg);
+        // One destructor event on the `return` path, one after `work`.
+        let (on_return, at_end) = if g.may_precede(work, dtors[0]) {
+            (dtors[1], dtors[0])
+        } else {
+            (dtors[0], dtors[1])
+        };
+        assert!(g.guaranteed(work, at_end));
+        assert!(g.exclusive(work, on_return));
+        assert!(g.guaranteed(fail, on_return));
+        // Both events stand for the one destructor site.
+        assert_eq!(
+            g.cfg.events[dtors[0].0 as usize].sites,
+            g.cfg.events[dtors[1].0 as usize].sites
+        );
+
+        let g = graph(&unit, "loop");
+        let use_ = g.ev("use");
+        let element = g.ev_at("Item::~Item", 37);
+        assert!(g.sequenced(use_, element), "{}", g.dump());
+        assert!(g.may_precede(element, use_));
+        let array = g.ev_at("Item::~Item", 36);
+        assert!(g.may_precede(element, array));
+        assert!(!g.guaranteed(element, array));
+        assert!(!g.may_precede(array, element));
+
+        let g = graph(&unit, "handler");
+        let (recover, caught) = (g.ev("recover"), g.ev("Item::~Item"));
+        assert!(g.guaranteed(recover, caught));
+    }
+
+    #[test]
+    fn each_base_lifecycle_call_is_its_own_event() {
+        let unit = lower("lifecycle.cpp");
+        let g = graph(&unit, "bases");
+        let (ctor_a, ctor_b) = (g.ev("BaseA::BaseA"), g.ev("BaseB::BaseB"));
+        let (dtor_a, dtor_b) = (g.ev("BaseA::~BaseA"), g.ev("BaseB::~BaseB"));
+        let work = g.ev("work");
+        for e in [ctor_a, ctor_b] {
+            assert_eq!(g.kind(e), EventKind::Construct);
+            assert_eq!(g.cfg.events[e.0 as usize].sites.len(), 1, "{}", g.dump());
+            assert!(g.sequenced(e, work), "{}", g.dump());
+        }
+        for e in [dtor_a, dtor_b] {
+            assert_eq!(g.kind(e), EventKind::Destroy);
+            assert_eq!(g.cfg.events[e.0 as usize].sites.len(), 1, "{}", g.dump());
+            assert!(g.sequenced(work, e), "{}", g.dump());
+        }
+        // Virtual bases are built first, and the IR does not say which are
+        // virtual: the bases' order is not claimed.
+        assert!(g.unordered(ctor_a, ctor_b), "{}", g.dump());
+        assert!(g.unordered(dtor_a, dtor_b), "{}", g.dump());
+    }
+
+    #[test]
+    fn each_declarator_constructs_before_the_next_is_evaluated() {
+        let unit = lower("lifecycle.cpp");
+        let g = graph(&unit, "two");
+        let (first, second) = (g.ev("first"), g.ev("second"));
+        let ctors = g.all("Pair::Pair");
+        assert_eq!(ctors.len(), 2, "{}", g.dump());
+        let (a, b) = (ctors[0], ctors[1]);
+        assert!(g.sequenced(first, a), "{}", g.dump());
+        assert!(g.sequenced(a, second));
+        assert!(g.sequenced(second, b));
+        // Destroyed in reverse order of construction.
+        let dtors = g.all("Pair::~Pair");
+        assert_eq!(dtors.len(), 2);
+        assert!(g.sequenced(b, dtors[0]));
+        assert!(g.sequenced(dtors[0], dtors[1]));
+        assert_eq!(
+            g.cfg.events[dtors[0].0 as usize].occurrence,
+            g.cfg.events[b.0 as usize].occurrence
+        );
+    }
+
+    #[test]
+    fn try_bodies_have_exception_edges_to_their_landing() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "guarded");
+        let (a, b, h, c) = (g.ev("a"), g.ev("b"), g.ev("h"), g.ev("c"));
+        let landing = g
+            .cfg
+            .edges
+            .iter()
+            .find(|e| e.from == g.block(a) && e.kind == EdgeKind::Exception)
+            .expect("exception edge")
+            .to;
+        assert_eq!(
+            g.cfg.blocks[landing.0 as usize].kind,
+            trace_ir::BlockKind::Landing
+        );
+        assert!(g.sequenced(a, b));
+        assert!(g.may_precede(a, h));
+        assert!(!g.may_precede(h, a));
+        assert!(!g.guaranteed(a, h));
+        assert!(g.may_precede(h, c));
+
+        let g = graph(&unit, "thrower");
+        let (before, dead) = (g.ev("before"), g.ev("dead"));
+        assert!(g.exclusive(before, dead));
+        let exceptional = g.cfg.exceptional_exit.expect("exceptional exit");
+        assert!(g.edge(g.block(before), exceptional, EdgeKind::Exception));
+    }
+
+    #[test]
+    fn a_parse_error_keeps_its_events_unordered_under_a_gap() {
+        let unit = lower("parse_error.c");
+        let g = graph(&unit, "broken");
+        assert!(g.gap(GapKind::ParseError), "{:#?}", g.cfg);
+        let (a, d, e, c) = (g.ev("a"), g.ev("d"), g.ev("e"), g.ev("c"));
+        // The misparsed call is kept, under the gap.
+        assert!(g.covered(d), "{}", g.dump());
+        assert!(!g.guaranteed(d, e));
+        assert!(!g.covered(a) && !g.covered(c));
+        assert!(g.guaranteed(a, c));
+    }
+
+    #[test]
+    fn a_recovered_statement_keeps_its_place() {
+        let unit = lower("recovery.cpp");
+        let g = graph(&unit, "declared");
+        let (before, factory, value) = (g.ev("before"), g.ev("factory"), g.ev("value"));
+        assert!(g.guaranteed(before, factory), "{}", g.dump());
+        assert!(g.guaranteed(factory, value));
+    }
+
+    #[test]
+    fn member_initializers_run_first_in_no_modeled_order() {
+        let unit = lower("prologue.cpp");
+        let g = graph(&unit, "Derived::Derived");
+        let (f, gg, base, body) = (g.ev("f"), g.ev("g"), g.ev("Base::Base"), g.ev("body"));
+        for e in [f, gg, base] {
+            assert!(g.covered(e), "{}", g.dump());
+            assert!(g.may_precede(e, body));
+            assert!(!g.may_precede(body, e));
+        }
+        assert!(!g.covered(body));
+        assert!(g.gap(GapKind::InitializerOrder));
+    }
+
+    #[test]
+    fn a_default_member_initializer_runs_first_under_a_gap() {
+        // Written in the class, outside the body and the initializer list.
+        let unit = lower("prologue.cpp");
+        let g = graph(&unit, "Owner::Owner");
+        let (seed, body) = (g.ev("seed"), g.ev("body"));
+        assert!(g.covered(seed), "{}", g.dump());
+        assert!(g.may_precede(seed, body));
+        assert!(!g.may_precede(body, seed));
+        assert!(!g.guaranteed(seed, body));
+    }
+
+    fn covered_by(g: &Graph, e: EventId, kind: GapKind) -> bool {
+        g.cfg
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == kind && gap.events.is_some_and(|(lo, hi)| lo <= e && e <= hi))
+    }
+
+    #[test]
+    fn unsupported_constructs_are_gaps_not_order() {
+        let unit = lower("unsupported.c");
+        let g = graph(&unit, "statement_expression");
+        let (inner, k) = (g.ev("g"), g.ev("k"));
+        assert!(
+            covered_by(&g, inner, GapKind::UnsupportedConstruct),
+            "{}",
+            g.dump()
+        );
+        assert!(!g.guaranteed(inner, k));
+
+        let g = graph(&unit, "computed");
+        let (a, b) = (g.ev("a"), g.ev("b"));
+        assert!(g.gap(GapKind::UnsupportedConstruct), "{}", g.dump());
+        assert!(g.edge(g.block(a), g.cfg.exit, EdgeKind::Unsupported));
+        assert!(g.exclusive(a, b));
+
+        let g = graph(&unit, "unresolved");
+        let a = g.ev("a");
+        assert!(g.gap(GapKind::UnresolvedGoto), "{}", g.dump());
+        assert!(g.edge(g.block(a), g.cfg.exit, EdgeKind::Unsupported));
+    }
+
+    #[test]
+    fn a_branch_inside_unordered_operands_is_a_gap() {
+        let unit = lower("unsupported.c");
+        let g = graph(&unit, "branchy");
+        let (a, b, c, f) = (g.ev("a"), g.ev("b"), g.ev("c"), g.ev("f"));
+        for e in [a, b, c] {
+            assert!(covered_by(&g, e, GapKind::UnorderedBranch), "{}", g.dump());
+        }
+        assert!(!g.guaranteed(a, c));
+        assert!(!g.covered(f) || !g.guaranteed(c, f));
+    }
+
+    #[test]
+    fn setjmp_and_longjmp_are_unsupported() {
+        let unit = lower("unsupported.c");
+        let g = graph(&unit, "jumps");
+        let (set, jump) = (g.ev("setjmp"), g.ev("longjmp"));
+        assert!(
+            covered_by(&g, set, GapKind::UnsupportedConstruct),
+            "{}",
+            g.dump()
+        );
+        assert!(covered_by(&g, jump, GapKind::UnsupportedConstruct));
+        assert!(!g.guaranteed(set, jump));
+    }
+
+    /// `asm goto` branches to each label it names and falls through; a
+    /// label it names that the body lacks leaves through `unsupported`.
+    #[test]
+    fn asm_goto_branches_to_its_labels() {
+        let unit = lower("unsupported.c");
+        let g = graph(&unit, "asm_jump");
+        let (a, b) = (g.ev("a"), g.ev("b"));
+        let into =
+            |to: BlockId, kind: EdgeKind| g.cfg.edges.iter().any(|e| e.to == to && e.kind == kind);
+        assert!(into(g.block(b), EdgeKind::SwitchCase), "{}", g.dump());
+        assert!(g.may_precede(a, b));
+        assert!(!g.guaranteed(a, b));
+        assert!(g.cfg.gaps.is_empty());
+
+        let g = graph(&unit, "asm_unresolved");
+        let a = g.ev("a");
+        assert!(g.gap(GapKind::UnresolvedGoto), "{}", g.dump());
+        let asm = g.cfg.edges.iter().find(|e| e.kind == EdgeKind::Unsupported);
+        assert!(asm.is_some_and(|e| e.to == g.cfg.exit), "{}", g.dump());
+        assert!(g.block_path(asm.unwrap().from, g.block(a), None));
+
+        let g = graph(&unit, "asm_plain");
+        assert!(g.sequenced(g.ev("a"), g.ev("b")));
+        assert!(g.cfg.gaps.is_empty());
+    }
+
+    #[test]
+    fn jumps_out_of_a_scope_destroy_its_objects() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "jumps");
+        let (quit, work, after) = (g.ev("quit"), g.ev("work"), g.ev("after"));
+        let dtors = g.all("Guard::~Guard");
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        // One destructor on the `goto` path, one at the block's end.
+        assert!(dtors
+            .iter()
+            .any(|&d| g.exclusive(d, work) && g.guaranteed(quit, d)));
+        assert!(dtors.iter().any(|&d| g.guaranteed(work, d)));
+        for &d in &dtors {
+            assert!(g.may_precede(d, after));
+        }
+
+        let g = graph(&unit, "loops");
+        let (skip, quit, work) = (g.ev("skip"), g.ev("quit"), g.ev("work"));
+        let dtors = g.all("Guard::~Guard");
+        // `continue`, `break` and the end of the body each leave the scope.
+        assert_eq!(dtors.len(), 3, "{}", g.dump());
+        let (more, after) = (g.ev("more"), g.ev("after"));
+        let at_end: Vec<_> = dtors.iter().filter(|&&d| g.guaranteed(work, d)).collect();
+        let on_continue: Vec<_> = dtors
+            .iter()
+            .filter(|&&d| g.guaranteed(skip, d) && !g.guaranteed(quit, d))
+            .collect();
+        let on_break: Vec<_> = dtors
+            .iter()
+            .filter(|&&d| g.guaranteed(quit, d) && !g.guaranteed(work, d))
+            .collect();
+        assert_eq!((at_end.len(), on_continue.len(), on_break.len()), (1, 1, 1));
+        let (on_continue, on_break) = (*on_continue[0], *on_break[0]);
+        assert!(g.block_path(g.block(on_continue), g.block(more), Some(g.block(work))));
+        assert!(g.block_path(g.block(on_break), g.block(after), Some(g.block(more))));
+    }
+
+    #[test]
+    fn a_backward_goto_destroys_the_objects_declared_after_its_label() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "rewound");
+        let (before, retry, work) = (g.ev("before"), g.ev("retry"), g.ev("work"));
+        let dtors = g.all("Guard::~Guard");
+        // One destructor on the `goto` path, one at the body's end.
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        let on_goto: Vec<_> = dtors
+            .iter()
+            .copied()
+            .filter(|&d| !g.may_precede(work, d))
+            .collect();
+        assert_eq!(on_goto.len(), 1, "{}", g.dump());
+        let on_goto = on_goto[0];
+        assert!(g.guaranteed(retry, on_goto), "{}", g.dump());
+        // Back to the label only through the destructor.
+        let label = g.block(before);
+        assert!(g.block_path(g.block(on_goto), label, None), "{}", g.dump());
+        assert!(
+            !g.block_path(g.block(retry), label, Some(g.block(on_goto))),
+            "{}",
+            g.dump()
+        );
+
+        // Leaving a nested scope too: its object, then the one declared
+        // after the label in the label's own scope.
+        let g = graph(&unit, "rewound_nested");
+        let (before, retry, work) = (g.ev("before"), g.ev("retry"), g.ev("work"));
+        let dtors = g.all("Guard::~Guard");
+        assert_eq!(dtors.len(), 4, "{}", g.dump());
+        let on_goto: Vec<_> = dtors
+            .iter()
+            .copied()
+            .filter(|&d| !g.may_precede(work, d))
+            .collect();
+        assert_eq!(on_goto.len(), 2, "{}", g.dump());
+        let (inner, outer) = (on_goto[0], on_goto[1]);
+        assert!(g.sequenced(inner, outer), "{}", g.dump());
+        let line = |e: EventId| g.cfg.events[e.0 as usize].occurrence.span.line;
+        assert!(line(inner) > line(outer), "inner first: {}", g.dump());
+        assert!(g.guaranteed(retry, inner));
+        let label = g.block(before);
+        assert!(
+            !g.block_path(g.block(retry), label, Some(g.block(outer))),
+            "{}",
+            g.dump()
+        );
+
+        // A forward `goto` within the scope destroys nothing early.
+        let g = graph(&unit, "forward");
+        let (work, after) = (g.ev("work"), g.ev("after"));
+        let dtor = g.ev("Guard::~Guard");
+        assert!(g.guaranteed(after, dtor), "{}", g.dump());
+        assert!(g.may_precede(work, dtor));
+    }
+
+    #[test]
+    fn a_loop_condition_object_is_destroyed_as_the_loop_ends() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "leased");
+        let after = g.ev("after");
+        let dtors = g.all("Lease::~Lease");
+        assert!(
+            dtors.iter().any(|&d| g.guaranteed(d, after)),
+            "{}",
+            g.dump()
+        );
+    }
+
+    #[test]
+    fn a_loop_condition_object_is_destroyed_on_each_iteration() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "lease_continued");
+        let (lease, skip, quit, work, after) = (
+            g.ev("lease"),
+            g.ev("skip"),
+            g.ev("quit"),
+            g.ev("work"),
+            g.ev("after"),
+        );
+        let head = g.block(lease);
+        let dtors = g.all("Lease::~Lease");
+        // Ending an iteration (the body's end or `continue`) destroys the
+        // object before the next condition is evaluated...
+        let again = *dtors
+            .iter()
+            .find(|&&d| g.edge(g.block(d), head, EdgeKind::BackEdge))
+            .unwrap_or_else(|| panic!("no destructor on the back edge: {}", g.dump()));
+        assert!(g.may_precede(work, again), "{}", g.dump());
+        assert!(
+            g.block_path(g.block(skip), g.block(again), Some(g.block(work))),
+            "{}",
+            g.dump()
+        );
+        assert!(
+            !g.block_path(g.block(again), g.block(work), Some(head)),
+            "{}",
+            g.dump()
+        );
+        // ...and leaving the loop (a false condition or `break`) destroys
+        // it before what follows.
+        let out = *dtors
+            .iter()
+            .find(|&&d| g.guaranteed(d, after))
+            .unwrap_or_else(|| panic!("no destructor after the loop: {}", g.dump()));
+        assert!(
+            g.block_path(g.block(quit), g.block(out), Some(head)),
+            "{}",
+            g.dump()
+        );
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+
+        // A `for` init-statement's object lives for the whole loop.
+        let g = graph(&unit, "guarded_for");
+        let (more, skip, step, work, after) = (
+            g.ev("more"),
+            g.ev("skip"),
+            g.ev("value"),
+            g.ev("work"),
+            g.ev("after"),
+        );
+        assert!(
+            g.block_path(g.block(skip), g.block(step), Some(g.block(work))),
+            "{}",
+            g.dump()
+        );
+        let dtor = g.ev("Guard::~Guard");
+        assert!(g.guaranteed(dtor, after), "{}", g.dump());
+        assert!(!g.may_precede(dtor, more), "{}", g.dump());
+        assert!(!g.may_precede(dtor, step), "{}", g.dump());
+    }
+
+    #[test]
+    fn a_throw_destroys_the_objects_it_leaves() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "thrown");
+        let (quit, work, after) = (g.ev("quit"), g.ev("work"), g.ev("after"));
+        let dtors = g.all("Guard::~Guard");
+        // One destructor on the `throw` path, one on the way from a call
+        // that throws, one at the block's end.
+        assert_eq!(dtors.len(), 3, "{}", g.dump());
+        assert!(dtors
+            .iter()
+            .any(|&d| g.exclusive(d, work) && g.guaranteed(quit, d) && g.may_precede(d, after)));
+    }
+
+    #[test]
+    fn a_labeled_call_in_a_try_body_may_throw() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "retried");
+        let (work, more) = (g.ev("work"), g.ev("more"));
+        assert!(g.may_precede(work, more), "{}", g.dump());
+        assert!(g.may_precede(more, work));
+    }
+
+    #[test]
+    fn a_local_class_member_is_not_the_enclosing_flow() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "local_class");
+        let (work, after) = (g.ev("work"), g.ev("after"));
+        // The member's `return` does not leave the enclosing function.
+        assert!(g.guaranteed(work, after), "{}", g.dump());
+        for value in g.all("value") {
+            assert!(g.covered(value), "{}", g.dump());
+        }
+    }
+
+    #[test]
+    fn new_constructs_and_delete_destroys() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "heap");
+        let (value, ctor, dtor) = (g.ev("value"), g.ev("Node::Node"), g.ev("Node::~Node"));
+        assert_eq!(g.kind(ctor), EventKind::Construct);
+        assert_eq!(g.kind(dtor), EventKind::Delete);
+        assert!(g.sequenced(value, ctor), "{}", g.dump());
+        assert!(g.sequenced(ctor, dtor));
+    }
+
+    #[test]
+    fn a_lambda_body_is_its_own_graph() {
+        let unit = lower("lambda.cpp");
+        let g = graph(&unit, "outer");
+        let (before, seed, after) = (g.ev("before"), g.ev("seed"), g.ev("after"));
+        assert!(g.all("inside").is_empty(), "{}", g.dump());
+        assert!(g.sequenced(before, seed));
+        assert!(g.sequenced(seed, after));
+        let lambda = unit
+            .functions
+            .iter()
+            .find(|f| f.name.contains("$lambda"))
+            .unwrap()
+            .name
+            .clone();
+        let inner = graph(&unit, &lambda);
+        inner.ev("inside");
+        assert!(inner.all("seed").is_empty());
+    }
+
+    #[test]
+    fn an_exception_no_handler_catches_leaves_the_function() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "typed");
+        let a = g.ev("a");
+        let landing = g
+            .cfg
+            .edges
+            .iter()
+            .find(|e| e.from == g.block(a) && e.kind == EdgeKind::Exception)
+            .unwrap()
+            .to;
+        let exceptional = g.cfg.exceptional_exit.expect("exceptional exit");
+        assert!(
+            g.edge(landing, exceptional, EdgeKind::Exception),
+            "{}",
+            g.dump()
+        );
+
+        let g = graph(&unit, "guarded");
+        assert!(g.cfg.exceptional_exit.is_none());
+    }
+
+    /// `throw work();` in a `try` leaves for the handlers once: the throw's
+    /// own edge and the edge for the call in it are one edge, as built and
+    /// not only once `compact` drops duplicates.
+    #[test]
+    fn a_throw_in_a_try_has_one_exception_edge() {
+        // Built without a repeated edge (asserted before `compact` in every
+        // debug build), so `compact` hides none here.
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "rethrow");
+        let work = g.block(g.ev("work"));
+        let exception = |b: BlockId| {
+            g.cfg
+                .edges
+                .iter()
+                .filter(|e| e.from == b && e.kind == EdgeKind::Exception)
+                .count()
+        };
+        assert_eq!(exception(work), 1, "{}", g.dump());
+    }
+
+    /// A constructor's function-try-block is a child of the definition, not
+    /// its `body`: its initializers, body and handlers are lowered all the
+    /// same, the initializers inside the `try`.
+    #[test]
+    fn a_constructor_function_try_block_is_lowered() {
+        let unit = lower("exceptions.cpp");
+        let ctor = unit
+            .functions
+            .iter()
+            .find(|f| f.name == "Guarded::Guarded" && f.is_defined)
+            .unwrap()
+            .id;
+        let mut callees: Vec<&str> = unit
+            .call_sites
+            .iter()
+            .filter(|s| s.caller == ctor)
+            .map(|s| s.callee_name.as_str())
+            .collect();
+        callees.sort_unstable();
+        assert_eq!(callees, ["Member::Member", "h", "make", "run"]);
+        let g = graph(&unit, "Guarded::Guarded");
+        let make = g.block(g.ev("make"));
+        let run = g.block(g.ev("run"));
+        let h = g.block(g.ev("h"));
+        // The initializers run first, in the `try`.
+        assert!(
+            g.reach(make, None, |k| k == EdgeKind::Fallthrough)
+                .contains(&run),
+            "{}",
+            g.dump()
+        );
+        assert!(!g.reach(run, None, |_| true).contains(&make));
+        assert!(
+            g.reach(make, None, |k| k == EdgeKind::Exception)
+                .into_iter()
+                .any(|b| g.reach(b, None, |_| true).contains(&h)),
+            "{}",
+            g.dump()
+        );
+    }
+
+    /// The outer `try` takes what the inner handlers throw, and what the
+    /// inner `try` lets through, never what it catches.
+    #[test]
+    fn an_inner_catch_all_shields_the_outer_try() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "nested");
+        let a = g.block(g.ev("a"));
+        let c = g.block(g.ev("c"));
+        assert!(!g.reach(a, None, |_| true).contains(&c), "{}", g.dump());
+        let g = graph(&unit, "nested_typed");
+        let a = g.block(g.ev("a"));
+        let c = g.block(g.ev("c"));
+        assert!(g.reach(a, None, |_| true).contains(&c), "{}", g.dump());
+    }
+
+    /// Two statements of `n` unordered calls each: what orders the second
+    /// after the first is one `sequenced` edge between their blocks, not a
+    /// pair per two calls.
+    #[test]
+    fn consecutive_unordered_groups_store_linear_order() {
+        let n = 100;
+        let sum = vec!["step()"; n].join(" + ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sums.c");
+        std::fs::write(
+            &path,
+            format!("int step(void);\nvoid sums(void)\n{{\n    {sum};\n    {sum};\n}}\n"),
+        )
+        .unwrap();
+        let graph_ = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let unit = index_source_file(
+            &path,
+            dir.path(),
+            &graph_,
+            &PreprocessOptions::new().with_call_sequencing(true),
+            &IndexSourceCache::new(),
+            None,
+            &HeaderOrder::default(),
+        );
+        let g = graph(&unit, "sums");
+        let steps = g.all("step");
+        assert_eq!(steps.len(), 2 * n);
+        assert!(
+            g.cfg.order.len() < 4 * n,
+            "{} order pairs for {} events",
+            g.cfg.order.len(),
+            steps.len()
+        );
+        let line = |e: EventId| g.cfg.events[e.0 as usize].occurrence.span.line;
+        let (first, second): (Vec<_>, Vec<_>) = steps.iter().partition(|&&e| line(e) == 4);
+        assert_eq!((first.len(), second.len()), (n, n));
+        let (a, b) = (g.block(first[0]), g.block(second[0]));
+        assert!(first.iter().all(|&e| g.block(e) == a));
+        assert!(second.iter().all(|&e| g.block(e) == b));
+        assert!(g.edge(a, b, EdgeKind::Sequenced), "{}", g.dump());
+        assert!(g.unordered(first[0], first[n - 1]));
+        assert!(g.unordered(second[0], second[n - 1]));
+    }
+
+    #[test]
+    fn nesting_past_the_walk_depth_is_a_gap() {
+        // Indexing runs on threads with this stack (`index_pool`).
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("deep.c");
+                let depth = MAX_AST_WALK_DEPTH as usize + 10;
+                let source = format!(
+                    "int g(void);\nint k(void);\nint deep(void)\n{{\n    k();\n    return {}g(){};\n}}\n",
+                    "(".repeat(depth),
+                    ")".repeat(depth)
+                );
+                std::fs::write(&path, source).unwrap();
+                let graph_ = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+                let unit = index_source_file(
+                    &path,
+                    dir.path(),
+                    &graph_,
+                    &PreprocessOptions::new().with_call_sequencing(true),
+                    &IndexSourceCache::new(),
+                    None,
+                    &HeaderOrder::default(),
+                );
+                let g = graph(&unit, "deep");
+                assert!(g.gap(GapKind::DepthExceeded), "{}", g.dump());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn generic_selection_runs_one_association_and_not_its_controlling_expression() {
+        let unit = lower("branches.c");
+        let g = graph(&unit, "generic_pick");
+        let (selector, chosen, other, picked) = (
+            g.ev("selector"),
+            g.ev("chosen"),
+            g.ev("other"),
+            g.ev("picked"),
+        );
+        assert!(g.exclusive(chosen, other), "{}", g.dump());
+        for e in [chosen, other] {
+            assert!(g.may_precede(e, picked), "{}", g.dump());
+            assert!(!g.guaranteed(e, picked), "{}", g.dump());
+        }
+        // The controlling expression is never evaluated: no proof either way.
+        assert!(
+            covered_by(&g, selector, GapKind::Unevaluated),
+            "{}",
+            g.dump()
+        );
+        for e in [chosen, other, picked] {
+            assert!(!g.guaranteed(selector, e), "{}", g.dump());
+        }
+    }
+
+    #[test]
+    fn a_factory_and_the_constructor_it_runs_are_separate_events() {
+        let unit = lower("lifecycle.cpp");
+        let g = graph(&unit, "shared_build");
+        let site = |e: EventId, name: &str| {
+            g.cfg.events[e.0 as usize].sites.iter().any(|&s| {
+                unit.call_sites
+                    .iter()
+                    .any(|c| c.id == s && c.callee_name.as_str().starts_with(name))
+            })
+        };
+        let events = |name: &str| -> Vec<EventId> {
+            (0..g.cfg.events.len() as u32)
+                .map(EventId)
+                .filter(|&e| site(e, name))
+                .collect()
+        };
+        let (factory, ctor) = (events("std::make_shared"), events("Widget::Widget"));
+        assert_eq!(factory.len(), 1, "{}", g.dump());
+        assert_eq!(ctor.len(), 1, "{}", g.dump());
+        let (factory, ctor, arg) = (factory[0], ctor[0], g.ev("make_arg"));
+        assert_ne!(factory, ctor, "{}", g.dump());
+        assert!(!site(factory, "Widget::Widget"), "{}", g.dump());
+        assert_eq!(g.kind(ctor), EventKind::Construct);
+        assert!(g.sequenced(arg, factory), "{}", g.dump());
+        assert!(g.sequenced(arg, ctor), "{}", g.dump());
+        // It runs inside the factory: no order between the two is claimed.
+        assert!(g.unordered(factory, ctor), "{}", g.dump());
+    }
+
+    #[test]
+    fn a_once_only_local_initializer_may_be_skipped() {
+        let unit = lower("lifecycle.cpp");
+        for (function, init) in [
+            ("once_object", "Once::Once"),
+            ("once_value", "seed_value"),
+            ("once_thread", "Once::Once"),
+        ] {
+            let g = graph(&unit, function);
+            let (init, after) = (g.ev(init), g.ev("after"));
+            assert!(g.may_precede(init, after), "{function}\n{}", g.dump());
+            assert!(!g.sequenced(init, after), "{function}\n{}", g.dump());
+            assert!(!g.guaranteed(init, after), "{function}\n{}", g.dump());
+            // A path that skips the initializer reaches `after`.
+            let entry = g.cfg.entry;
+            assert!(
+                g.block_path(entry, g.block(after), Some(g.block(init))),
+                "{function}\n{}",
+                g.dump()
+            );
+            assert!(g.all("Once::~Once").is_empty(), "{function}\n{}", g.dump());
+        }
+    }
+
+    /// `try { Sentry s; may_throw(); later(); } catch (...)`: a call that
+    /// throws leaves the body through `s`'s destructor, so `later` is not
+    /// proven to precede every destruction of `s`.
+    #[test]
+    fn an_exception_destroys_the_objects_it_leaves() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "unwound");
+        let (ctor, thrower, later, h) = (
+            g.ev("Sentry::Sentry"),
+            g.ev("may_throw"),
+            g.ev("later"),
+            g.ev("h"),
+        );
+        let dtors = g.all("Sentry::~Sentry");
+        // At the body's end, and on the way to the handler.
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        for &d in &dtors {
+            assert!(g.may_precede(thrower, d), "{}", g.dump());
+        }
+        let unwinding: Vec<_> = dtors
+            .iter()
+            .copied()
+            .filter(|&d| !g.may_precede(later, d) || !g.sequenced(later, d))
+            .collect();
+        assert_eq!(unwinding.len(), 1, "{}", g.dump());
+        let d = unwinding[0];
+        assert!(g.may_precede(d, h), "{}", g.dump());
+        assert!(!g.guaranteed(later, d), "{}", g.dump());
+        assert!(g.may_precede(ctor, d), "{}", g.dump());
+
+        // An exception the inner handlers do not catch leaves the outer
+        // body through its object's destructor too.
+        let g = graph(&unit, "unwound_nested");
+        let (thrower, h) = (g.ev("may_throw"), g.ev("h"));
+        let dtors = g.all("Sentry::~Sentry");
+        assert!(
+            dtors
+                .iter()
+                .any(|&d| g.may_precede(thrower, d) && g.may_precede(d, h)),
+            "{}",
+            g.dump()
+        );
+    }
+
+    /// A call written in an operand that is never evaluated orders
+    /// nothing; one in an operand that may be evaluated (`typeid`, a
+    /// variable-length array type) may run or not.
+    #[test]
+    fn unevaluated_operands_order_nothing() {
+        let unit = lower("args_order.cpp");
+        let g = graph(&unit, "unevaluated_operands");
+        let then = g.ev("then");
+        for callee in ["sized", "typed", "checked", "required"] {
+            let e = g.ev(callee);
+            assert!(
+                covered_by(&g, e, GapKind::Unevaluated),
+                "{callee}\n{}",
+                g.dump()
+            );
+            assert!(!g.guaranteed(e, then), "{callee}\n{}", g.dump());
+        }
+        for callee in ["identified", "bound"] {
+            let e = g.ev(callee);
+            assert!(
+                !covered_by(&g, e, GapKind::Unevaluated),
+                "{callee}\n{}",
+                g.dump()
+            );
+            assert!(g.may_precede(e, then), "{callee}\n{}", g.dump());
+            assert!(!g.sequenced(e, then), "{callee}\n{}", g.dump());
+            assert!(!g.guaranteed(e, then), "{callee}\n{}", g.dump());
+        }
+
+        let unit = lower("args_order.c");
+        let g = graph(&unit, "size_query");
+        let (sized, after) = (g.ev("sized"), g.ev("after_size"));
+        assert!(covered_by(&g, sized, GapKind::Unevaluated), "{}", g.dump());
+        assert!(!g.guaranteed(sized, after), "{}", g.dump());
+        // `sizeof(int[counted()])` evaluates the array bound.
+        let g = graph(&unit, "vla_size");
+        let (counted, after) = (g.ev("counted"), g.ev("after_size"));
+        assert!(
+            !covered_by(&g, counted, GapKind::Unevaluated),
+            "{}",
+            g.dump()
+        );
+        assert!(g.may_precede(counted, after), "{}", g.dump());
+        assert!(!g.guaranteed(counted, after), "{}", g.dump());
+    }
+
+    /// Where `from`'s exception edges lead.
+    fn exception_targets(g: &Graph, from: BlockId) -> Vec<BlockId> {
+        g.cfg
+            .edges
+            .iter()
+            .filter(|e| e.from == from && e.kind == EdgeKind::Exception)
+            .map(|e| e.to)
+            .collect()
+    }
+
+    /// `n` objects declared one after another in a `try`: each
+    /// constructor may throw with the objects before it live, yet the
+    /// cleanup blocks chain, one destructor each, instead of one block per
+    /// set of live objects.
+    #[test]
+    fn cleanup_blocks_are_linear_in_live_objects() {
+        let n = 300;
+        let locals: String = (0..n).map(|i| format!("        L o{i};\n")).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.cpp");
+        std::fs::write(
+            &path,
+            format!(
+                "struct L {{\n    L();\n    ~L();\n}};\nvoid many()\n{{\n    try {{\n{locals}    }} catch (...) {{\n    }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let graph_ = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let unit = index_source_file(
+            &path,
+            dir.path(),
+            &graph_,
+            &PreprocessOptions::new().with_call_sequencing(true),
+            &IndexSourceCache::new(),
+            None,
+            &HeaderOrder::default(),
+        );
+        let g = graph(&unit, "many");
+        assert_eq!(g.all("L::L").len(), n);
+        assert!(
+            g.cfg.events.len() < 4 * n,
+            "{} events for {n} objects",
+            g.cfg.events.len()
+        );
+        assert!(
+            g.cfg.order.len() < 4 * n,
+            "{} order pairs for {n} objects",
+            g.cfg.order.len()
+        );
+        // Each object is destroyed at the body's end and, but for the last,
+        // in one cleanup block: the later constructors' throws share them.
+        assert_eq!(g.all("L::~L").len(), 2 * n - 1);
+    }
+
+    /// A `try` whose body never throws, or throws only from code nothing
+    /// reaches, passes nothing on: no cleanup for the objects around it.
+    #[test]
+    fn an_unreachable_landing_passes_nothing_on() {
+        let unit = lower("exceptions.cpp");
+        for function in ["dead_landing", "dead_after_break"] {
+            let g = graph(&unit, function);
+            let (w, k) = (g.ev("w"), g.ev("k"));
+            let dtor = g.ev("G::~G");
+            assert!(g.guaranteed(w, dtor), "{function}\n{}", g.dump());
+            assert!(g.guaranteed(k, dtor), "{function}\n{}", g.dump());
+            assert!(g.cfg.exceptional_exit.is_none(), "{function}\n{}", g.dump());
+        }
+        let g = graph(&unit, "dead_after_return");
+        assert!(g.cfg.exceptional_exit.is_none(), "{}", g.dump());
+    }
+
+    /// `if (G b = G())`, `while (G d = G())`: the object is live once
+    /// built, so its constructor throws straight to the landing, as in
+    /// `G b = G();`.
+    #[test]
+    fn a_condition_object_is_live_once_built() {
+        let unit = lower("exceptions.cpp");
+        for function in ["condition_if", "condition_while", "declared_object"] {
+            let g = graph(&unit, function);
+            let ctor = g.ev("G::G");
+            let landing = g
+                .cfg
+                .blocks
+                .iter()
+                .position(|b| b.kind == trace_ir::BlockKind::Landing)
+                .map(|b| BlockId(b as u32))
+                .unwrap();
+            assert!(
+                exception_targets(&g, g.block(ctor)).contains(&landing),
+                "{function}\n{}",
+                g.dump()
+            );
+        }
+    }
+
+    /// A call in an operand the language never evaluates never throws.
+    #[test]
+    fn an_unevaluated_call_throws_nothing() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "unevaluated_in_try");
+        assert!(
+            g.cfg.edges.iter().all(|e| e.kind != EdgeKind::Exception),
+            "{}",
+            g.dump()
+        );
+        assert_eq!(g.all("G::~G").len(), 1, "{}", g.dump());
+    }
+
+    /// A destructor a `throw` runs while unwinding terminates should it
+    /// throw: the throw's block leaves for the landing alone, never through
+    /// a cleanup of the objects still to destroy.
+    #[test]
+    fn a_throw_unwinding_destroys_without_throwing() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "thrown_pair");
+        let test = g.block(g.ev("k"));
+        let thrown = g
+            .cfg
+            .edges
+            .iter()
+            .find(|e| e.from == test && e.kind == EdgeKind::BranchTrue)
+            .unwrap()
+            .to;
+        let landing = g
+            .cfg
+            .blocks
+            .iter()
+            .position(|b| b.kind == trace_ir::BlockKind::Landing)
+            .map(|b| BlockId(b as u32))
+            .unwrap();
+        let destroys = g.cfg.blocks[thrown.0 as usize].events.len();
+        assert_eq!(destroys, 2, "{}", g.dump());
+        assert_eq!(exception_targets(&g, thrown), [landing], "{}", g.dump());
+    }
+}

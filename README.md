@@ -124,6 +124,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--dep <PATH>` | Treat a directory as a dependency root: a tree the target builds against but that is not under analysis (repeatable). Its headers contribute declarations — types, class definitions, inheritance, prototypes, declared return types — while its sources are never translation units. Function bodies and variable initializers are skipped during lowering, so they contribute no call sites or value flow. See the note below. |
 | `--explore` | Enable bounded conditional-variant exploration. Discovers candidate macro definitions from project GN files (`BUILD.gn`, `*.gni`), evaluates semantic feasibility of excluded `#if`/`#ifdef`/`#elif` arms, preprocesses and lowers feasible variants independently, and unions their facts into the merged program (preserving body and call facts plus struct fields across configurations; conditional signatures retain the base arity, see [limits](docs/ANALYSIS.md#limits-of---explore)). Off by default. |
 | `--explore-budget <N>` | Maximum additional configurations per translation unit (default: 4). Budget diagnostics count omitted candidate activation goals, not proven reachable configurations. |
+| `--sequencing` | Record a compact call-order control-flow graph per function body beside the call graph, for call-sequence queries. The call graph, points-to and argument flow are unchanged. Off by default. See [call sequencing](docs/ANALYSIS.md#call-sequencing-control-flow-sidecar). |
 | `--no-ipc` | Disable IPC proxy→stub bridge edge detection (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`) and connect proxy methods to handlers or service implementations across the opaque Binder boundary. See `docs/IPC_ROADMAP.md`. Service IDL and the HDI C++ IPC subset synthesize declarations-only interface/proxy/stub headers; HDI methods may omit a return type. See [IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces) for signatures, pairing and dialect limits. |
 | `--solve-budget-pops <N>` | Solver work budget in worklist pops. Default derives from the PAG constraint count (`800000 + 6×constraints`), so normal trees converge and huge ones finish instead of stopping at a partial result; `0` = unlimited. `TRACE_SOLVE_BUDGET_POPS` overrides it for experimentation. A truncated run is recorded, not silent: `analysis_run.options_json.solver_partial`, an `analyze`-stage diagnostic, and a `trace inspect` warning. |
 | `--solve-budget-secs <N>` | Solver wall-clock budget in seconds (default: off; `0` = no time limit). Checked periodically, so lead time can overshoot by up to one checkpoint, and the stop point varies with machine load. |
@@ -349,6 +350,56 @@ trace inspect <DB> callchain [--from FN|FILE:LINE] [--to FN|FILE:LINE] [--depth 
 trace inspect /tmp/trace.db callchain --from main --to target --depth 3
 trace inspect /tmp/trace.db callchain --from main.c:10 --to target.c:20
 trace inspect /tmp/trace.db callchain --from caller --to helper --format mermaid
+```
+
+### `trace inspect sequence`
+
+A bounded call sequence rebuilt from the call-order graphs a
+`trace analyze --sequencing` database records: one function body (every
+configuration variant side by side), the part of a body reachable from one
+call, or the blocks on paths between two calls together with their relation
+(`sequenced_before`, `guaranteed_before`, `may_precede`, `may_follow`,
+`may_both`, `exclusive`, `unordered` or `unknown`, with the conditions each
+claims). Callees are inlined up to `--depth`, each call returning to the
+event that made it; loops stay back edges. Unknown callees, bodies without a
+graph (dependency, declaration only), recursion, thread and task starts and
+IPC bridges are shown as boundaries, and a budget that cuts something leaves a
+`truncated` marker. A database analysed without `--sequencing` is rejected
+with an error naming the flag. Semantics and limits:
+[Call sequencing](docs/ANALYSIS.md#call-sequencing-control-flow-sidecar).
+
+```text
+trace inspect <DB> sequence (--function FN | --file SUBSTR --line N [--col C] [--callee NAME])
+    [--to-file SUBSTR --to-line N [--to-col C] [--to-callee NAME]]
+    [--depth N] [--max-events N] [--max-frames N] [--max-targets N] [--inline-contexts]
+    [--format text|json|graphviz|mermaid]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--function <FN>` | Function name, C++ qualified suffix, or `FILE:LINE`; `--file` narrows a name, and shows only the bodies compiled from or written in that file. |
+| `--file <SUBSTR>`, `--line <N>` | Position of the starting call: its spelling or its macro invocation. A call several configuration variants compile is one call, followed in each of them. |
+| `--col <C>`, `--callee <NAME>` | Pick one call when the line holds several (`NAME` or a `::NAME` suffix). |
+| `--to-file`, `--to-line`, `--to-col`, `--to-callee` | The second call: show the paths between the two and report their relation. |
+| `--depth <N>` | Call levels inlined below the starting function (default 1). |
+| `--max-events <N>` | Events shown across all inlined bodies (default 200). |
+| `--max-frames <N>` | Function graphs shown, the starting ones included (default 32). |
+| `--max-targets <N>` | Targets of one call considered for inlining (default 4). |
+| `--inline-contexts` | Also inline the callbacks thread and task starts run; they stay unordered against the starter. |
+| `--format` | `text` (default), `json`, `graphviz` or `mermaid`. |
+
+In the text view, calls whose order the language leaves unspecified are
+grouped as `{ g(), h() }  (order unspecified)`; `↺` marks a back edge or a
+recursive call, `??` an unknown callee and `⊘` an omitted body.
+
+**Examples**
+
+```bash
+trace analyze tests/fixtures/call_sequence --sequencing -o /tmp/seq.db
+trace inspect /tmp/seq.db sequence --function for_loop
+trace inspect /tmp/seq.db sequence --file branches.c --line 10 \
+    --to-file branches.c --to-line 12        # relation: exclusive
+trace inspect /tmp/seq.db sequence --function args --format mermaid
 ```
 
 ### `trace inspect diagnostics`
@@ -618,6 +669,7 @@ Measured changes are recorded in the [evaluation report](docs/EVAL_REPORT.md).
 | **Minimal** (default) | *(none)* | `analysis_run`, `files`, `functions`, filtered `call_sites`, `call_edges`, `arg_flow_edges`, `execution_contexts`, PAG-referenced variables, flow graph (`flow_nodes` / `flow_edges` / `flow_memory_access`), `diagnostics`. |
 | **Full IR** | `--full-export` | Minimal plus all `types`, all `variables`, PAG `locations`. |
 | **Points-to debug** | `--debug-points-to` | Adds `points_to` table (and retains PAG during analysis). Use with `--full-export` for complete debug dumps. |
+| **Call sequencing** | `--sequencing` | Adds the call-order graphs (`cfg_*` tables) to either mode above; without the flag those tables are empty. See [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables). |
 
 The flow-graph tables are always exported because `trace inspect dataflow`
 queries them directly.
@@ -629,6 +681,7 @@ queries them directly.
 - The site has at least one **`call_edge`**.
 - The site has at least one **`arg_flow_edge`**.
 - The site is an **indirect** call (`is_direct = 0`), including unresolved function-pointer calls.
+- A call-order event names the site (`--sequencing` only), so every site `trace inspect sequence` shows can be joined.
 
 So unresolved indirect sites (e.g. `sbuf->impl->readBuffer` before a fix) still appear in `call_sites` even with zero `call_edges`.
 
@@ -648,6 +701,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 
 **How it works**:
 - Ingests and remaps files, link targets, functions, call sites, call edges, and execution contexts across input databases (an input exported before `execution_contexts` existed contributes none and is named in a `MissingExecutionContexts` diagnostic).
+- Carries the call-order graphs of inputs analysed with `--sequencing`, remapped; a shared header body keeps one graph per distinct body, as `trace analyze` keeps configuration variants. `options_json.call_sequencing` is `true` when every input was sequenced, `false` when none was and `"partial"` otherwise, which `trace inspect sequence` reports; see the [merger schema contract](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
 - Shared header declarations deduplicate across link images; definitions retain each image's ownership and outgoing calls. Project-file ownership (`is_dep = 0` in any input) propagates to all copies; see [database merger header copies](docs/ANALYSIS.md#database-merger-header-copies).
 - Re-links `external` call edges (`functions.is_defined = 0` or `call_edges.resolution = 'external'`) against matching exported definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating edge resolution to `direct` or `ambiguous`, while preserving original non-direct resolutions (`indirect` and `ipc`).
 - **May-analysis over-approximation**: External calls retain edges to every selected definition, including each image's copy of a shared header body. Distinct source origins make the call ambiguous; shared-origin copies retain a resolved classification. Deduplicates call edges per call site to eliminate duplicate edges.
@@ -662,6 +716,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
   - **Unresolved externals**: External function calls that remain unresolved in all merged repositories (`UnresolvedExternal`).
   - **Weak symbol overrides**: Weak definitions superseded by strong definitions across repositories (`WeakOverride`, scoped to cross-repository overrides).
   - **Inputs without execution contexts**: Inputs that have no `execution_contexts` table (`MissingExecutionContexts`).
+  - **Inputs without call sequencing**: Inputs analysed without `--sequencing` when another input was (`MissingSequencing`).
 
 **Example**:
 
@@ -688,7 +743,7 @@ indexes before that export phase. See the
 SQLite export also builds a function-range index for operation ownership lookup
 during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
 
-Schema version: **v8**; readers also support v7. Repeated names, call and operation expressions, and graph text are stored once in a shared dictionary; the existing query columns and values are exposed through read-only views (see [compact text storage](docs/SQLITE_SCHEMA.md#compact-text-storage)). Each version is an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 and v8 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table.
+Schema version: **v8**; readers also support v7. Repeated names, call and operation expressions, and graph text are stored once in a shared dictionary; the existing query columns and values are exposed through read-only views (see [compact text storage](docs/SQLITE_SCHEMA.md#compact-text-storage)). Each version is an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 and v8 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table. The `cfg_*` tables hold the per-function call-order graphs `trace analyze --sequencing` records (empty otherwise; `analysis_run.options_json.call_sequencing` says which), read by `trace inspect sequence`; see [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables).
 
 ### Entity relationship (overview)
 
@@ -699,7 +754,9 @@ link_targets ─┬─ target_sources → files
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        │             │  (target_id → link_targets)
        │             ├─ call_edges → functions (caller and callee)
-       │             └─ execution_contexts → functions, call_sites, variables
+       │             ├─ execution_contexts → functions, call_sites, variables
+       │             └─ cfg_functions ─ cfg_blocks ─ cfg_events ─ cfg_event_sites → call_sites
+       │                (--sequencing; cfg_edges, cfg_event_order, cfg_gaps)
        └─ variables ─ flow_nodes ─ flow_edges → flow_nodes
                     (fn_id → functions, type_id → types,
                      target_id → link_targets)

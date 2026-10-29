@@ -64,6 +64,9 @@ pub struct UnitIndex {
     pub anonymous_bases: BTreeMap<String, BTreeSet<(trace_ir::FileId, String)>>,
     /// Namespaces this unit opens, merged in every mode.
     pub namespaces: BTreeSet<String>,
+    /// Call-order graphs of this unit's bodies, unit-local ids, in function
+    /// order (`--sequencing`).
+    pub cfgs: Vec<trace_ir::FunctionCfg>,
     /// Per type of `types`, the descriptor `merge_types` interns into the
     /// receiving table on the ordinary path: the type's own for a type whose
     /// layout spells it, otherwise the aggregate rebuilt from its layout.
@@ -92,6 +95,7 @@ impl UnitIndex {
         self.template_bases.shrink_to_fit();
         self.arrow_returns.shrink_to_fit();
         self.final_classes.shrink_to_fit();
+        self.cfgs.shrink_to_fit();
         self.merge_descs.shrink_to_fit();
     }
 }
@@ -1281,6 +1285,29 @@ fn merge_unit(
         call_map.insert(old, new_id);
     }
 
+    for cfg in &unit.cfgs {
+        if dropped_fns.contains(&cfg.function) {
+            continue;
+        }
+        let Some(&function) = fn_map.get(&cfg.function) else {
+            continue;
+        };
+        let Some(owner) = program.symbols.function_by_id(function) else {
+            continue;
+        };
+        if !merges_body(program, mode, owner) {
+            continue;
+        }
+        let tu = unit_of(owner.file);
+        let variants = program.cfgs.entry(function).or_default();
+        let map_site = |s| call_map.get(&s).copied();
+        // Units share merged sites: a site is its own key.
+        let added = trace_ir::add_variant(variants, None, cfg, function, map_site, map_file, |s| s);
+        if let Ok(kept) = added {
+            kept.tu = Some(tu);
+        }
+    }
+
     let valid_flow = |flow: &FlowConstraint| {
         flow.vars().all(|v| var_map.contains_key(&v))
             && flow_fns(flow).all(|f| fn_map.contains_key(&f))
@@ -1450,21 +1477,12 @@ fn merge_unit(
         let Some(&new_fn) = fn_map.get(old_fn) else {
             continue;
         };
-        if program
-            .symbols
-            .function_by_id(new_fn)
-            .is_some_and(|f| program.is_dep_file(f.file))
-        {
+        let merges = match program.symbols.function_by_id(new_fn) {
+            Some(f) => merges_body(program, mode, f),
+            None => !matches!(mode, MergeMode::SymbolsOnly),
+        };
+        if !merges {
             continue;
-        }
-        if matches!(mode, MergeMode::SymbolsOnly) {
-            let is_internal = program
-                .symbols
-                .function_by_id(new_fn)
-                .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
-            if !is_internal {
-                continue;
-            }
         }
         let remapped: Vec<ReturnFlow> = flows
             .iter()
@@ -1487,6 +1505,15 @@ fn merge_unit(
             target.extend(remapped);
         }
     }
+}
+
+/// Whether a merge keeps the body facts (return flows, call-order graphs)
+/// of `function`: never a dependency body, and only internal C++ bodies
+/// from a header's symbols-only merge.
+fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool {
+    !program.is_dep_file(function.file)
+        && (!matches!(mode, MergeMode::SymbolsOnly)
+            || (function.linkage == trace_ir::Linkage::Internal && function.is_cpp))
 }
 
 fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
@@ -2140,6 +2167,7 @@ mod tests {
                 expansion_span: None,
                 is_direct: true,
                 in_loop: false,
+                unevaluated: false,
                 receiver_class: None,
                 exact_receiver: false,
                 return_dst: Some(VarId(0)),
@@ -2407,6 +2435,7 @@ mod tests {
             expansion_span: None,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
@@ -2530,6 +2559,7 @@ mod tests {
                     expansion_span: None,
                     is_direct: true,
                     in_loop: false,
+                    unevaluated: false,
                     receiver_class: None,
                     exact_receiver: false,
                     return_dst: None,
@@ -2615,6 +2645,7 @@ mod tests {
                 expansion_span: None,
                 is_direct: true,
                 in_loop,
+                unevaluated: false,
                 receiver_class: None,
                 exact_receiver: false,
                 return_dst: None,
@@ -2968,6 +2999,7 @@ mod tests {
                     expansion_span: None,
                     is_direct: false,
                     in_loop: false,
+                    unevaluated: false,
                     receiver_class: None,
                     exact_receiver: false,
                     return_dst: None,
@@ -3116,5 +3148,119 @@ mod tests {
             let program = merge_all(&[("a.cpp", spec), ("b.cpp", reader)]);
             assert_eq!(members_named(&program, name).len(), 2, "{why}");
         }
+    }
+
+    /// A unit `/src/main.cpp` whose one function `body`, written in
+    /// `files[at]`, has an event-free graph.
+    fn sequenced_body_unit(files: &[&str], at: u32, linkage: trace_ir::Linkage) -> UnitIndex {
+        use trace_ir::{Block, BlockId, BlockKind, CfgEdge, EdgeKind, FunctionCfg};
+        let file = trace_ir::FileId(at);
+        let block = |kind| Block {
+            kind,
+            span: None,
+            events: Vec::new(),
+        };
+        UnitIndex {
+            path: PathBuf::from(files[0]),
+            files: files.iter().map(PathBuf::from).collect(),
+            functions: vec![Function {
+                is_weak: false,
+                target: None,
+                id: FnId(1),
+                name: "body".into(),
+                linkage,
+                return_type: TypeId(0),
+                params: Vec::new(),
+                locals: Vec::new(),
+                span: trace_ir::Span::new(file, 3, 1),
+                end_line: 5,
+                file,
+                is_defined: true,
+                param_type_ids: Vec::new(),
+                explicit_arity: Some(0),
+                default_args: 0,
+                reference_params: Vec::new(),
+                owner_unresolved: false,
+                variadic: false,
+                defaulted_in_class: false,
+                declared_in_class: false,
+                is_static_member: false,
+                is_virtual: false,
+                is_final: false,
+                is_cpp: true,
+                c_linkage: false,
+                tu: None,
+            }],
+            cfgs: vec![FunctionCfg {
+                function: FnId(1),
+                tu: None,
+                variant: 0,
+                entry: BlockId(0),
+                exit: BlockId(1),
+                exceptional_exit: None,
+                blocks: vec![block(BlockKind::Entry), block(BlockKind::Exit)],
+                edges: vec![CfgEdge {
+                    from: BlockId(0),
+                    to: BlockId(1),
+                    kind: EdgeKind::Fallthrough,
+                }],
+                events: Vec::new(),
+                order: Vec::new(),
+                gaps: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merged_cfg_records_its_function_and_unit() {
+        let mut program = Program::default();
+        let unit = sequenced_body_unit(&["/src/main.cpp"], 0, trace_ir::Linkage::External);
+        merge_unit_index(&mut program, &unit);
+        let (&function, graphs) = program.cfgs.iter().next().expect("graph merged");
+        assert_eq!(program.symbols.function(function).name, "body");
+        assert_eq!(graphs.len(), 1);
+        assert_eq!(graphs[0].function, function);
+        let tu = graphs[0].tu.expect("unit recorded");
+        assert_eq!(
+            program.symbols.files[tu.0 as usize].path,
+            Path::new("/src/main.cpp")
+        );
+        // The same body merged again is the same graph.
+        merge_unit_index(&mut program, &unit);
+        assert_eq!(program.cfgs.values().map(Vec::len).sum::<usize>(), 1);
+    }
+
+    /// A body in a dependency root keeps no graph, whatever unit lowered it.
+    #[test]
+    fn dependency_body_keeps_no_cfg() {
+        let mut program = Program::default();
+        program
+            .symbols
+            .set_dep_roots(vec![PathBuf::from("/nonexistent-dep")]);
+        let unit = sequenced_body_unit(
+            &["/src/main.cpp", "/nonexistent-dep/api.h"],
+            1,
+            trace_ir::Linkage::External,
+        );
+        merge_unit_index(&mut program, &unit);
+        assert!(program.cfgs.is_empty(), "{:?}", program.cfgs);
+    }
+
+    /// A header's symbols-only merge keeps the bodies whose call sites it
+    /// keeps: internal C++ ones.
+    #[test]
+    fn symbols_only_merge_keeps_internal_cpp_cfgs_only() {
+        let mut program = Program::default();
+        merge_unit_symbols(
+            &mut program,
+            &sequenced_body_unit(&["/src/a.h"], 0, trace_ir::Linkage::External),
+        );
+        assert!(program.cfgs.is_empty());
+        merge_unit_symbols(
+            &mut program,
+            &sequenced_body_unit(&["/src/b.h"], 0, trace_ir::Linkage::Internal),
+        );
+        assert_eq!(program.cfgs.len(), 1);
     }
 }

@@ -165,6 +165,7 @@ fn scope_unit(
     }
     scoped.call_sites.retain(|c| !removed.contains(&c.caller));
     scoped.fn_returns.retain(|id, _| !removed.contains(id));
+    scoped.cfgs.retain(|c| !removed.contains(&c.function));
     if !removed.is_empty() || !removed_globals.is_empty() {
         let mut excluded = vec![false; scoped.flow.len()];
         for id in removed {

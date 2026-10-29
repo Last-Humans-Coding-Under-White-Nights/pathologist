@@ -187,24 +187,7 @@ fn operation(kind: &str) -> &str {
 pub(crate) fn is_merge_output(conn: &Connection) -> Result<bool> {
     // Legacy/scratch databases may have no run metadata; retain their
     // actionable structural diagnostics instead of failing on this query.
-    let options: Option<String> =
-        if crate::inspect::column_exists(conn, "analysis_run", "options_json")? {
-            conn.query_row(
-                "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-        } else {
-            None
-        };
-    Ok(match options {
-        Some(options) => {
-            let metadata: serde_json::Value = serde_json::from_str(&options)?;
-            metadata["stage"] == "merge"
-        }
-        None => false,
-    })
+    Ok(crate::inspect::run_options(conn)?.is_some_and(|options| options["stage"] == "merge"))
 }
 
 /// Require an analysis export with the structures used by the source-level view.

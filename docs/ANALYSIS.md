@@ -11,6 +11,7 @@ trace uses inclusion-based (Andersen-style) pointer analysis to resolve indirect
 | Field handling | Field-sensitive with **instance-insensitive field summaries** |
 | Pointer analysis kind | **May-analysis** (sound over-approximation) |
 | Context sensitivity | **None** |
+| Call order | Not used by the analysis; optional per-function control-flow sidecar ([Call sequencing](#call-sequencing-control-flow-sidecar)) |
 
 ## Workflow
 
@@ -2113,6 +2114,10 @@ still the callee of an `ipc` edge.
   - `unknown`: none of these. A start site several ordinary calls reach (a
     wrapper called twice, a function called in a caller's loop) can still run
     more than once.
+- **Call order.** A start site is an `async_start` boundary in
+  [Call sequencing](#call-sequencing-control-flow-sidecar): the callback is
+  not ordered after the starter's later calls, and no happens-before is
+  claimed across contexts.
 
 ### Terminators (`clears`)
 
@@ -4891,9 +4896,471 @@ and feature implementations by exploring feasible configuration variants indepen
   files that define the same symbol, which is the pre-existing twin-definition dedup
   rather than anything exploration does.
 
+## Call sequencing (control-flow sidecar)
+
+The call graph says which functions a call site may reach; it does not say
+whether one call happens before another. `trace analyze --sequencing` (off by
+default) records, beside the unchanged call-graph facts, a compact control-flow
+graph per function body whose nodes carry the body's call occurrences. A query
+(`trace inspect sequence`) later rebuilds bounded partial sequences from the
+database alone, loading only the functions it reaches. The sidecar is never
+read by the PAG or the solver: `call_edges`, points-to and `arg_flow` are the
+same with the flag on or off, and the analysis stays flow-insensitive
+([Properties](#properties)). With the flag off nothing is recorded and the
+database carries no sequencing rows.
+
+### Events and what "before" means
+
+- **Event.** One syntactic invocation in a function body: one
+  `CallOccurrence` (spelling span, expansion span, expansion-chain id; see
+  [Call source locations](#call-source-locations)). An event lists the
+  `CallSite` records of that invocation as its `sites`: alternative targets of
+  the *same* invocation (one record per member candidate, post-merge virtual
+  overrides, a configuration variant's own record), never a sequence of
+  calls. An automatic object whose implicit constructor or destructor runs
+  its bases' (`struct C : A, B {}; C c;`) records one site per base class at
+  the declaration; each base's is an event of its own (`A::A` and `B::B`),
+  its overloads alternatives of that one. The constructor a smart-pointer
+  factory runs ([Factory construction](#factory-construction)) shares the
+  factory call's position but is no alternative target of it: its sites are
+  marked `exact_receiver` (the object is exactly `T`), so
+  `std::make_shared<S>(arg())` is two events, `std::make_shared` and
+  `S::S`, both after `arg` and `unordered` with each other (the constructor
+  runs inside the factory, whose body is not in the tree). Kinds: `call`, `construct` (including the constructor a
+  `new`-expression runs), `destroy` and `delete`. Two expansions of one macro
+  are two events, even when their displayed coordinates match; so is an
+  argument a macro substitutes twice (`TWICE(step())`), whose two sites share
+  one source position.
+- **"A before B"** compares the *invocations* of A and B, not their
+  completions. Every guarantee is conditional on B executing and on every call
+  between A and B completing normally (no `throw`, `longjmp`, `exit` or
+  noreturn call); the query states these conditions with its answer. Relation
+  strengths:
+  - `sequenced_before`: same block (the blocks of one chain of `sequenced`
+    edges count as one; see [Representation](#representation)), not on a
+    cycle, A precedes B in the block's local order; `guaranteed_before`: A's block dominates B's block
+    over every edge, exception edges included, B's block does not reach A's,
+    B's block is reached from the entry without an exception edge, and no gap
+    other than an `unordered_branch` gap covers either event (that kind only
+    unorders its own events; see `unordered` below). When A's block has an `exception` edge, A must also
+    precede every other event of its block: in
+    `try { a(); b(); } catch (...) { h(); } c();` `a` may throw before `b`
+    runs and the handler fall through to `c`, so `b` only `may_precede` `c`,
+    while `a` (whose own throw still invoked it) is `guaranteed_before` `c`.
+    A block reached only through a handler is never claimed (`a` to `h` is
+    `may_precede`). Both are proofs *under the conditions above*.
+  - `may_precede`, `may_follow`, `may_both` (a loop): a control-flow path
+    exists. This is not feasibility: correlated branch predicates are not
+    reasoned about. Two calls of one block on a cycle are `may_both`
+    whatever the block's local order (`while (more()) { a(); b(); }`: one
+    iteration's `b` precedes the next one's `a`).
+  - `exclusive`: no path either way (`if (ok) send(); else recover();`).
+    `unordered`: same block without a local order, or both held by one
+    `unordered_branch` gap with a relation that names a direction
+    (`sequenced_before`, `guaranteed_before`, `may_precede` or `may_follow`):
+    in `sink(cond() ? left() : right(), other())` `left` and `other` are
+    `unordered` both ways whichever argument the builder walked first, while
+    `left` and `right` stay `exclusive`. Events of two different gaps keep
+    their order: after `sink(c1() ? a() : b(), x()); sink(c2() ? d() : e(),
+    y());` `c1` is `guaranteed_before` `c2`. `unknown`: a gap or boundary
+    lies between them.
+  - **Unmodeled transfers.** An `unsupported` edge (computed or unresolved
+    `goto`) or an event under a gap that may hide control flow
+    (`parse_error`, `depth_exceeded`, `unsupported_construct`,
+    `unresolved_goto`: a `longjmp`, a statement expression) may lead
+    anywhere; a `setjmp` may be returned to from any later call. A missing
+    edge is never evidence of impossibility: when A's block, or a block it
+    reaches, may leave that way, or A follows such an event, B may follow A
+    (and the same the other way), so `a(); goto *p; resume: b();` relates
+    `a` to `b` as `may_precede`, and the arms of `if (setjmp(env))` as
+    `may_both`; the answer notes the unmodeled transfer. A proof
+    (`guaranteed_before`) also needs every block that may leave that way to
+    be dominated by A's (in A's own block, every hiding event to follow A),
+    so no such jump enters B's block without A: in
+    `if (x) goto *p; a(); skip: b();` `a` only `may_precede` `b`. An end
+    under such a gap is `unknown`. Such a gap with no call under it (a
+    `goto` inside a statement expression, a call-free `ERROR` subtree)
+    leaves nothing to mark where: the builder ends the block at it with an
+    `unsupported` edge, beside a fallthrough to the block the walk goes on
+    in, so `if (x) { a(); ({ goto t; 0; }); } else { t: b(); }` relates `a`
+    to `b` as `may_precede`, not `exclusive`.
+
+### Expressions
+
+Events of an expression are ordered post-order: a node's own events follow its
+children's, so an argument's calls precede the call they are passed to.
+
+- Call arguments form an **unordered group**. In C++17 and later the callee
+  and receiver expression is sequenced before the arguments; in C and earlier
+  C++ it joins the group.
+- `&&`, `||` and `?:` branch (short-circuit); the comma operator is sequenced.
+- C `_Generic` evaluates exactly one association and never its controlling
+  expression: each association is an arm of its own (a `switch_case` edge
+  from the current block, all arms joining after), and the controlling
+  expression's calls are one unordered group under an `unevaluated` gap that
+  orders nothing after it. So in
+  `_Generic(selector(), int: chosen(), default: other()); after();`
+  `chosen` and `other` are `exclusive`, each `may_precede` `after`, and
+  `selector` is `unknown` to every other call.
+- <a id="unevaluated-operands"></a>**Unevaluated operands.** Lowering
+  (`unevaluated_operand` in `trace-parse/src/lower.rs`) tags the calls of an
+  operand the language never evaluates `CallSite::unevaluated`: the operand
+  of `noexcept(e)`, the requirements of a `requires` expression, the
+  controlling expression of `_Generic`, and the operand of `sizeof`,
+  `alignof`, `decltype` and GNU `typeof`/`__typeof__` when it is a call.
+  Those four do not evaluate their operand unless its type is variably
+  modified (C11 6.5.3.4p2; GNU `typeof` likewise), and lowering does not
+  know types: a call's result is never variably modified (parentheses
+  aside: C++ `sizeof(f())`, C `sizeof f()`; C parses `sizeof(f())` and
+  `typeof(f())` as a function *type*, which calls nothing). A tagged call
+  never runs, so the solver gives it no call edge, no argument or return
+  flow and no model effect; it is part of the merge identity, so an
+  evaluated copy of the same site in another unit keeps its edges. The
+  operator keyword itself, which the grammars parse as a call
+  (`noexcept(e)` and `typeid(e)` in C++, `__typeof__(e)` with an expression
+  operand in C), is no call site at all. In the call-order graph a tagged
+  call is kept the way `_Generic`'s controlling expression is, under an
+  `unevaluated` gap ordering nothing after it, wherever it is written
+  (member and default member initializers too); the query relates it
+  `unknown`, never counts it as a call reaching the other end, and does not
+  inline it (an `unevaluated` boundary). A type operand
+  (`sizeof(int[n()])` calls `n` for its array bound) and any other
+  expression (`sizeof(rows[f()])` over a two-dimensional variable-length
+  array) may be evaluated: they stay ordinary calls, and like `typeid(e)`,
+  whose operand is evaluated when it is a polymorphic glvalue, the operand
+  is a `branch_true` arm beside a `branch_false` bypass, so its calls
+  `may_precede` what follows.
+- Assignment: right before left in C++17 and later, unordered otherwise.
+  `<<`, `>>` and subscript are left before right in C++17 and later. Operands
+  of other binary and unary operators are unordered.
+- A lambda body is its own function's graph; init-captures are events of the
+  enclosing function at the lambda.
+
+The language standard is the unit's (`-std=` from the compilation database,
+otherwise the default).
+
+### Statements
+
+Compound statements, `if`/`else`, `while`, `do`, `for` (init once; condition;
+body; update; back edge to the condition; `continue` goes to the update),
+range-for (range expression once; header; body; back edge), `switch` (case
+edges, fallthrough edges, `default`, and an edge past the switch when there is
+no `default`), `break`, `continue`, `return` (edge to the exit), `goto` and
+labels (labels are resolved before the body is walked), `asm goto` (a
+`switch_case` edge to each label it names, through a block destroying what
+the jump leaves, and a fallthrough past it; a label the body lacks adds an
+`unresolved_goto` gap and an `unsupported` edge, so in
+`asm goto("jmp %l0" : : : : out); a(); out: b();` `a` only `may_precede`
+`b`; any other `asm` transfers nothing), `try`/`catch` and `throw`.
+
+- **Automatic objects** ([Automatic objects](#automatic-objects)): the
+  constructor event sits at its declarator, so `T a{f()}, b{g()};` orders
+  `f`, `T::T`, `g`, `T::T`. The one destructor site the IR records per
+  object is referenced from every exit of its scope: the normal end and each
+  `return`, `break`, `continue`, `goto` or `throw` leaving it, in reverse
+  declaration order. The sites of one object's bases (one per base class
+  providing the member) are one unordered group, for construction and
+  destruction alike: the IR does not record which bases are virtual (built
+  first), so their order is not claimed. A `goto` back to a label the walk has passed also
+  destroys the objects the label's scope declared after the label
+  (`again: before(); Guard g; if (retry()) goto again;` runs `Guard::~Guard`
+  on the jump), after those of the scopes it leaves; a forward `goto` cannot
+  skip a declaration in valid C++ and destroys only what it leaves. An `if`
+  or `switch` condition's object is destroyed where the statement ends, a
+  `for` init-statement's where the loop ends. A `while` condition's object
+  lives for one iteration: the end of the body and `continue` reach a block
+  destroying it before the back edge to the next evaluation, and a false
+  condition or `break` destroy it at the loop's exit, so in
+  `while (T t = next()) work();` one iteration's `T::~T` precedes the next
+  one's `next` (the pinned grammar parses no declaration as a `for`
+  condition). No call site is added for this.
+- **Once-only locals.** The initializer of a block-scope `static` (the
+  declarations lowering classifies `FnStatic`, `storage_for`) or thread-storage
+  (`thread_local`, `_Thread_local`, `__thread`) variable runs on the first
+  pass only. Each such declarator whose initializer or construction holds a
+  call is a `branch_true` arm beside a `branch_false` bypass, both joining
+  after it, so in `void f() { static S s; after(); }` and
+  `static int x = init(); after();` the initializer `may_precede` `after`
+  instead of being `sequenced_before` it. The guard is not a call; no site
+  is added for it. Such objects have no destructor event (they are destroyed
+  at exit).
+- **Exceptions.** Each `try` has one `landing` block. Every block of the
+  `try` body that holds an event, nested handlers included, has an
+  `exception` edge to it, except a block of a nested `try` body: that block
+  throws to the nested landing, which passes on what its handlers do not
+  catch. An exception leaving automatic objects destroys them on the way:
+  when objects of the scopes inside the `try` are live at a call, the
+  block's `exception` edge goes to the cleanup block of the latest of them,
+  which holds that object's destructor events and has an `exception` edge
+  on to the cleanup block of the object declared before it, and so on
+  (innermost first, in reverse declaration order, as a `return` destroys
+  them) to the landing. A call that leaves fewer objects for the same
+  landing enters the same chain further down, so there is one cleanup
+  block per object and landing, never one per set of live objects: a body
+  of n objects stores O(n) cleanup events. A block whose live objects
+  change between its calls (`Guard g;` after a call) has an edge for each
+  set. An object counts once its constructor (its whole initializer) has
+  run, in every declaration form: in `if (G b = G())` and
+  `while (G d = G())` as in `G b = G();`, `G::G` throws straight to the
+  landing, never through a copy of `~G` for the object it failed to build.
+  It no longer counts once its destructor starts, so a destructor's own
+  event never throws through a copy of itself. The cleanup events are
+  additional copies of the objects' destructor sites (one position, see
+  [Query](#query)). So in
+  `try { Guard g; may_throw(); later(); } catch (...) { h(); }`
+  `later` only `may_precede` `Guard::~Guard`, which `may_precede` `h`. A
+  destructor run on the way out of a scope normally (its end, `return`,
+  `break`, `continue`, `goto`) may throw like any call; one run while an
+  exception propagates (a `throw`'s own destructors, a cleanup block's)
+  takes no `exception` edge, since a destructor throwing then calls
+  `std::terminate`. Nor does a call that is never evaluated
+  ([unevaluated operands](#unevaluated-operands), `CallSite::unevaluated`). The
+  landing has an edge to each handler. Unless a handler is
+  `catch (...)` (its parameter list is the ellipsis alone: a pack expansion
+  inside a typed handler, `catch (Fault<Ts...> &)`, does not count), the landing also has an `exception` edge to the
+  enclosing landing or the function's exceptional exit, through the cleanup
+  chain of the objects live around the `try` statement, once a path from
+  the entry reaches the landing (a function-try-block's always, its
+  initializers may throw): a `try` whose body cannot throw, or throws only
+  from code after a `return` or `break`, passes nothing on and builds no
+  cleanup, so in `G g; w(); try { n = 1; } catch (E &) {} k();` `w`
+  stays `guaranteed_before` and `k` `sequenced_before` `~G`. A cleanup block no path reaches holds
+  no events and is removed with the empty blocks. So in
+  `try { try { a(); } catch (...) {} } catch (...) { c(); }` `a` and `c`
+  are exclusive, while a typed inner `catch`, or a call in the inner
+  handler, may reach `c`. A constructor's function-try-block
+  (`A::A() try : m_(f()) { ... } catch (...) { ... }`) holds the prologue:
+  its member initializers (and default member initializers) run in a block
+  of the `try`, before the body, with an `exception` edge to its landing. A `throw` destroys the objects it leaves in
+  its own block, then has an `exception` edge to the innermost landing or
+  to the exceptional exit. A
+  call *outside* a `try` has no exceptional edge: the conditions above
+  already exclude abnormal completion.
+- Loops stay cycles (`back_edge`), never unrolled.
+- Member functions of a local class and GNU nested functions run when called,
+  not where they are written: their control flow is not followed, and any
+  events lowering attributes to the enclosing function there form one
+  unordered group under an `unsupported_construct` gap.
+
+### Representation
+
+Per function body and configuration variant, `FunctionCfg`
+(`trace-ir/src/cfg.rs`) in `Program::cfgs` (ordered by function id):
+
+- blocks (`entry`, `exit`, `exceptional_exit`, `ordinary`, `landing`) with
+  their events in evaluation order, and typed successor edges
+  (`fallthrough`, `branch_true`, `branch_false`, `switch_case`, `back_edge`,
+  `return`, `exception`, `unsupported`, `sequenced`);
+- the **immediate** sequenced-before pairs between events of one block (a
+  DAG); events of a block with no path between them are unordered. A
+  `sequenced` edge splits one block's local order in two: it is the only way
+  into its target, and every event of its source is sequenced before every
+  event of its target. The builder adds one before a group that starts each
+  of its members after the latest events (an unordered group, the base
+  destructors of one object) when more than one event is latest, so in
+  `a() + b(); c() + d();` the second statement follows the first through
+  one edge rather than a pair per two calls. A query treats the blocks of
+  such a chain as one block;
+- gaps: regions whose order is not modeled.
+
+Storage stays linear in blocks + edges + events + sites: no transitive
+before-pairs, expanded callee bodies or enumerated paths are stored, and a
+group never restores more than one latest event before each member (a wider
+frontier gets a `sequenced` edge first), so a body stores at most about two
+order pairs per event. The exception is where one block must hold a whole
+group: inside an operand of an unordered group (its siblings start in the
+block it starts in) and in a constructor's member-initializer list (one
+`initializer_order` gap). There a sequenced step after an unordered one
+(the second operand of a comma, an initializer-list element, the next
+member initializer) stores a pair per two calls of the two steps, as in
+`f((a() + b(), c() + d()), e())`. After a body is built, event-free blocks
+that only fall through to their successor are removed
+(`FunctionCfg::compact`; a `sequenced` edge into one becomes a
+`fallthrough`); branch, loop, exit and landing structure is kept.
+
+The export writes `cfg_functions`, `cfg_blocks`, `cfg_edges`, `cfg_events`,
+`cfg_event_sites`, `cfg_event_order` and `cfg_gaps` in both export modes
+([schema](SQLITE_SCHEMA.md#call-sequencing-tables)), and retains every call
+site an event names even when the ordinary
+[call-site filter](SQLITE_SCHEMA.md#call-site-export-filter) would drop it (a
+direct site without call edges or argument flow).
+`analysis_run.options_json.call_sequencing` records whether the capability
+was enabled ([contract](SQLITE_SCHEMA.md#version-and-capability-contract)); a database without it reports so and names the flag to
+regenerate it.
+
+### Merge
+
+CFGs are built per translation unit and remapped with the unit
+(`merge_unit`): the function through the unit's function map, every event's
+sites through its call-site map, spans through the file map; `tu` records the
+unit. A body the merge does not keep has no CFG: a dropped duplicate body, a
+dependency-root body, a declaration and a weak body suppressed by a strong one
+in its link target.
+
+- A shared-header body merged from a second unit is dropped when its remapped
+  CFG is structurally equal to the one kept ("first body is kept", see
+  [Shared header functions](#shared-header-functions)). A body another unit
+  compiles differently, or a `--explore` variant that differs, is kept as a
+  separate **variant** of the function. Variants are never unioned: a query
+  shows them side by side, so no sequence mixes two configurations.
+- An event whose sites the merge does not keep (a call expanded from a
+  dependency's macro body) is spliced out of its block and local order, and an
+  `omitted_sites` gap records that it was there.
+- Post-merge virtual expansion adds override records as further sites of the
+  same event (`Program::attach_alternative_sites`).
+
+`trace-merge` carries the graphs of its sequenced inputs the same way
+(`trace_ir::add_variant` and `FunctionCfg::remap` are shared): function,
+call-site and file ids are remapped, and row ids renumbered. A body several
+inputs share (a header function the merger unifies) keeps one graph per
+structurally distinct body, in input order: an input compiling it as an
+earlier one did adds nothing, one compiling it differently adds a variant.
+Inputs share no call sites, so the comparison takes a site as its caller,
+position, callee spelling and directness (and how many such sites precede it
+in its input). Sites spelled alike that are alternatives of one event of an
+input (a merged input's copies of one header call) count as one site, so
+merging a merged database again keys them as merging its inputs at once
+does: no extra variant appears. A kept graph names its own input's sites first; each later
+input compiling the body alike lists its sites, in input order, as further
+alternatives of the matching events (`FunctionCfg::add_alternatives_from`,
+through `CallEvent::add_alternative_sites`, as
+`Program::attach_alternative_sites` adds override records), so the targets
+its call edges reach are kept: two repositories passing
+`inline void invoke(void (*cb)()) { cb(); }` different callbacks keep one
+graph whose `cb()` event reaches both. An event none of
+whose sites was carried is spliced out with an `omitted_sites` gap. The output's marker is
+`true` when every input was sequenced, `false` when none was, and `"partial"`
+otherwise, with one `MissingSequencing` diagnostic per input without graphs:
+an unsequenced input's functions have no CFG, so a merged database never
+claims more order than its inputs recorded. Schema side:
+[Merger inputs and output](SQLITE_SCHEMA.md#merger-inputs-and-output).
+
+### Boundaries and gaps
+
+A gap or boundary is uncertainty, never evidence for an order.
+
+- **Gaps** inside a body: `parse_error` (an `ERROR` subtree; its events are
+  kept as an unordered group), `depth_exceeded`, `unsupported_construct`
+  (computed `goto`, `setjmp`/`longjmp`, coroutines, SEH, statement
+  expressions; a nonlocal jump is recognized by its callee spelled plain or
+  qualified from the global namespace or `std`, so `::_setjmp` and
+  `std::longjmp` count), `unresolved_goto`, `unordered_branch` (a short-circuit or
+  conditional inside an unordered operand: the affected events are
+  unordered), `initializer_order` (member initializers and default member
+  initializers are one unordered group in a prologue block; declaration order
+  is not modeled. A site of the function that no walked node owns joins that
+  group too), `omitted_sites` and `unevaluated` (calls in an operand the
+  language never evaluates, the controlling expression of `_Generic` and
+  the [unevaluated operands](#unevaluated-operands) of `sizeof`,
+  `alignof`, `decltype`, `typeof`, `noexcept` and `requires`: kept as events so a position names them; an
+  end under one relates `unknown`, as the call never runs). A
+  body with a gap is `partial`.
+- **Boundaries** between functions, found by the query: `omitted_body` (the
+  callee has no CFG: dependency, declaration only, suppressed or not
+  sequenced), `unknown_callee` (a site without call edges), `unevaluated`
+  (a call that [never runs](#unevaluated-operands)), `recursion`,
+  `async_start` (the site starts an [execution context](#execution-contexts):
+  the callback runs elsewhere and is not inlined) and `ipc_bridge` (an `ipc`
+  edge). None establishes happens-before across threads or processes.
+
+### Query
+
+`trace inspect sequence` (`trace-db/src/inspect/sequence.rs`; options in the
+[README](../README.md#trace-inspect-sequence)) checks the capability marker
+first, then loads graphs only as it reaches them:
+
+- **Starting point.** `--function` names a function as the other inspect
+  commands do; with `--file`, only the variants compiled from (`tu_file_id`)
+  or written in (a block's file) a matching file are shown. Units that each
+  define one external function share its row, which records the first
+  definition's file, so `--file` may name another unit's body. A position
+  (`--file`/`--line`) names one call in every variant of its function that
+  compiles it (one event per graph at one position, with one callee and one
+  macro invocation position); the
+  query starts from each such variant, one frame per variant as for
+  `--function`. The destructor events of one automatic object on each way
+  out of its scope (the end, `return`, `break`, `continue`, `goto`, `throw`,
+  an exception's cleanup block, each iteration of a `while` with a
+  condition object) name the same sites:
+  they are copies of that one call, so the position names all of them. A
+  position matching several calls (two events of one graph that are not
+  such copies, as the two calls `TWICE(step())` makes, or calls of
+  different functions or callees) is an error listing at most
+  ten of them with the count of the rest; when they were matched at a macro
+  body's spelling, each candidate names its invocation and the error names
+  an invocation position to use instead: a macro invoked on different lines
+  in different `--explore` variants is one call per invocation, not one
+  call.
+- **Frames.** Each graph shown is a frame: every variant of the starting
+  function, then one frame per inlined (event, target variant) pair, breadth
+  first in event order up to `--depth` call levels. A `call` edge joins the
+  calling event's block to the frame's entry and a `return` edge joins its
+  exit back to that block, so a return always goes to the call that made it.
+  Blocks are listed in reverse postorder (branch arms before their join).
+- **Boundaries.** A target already on the frame stack is `recursion`; a
+  target without a graph is `omitted_body` (`dependency`, `declaration_only`
+  or `not_sequenced`); an event under an `unevaluated` gap is
+  `unevaluated` and inlines nothing; an event without call edges is
+  `unknown_callee`; the
+  callback an event starts as an execution context is `async_start` (inlined
+  only with `--inline-contexts`); an `ipc` edge of the frame's function is
+  `ipc_bridge` and is never inlined. `--max-targets`, `--max-frames` and
+  `--max-events` cut inlining with a `truncated` marker naming the budget
+  (Mermaid and Graphviz draw each as a dashed edge from the cut call's block
+  to a note `t<index>` labelled `truncated: <budget>`);
+  once `--max-frames` is reached nothing more is loaded or inlined, and its
+  one marker names the first call it cut. The starting frames are always
+  shown.
+- **Relations.** Two events of one graph relate as in
+  [Events and what "before" means](#events-and-what-before-means). When the second event lies in another function,
+  the query looks for the events of the first event's function whose calls
+  reach that graph within `--depth` levels, never through an `async_start` or
+  `ipc_bridge`, and relates the first event to each of them (the call itself
+  counts as `guaranteed_before`); several calls combine to the strongest
+  claim every one of them allows: `unknown` if any is; a proof only when all
+  are (`sequenced_before` when all are, otherwise `guaranteed_before`);
+  `exclusive` or `unordered` only when all are; otherwise `may_precede`,
+  `may_follow` or `may_both` by the orders the inputs admit, where an
+  `unordered` input admits both orders, a proof A first, and `exclusive`
+  neither. Every such call is cited: a note names their
+  positions and the JSON `relation.via` lists their `cfg_events` ids (empty
+  when both events share a graph). A first event several variants compile is related
+  in each of them, and the relations combine the same way, as do the
+  relations of every pair of destructor copies at either end (so in
+  `while (T t = next()) work();` `T::~T` and `work` are `may_both`); a
+  variant that reaches no copy of the second event is skipped with a note. Found
+  nowhere, the relation is `unknown`. One `unordered_branch` gap holding
+  both ends turns a directed relation (`sequenced_before`,
+  `guaranteed_before`, `may_precede`, `may_follow`) into `unordered`; any
+  other gap over either end turns `sequenced_before`/`guaranteed_before`
+  into `unknown`, and a gap that may hide control flow over either end turns
+  every relation into `unknown` (see "Unmodeled transfers" above). Between two
+  events of one graph, only the blocks on paths from the first to the second
+  (or to the calls reaching it) are shown.
+
+### Limits
+
+- Calls outside a `try` have no exceptional edge (see Exceptions above).
+- Temporaries' constructors and destructors are not lowered, so they are not
+  events.
+- Member-initializer declaration order is not modeled (`initializer_order`).
+- Paths are not checked for feasibility; `may_*` relations over-approximate.
+  Constant conditions are not folded either: the `do { ... } while (0)` of a
+  statement macro keeps its back edge, so two calls in it relate as
+  `may_both`.
+- A call spelled in a macro body shares its spelling position with every
+  expansion of that macro (`DealFormat` in HDF's `HDF_LOG_WRAPPER`: 14,852
+  events), so a query position there is ambiguous; the error suggests an
+  invocation position to name instead.
+- C API exposure of the query is a follow-up.
+
+Measured indexing, storage and query cost:
+[Call-order sidecar](EVAL_REPORT.md#call-order-sidecar-248--2026-10-27).
+
 ## Known imprecision
 
 - All paths merged; no null-check refinement.
+- Call order (`--sequencing`) is control-flow reachability, not path feasibility; see [Call sequencing](#call-sequencing-control-flow-sidecar), "Limits".
 - `free` does not invalidate pointers.
 - `FieldSummary` may connect unrelated struct instances.
 - **Lazily created field cells carry no slot guard** (see "Variable cells"): their recorded type is not reliable enough to guard by.

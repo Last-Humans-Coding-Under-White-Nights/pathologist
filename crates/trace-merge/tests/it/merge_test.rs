@@ -2607,3 +2607,837 @@ fn merged_execution_contexts_keep_their_model() {
         ]
     );
 }
+
+/// `trace analyze repo -o db ARGS…` with the workspace's own CLI.
+fn analyze_repo_with(repo: &std::path::Path, db: &std::path::Path, args: &[&std::ffi::OsStr]) {
+    let status = Command::new(trace_cli_bin())
+        .arg("analyze")
+        .arg(repo)
+        .arg("-o")
+        .arg(db)
+        .args(args)
+        .status()
+        .expect("failed to run trace analyze");
+    assert!(status.success(), "trace analyze {}", repo.display());
+}
+
+/// One repository per `(name, file, source, sequenced)`, analysed into
+/// `<name>.db`, `--sequencing` when asked.
+fn sequencing_inputs(
+    root: &std::path::Path,
+    repos: &[(&str, &str, &str, bool)],
+) -> Vec<std::path::PathBuf> {
+    repos
+        .iter()
+        .map(|&(name, file, source, sequenced)| {
+            let repo = root.join(name);
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(repo.join(file), source).unwrap();
+            let db = root.join(format!("{name}.db"));
+            let flag = [std::ffi::OsStr::new("--sequencing")];
+            analyze_repo_with(&repo, &db, if sequenced { &flag } else { &[] });
+            db
+        })
+        .collect()
+}
+
+fn merge_into(inputs: &[std::path::PathBuf], output: &std::path::Path) -> trace_merge::MergeReport {
+    merge_databases(
+        inputs,
+        &MergeOptions {
+            output: output.to_path_buf(),
+            verbose: false,
+        },
+    )
+    .unwrap()
+}
+
+fn sequencing_marker(conn: &Connection) -> serde_json::Value {
+    let options: String = conn
+        .query_row("SELECT options_json FROM analysis_run", [], |r| r.get(0))
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(&options).unwrap()["call_sequencing"].clone()
+}
+
+/// The callees of `function`'s call events, in event order.
+fn event_callees(conn: &Connection, function: &str) -> Vec<String> {
+    conn.prepare(
+        "SELECT s.callee_text FROM cfg_events e JOIN cfg_functions c ON c.id = e.cfg_id \
+         JOIN functions f ON f.id = c.fn_id JOIN cfg_event_sites es ON es.event_id = e.id \
+         JOIN call_sites s ON s.id = es.call_site_id WHERE f.name = ?1 ORDER BY e.id",
+    )
+    .unwrap()
+    .query_map([function], |r| r.get(0))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// `function`'s immediate sequenced-before pairs, as `a<b` by callee.
+fn event_order(conn: &Connection, function: &str) -> Vec<String> {
+    let callee = "(SELECT s.callee_text FROM cfg_event_sites es \
+                  JOIN call_sites s ON s.id = es.call_site_id WHERE es.event_id = {} LIMIT 1)";
+    conn.prepare(&format!(
+        "SELECT {} || '<' || {} FROM cfg_event_order o JOIN cfg_events e ON e.id = o.event_id \
+         JOIN cfg_functions c ON c.id = e.cfg_id JOIN functions f ON f.id = c.fn_id \
+         WHERE f.name = ?1 ORDER BY o.event_id, o.next_event_id",
+        callee.replace("{}", "o.event_id"),
+        callee.replace("{}", "o.next_event_id"),
+    ))
+    .unwrap()
+    .query_map([function], |r| r.get(0))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+fn count(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// Rows that name something outside their own graph or function: an event
+/// site of another caller, an event or edge across graphs.
+fn misattributed_cfg_rows(conn: &Connection) -> i64 {
+    count(
+        conn,
+        "SELECT (SELECT COUNT(*) FROM cfg_event_sites es JOIN cfg_events e ON e.id = es.event_id \
+                 JOIN cfg_functions c ON c.id = e.cfg_id JOIN call_sites s ON s.id = es.call_site_id \
+                 WHERE s.caller_fn_id != c.fn_id) \
+              + (SELECT COUNT(*) FROM cfg_events e JOIN cfg_blocks b ON b.id = e.block_id \
+                 WHERE b.cfg_id != e.cfg_id) \
+              + (SELECT COUNT(*) FROM cfg_edges g JOIN cfg_blocks s ON s.id = g.src_block \
+                 JOIN cfg_blocks d ON d.id = g.dst_block WHERE s.cfg_id != d.cfg_id) \
+              + (SELECT COUNT(*) FROM cfg_functions c JOIN cfg_blocks b ON b.id = c.entry_block \
+                 WHERE b.cfg_id != c.id)",
+    )
+}
+
+const CFG_TABLES: [&str; 7] = [
+    "cfg_functions",
+    "cfg_blocks",
+    "cfg_edges",
+    "cfg_events",
+    "cfg_event_sites",
+    "cfg_event_order",
+    "cfg_gaps",
+];
+
+fn cfg_dump(conn: &Connection) -> Vec<String> {
+    CFG_TABLES
+        .iter()
+        .flat_map(|table| {
+            conn.prepare(&format!("SELECT * FROM {table}"))
+                .unwrap()
+                .query_map([], |r| {
+                    let row: Vec<String> = (0..r.as_ref().column_count())
+                        .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                        .collect();
+                    Ok(format!("{table} {}", row.join(",")))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+const ORDERED: &str =
+    "void a(void); void b(void); void c(void);\nvoid run(void) { a(); b(); c(); }\n";
+const OTHER: &str = "void x(void); void y(void);\nvoid other(void) { x(); y(); }\n";
+
+#[test]
+fn sequenced_inputs_merge_into_a_complete_call_order() {
+    let tmp = tempdir().unwrap();
+    let inputs = sequencing_inputs(
+        tmp.path(),
+        &[
+            ("repo_a", "a.c", ORDERED, true),
+            ("repo_b", "b.c", OTHER, true),
+        ],
+    );
+    let output = tmp.path().join("merged.db");
+    let report = merge_into(&inputs, &output);
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::MissingSequencing),
+        "{:?}",
+        report.warnings
+    );
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(sequencing_marker(&conn), serde_json::json!(true));
+    assert_eq!(event_callees(&conn, "run"), ["a", "b", "c"]);
+    assert_eq!(event_order(&conn, "run"), ["a<b", "b<c"]);
+    assert_eq!(event_callees(&conn, "other"), ["x", "y"]);
+    assert_eq!(event_order(&conn, "other"), ["x<y"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let units: Vec<String> = conn
+        .prepare(
+            "SELECT u.path FROM cfg_functions c JOIN files u ON u.id = c.tu_file_id \
+             JOIN functions f ON f.id = c.fn_id ORDER BY f.name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        units.len() == 2 && units[0].ends_with("b.c") && units[1].ends_with("a.c"),
+        "each graph keeps the unit it was lowered in: {units:?}"
+    );
+    let inputs_total: i64 = inputs
+        .iter()
+        .map(|db| {
+            count(
+                &Connection::open(db).unwrap(),
+                "SELECT COUNT(*) FROM cfg_events",
+            )
+        })
+        .sum();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_events"),
+        inputs_total
+    );
+    let capability = trace_db::require_sequencing(&conn).unwrap();
+    assert!(capability == trace_db::SequencingMarker::Complete && capability.notice().is_none());
+
+    // Merging again gives the same rows.
+    let again = tmp.path().join("again.db");
+    merge_into(&inputs, &again);
+    assert_eq!(
+        cfg_dump(&Connection::open(&again).unwrap()),
+        cfg_dump(&conn)
+    );
+}
+
+#[test]
+fn mixed_inputs_merge_into_partial_sequencing_with_a_diagnostic() {
+    let tmp = tempdir().unwrap();
+    let inputs = sequencing_inputs(
+        tmp.path(),
+        &[
+            ("repo_a", "a.c", ORDERED, true),
+            ("plain", "b.c", OTHER, false),
+        ],
+    );
+    let output = tmp.path().join("merged.db");
+    let report = merge_into(&inputs, &output);
+    let missing: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|w| w.kind == WarningKind::MissingSequencing)
+        .collect();
+    assert_eq!(missing.len(), 1, "{:?}", report.warnings);
+    assert!(
+        missing[0].message.contains("plain.db") && missing[0].message.contains("--sequencing"),
+        "{}",
+        missing[0].message
+    );
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(sequencing_marker(&conn), serde_json::json!("partial"));
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM diagnostics WHERE stage = 'merge' AND severity = 'info' \
+             AND message LIKE '%plain.db%--sequencing%'"
+        ),
+        1
+    );
+    assert_eq!(event_callees(&conn, "run"), ["a", "b", "c"]);
+    assert!(event_callees(&conn, "other").is_empty());
+    let capability = trace_db::require_sequencing(&conn).unwrap();
+    assert_eq!(capability, trace_db::SequencingMarker::Partial);
+    assert!(capability.notice().unwrap().contains("partial"));
+    // `inspect sequence` reads the merged graph and says it is partial.
+    let run = trace_db::resolve_function_target(&conn, Some("run"), None, None).unwrap();
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Function {
+            function: trace_db::FunctionRowId(run.id),
+            file: None,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.capability, "partial");
+    let text = trace_db::render_sequence(&graph, trace_db::RenderFormat::Text).unwrap();
+    assert!(text.contains("note: call sequencing is partial"), "{text}");
+    let a = text.find("a()").expect(&text);
+    let b = text.find("b()").expect(&text);
+    let c = text.find("c()").expect(&text);
+    assert!(a < b && b < c, "{text}");
+}
+
+#[test]
+fn unsequenced_inputs_merge_without_call_order() {
+    let tmp = tempdir().unwrap();
+    let inputs = sequencing_inputs(
+        tmp.path(),
+        &[
+            ("repo_a", "a.c", ORDERED, false),
+            ("repo_b", "b.c", OTHER, false),
+        ],
+    );
+    let output = tmp.path().join("merged.db");
+    let report = merge_into(&inputs, &output);
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::MissingSequencing),
+        "nothing to diagnose when no input is sequenced: {:?}",
+        report.warnings
+    );
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(sequencing_marker(&conn), serde_json::json!(false));
+    assert!(cfg_dump(&conn).is_empty());
+    // Kind strings are interned only for a sequenced merge.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM strings WHERE text = 'fallthrough'"
+        ),
+        0
+    );
+    assert!(trace_db::require_sequencing(&conn).is_err());
+}
+
+/// `repo_a` and `repo_b`, each including `include/common.h` (`header`) and
+/// calling its `common`, analysed `--sequencing` with each repo's extra args.
+fn header_inputs(
+    root: &std::path::Path,
+    header: &str,
+    args: [&[&str]; 2],
+) -> Vec<std::path::PathBuf> {
+    let include = root.join("include");
+    fs::create_dir_all(&include).unwrap();
+    fs::write(include.join("common.h"), header).unwrap();
+    let mut inputs = Vec::new();
+    for (name, extra) in ["repo_a", "repo_b"].into_iter().zip(args) {
+        let repo = root.join(name);
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            format!("#include \"common.h\"\nint {name}_run() {{ return common(); }}\n"),
+        )
+        .unwrap();
+        let db = root.join(format!("{name}.db"));
+        let mut all = vec![
+            "--sequencing".as_ref(),
+            "--include".as_ref(),
+            include.as_os_str(),
+        ];
+        all.extend(extra.iter().map(std::ffi::OsStr::new));
+        analyze_repo_with(&repo, &db, &all);
+        assert_eq!(
+            count(
+                &Connection::open(&db).unwrap(),
+                "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+                 WHERE f.name = 'common'"
+            ),
+            1
+        );
+        inputs.push(db);
+    }
+    inputs
+}
+
+#[test]
+fn a_header_body_merged_from_several_inputs_keeps_one_graph_with_every_inputs_sites() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let inputs = header_inputs(
+        root,
+        "int local();\ninline int common() { local(); return local(); }\n",
+        [&[], &[]],
+    );
+    let output = root.join("merged.db");
+    let report = merge_into(&inputs, &output);
+    assert!(report.header_functions_deduped >= 1, "{report:?}");
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM functions WHERE name = 'common'"
+        ),
+        1,
+        "the body is one merged function"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'common'"
+        ),
+        1,
+        "one graph for the one merged body"
+    );
+    // The kept graph's two events each list the first input's site, then
+    // the second input's copy of it.
+    let first_input_sites = count(
+        &Connection::open(&inputs[0]).unwrap(),
+        "SELECT COUNT(*) FROM call_sites",
+    );
+    let sites: Vec<(i64, i64, bool)> = conn
+        .prepare(
+            "SELECT e.id, es.ordinal, es.call_site_id > ?1 FROM cfg_event_sites es \
+             JOIN cfg_events e ON e.id = es.event_id JOIN cfg_functions c ON c.id = e.cfg_id \
+             JOIN functions f ON f.id = c.fn_id WHERE f.name = 'common' \
+             ORDER BY e.id, es.ordinal",
+        )
+        .unwrap()
+        .query_map([first_input_sites], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let from_second: Vec<bool> = sites.iter().map(|s| s.2).collect();
+    assert_eq!(from_second, [false, true, false, true], "{sites:?}");
+    assert_eq!(event_callees(&conn, "common"), ["local"; 4]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+}
+
+/// Two inputs sharing `invoke`'s header body but passing it different
+/// callbacks keep one graph whose call event lists both inputs' sites, so
+/// the query follows each input's callback.
+#[test]
+fn a_header_body_merged_alike_keeps_every_inputs_call_targets() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let include = root.join("include");
+    fs::create_dir_all(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "inline void invoke(void (*cb)()) { cb(); }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["a", "b"] {
+        let repo = root.join(format!("repo_{name}"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            format!(
+                "#include \"common.h\"\nvoid mark_{name}();\n\
+                 void cb_{name}() {{ mark_{name}(); }}\n\
+                 void run_{name}() {{ invoke(cb_{name}); }}\n"
+            ),
+        )
+        .unwrap();
+        let db = root.join(format!("repo_{name}.db"));
+        analyze_repo_with(
+            &repo,
+            &db,
+            &[
+                "--sequencing".as_ref(),
+                "--include".as_ref(),
+                include.as_os_str(),
+            ],
+        );
+        inputs.push(db);
+    }
+    let output = root.join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'invoke'"
+        ),
+        1,
+        "one body compiled alike is one graph"
+    );
+    // The call edges keep both callbacks ...
+    let targets: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT g.name FROM call_edges ce JOIN functions f ON f.id = ce.caller_fn_id \
+             JOIN functions g ON g.id = ce.callee_fn_id WHERE f.name = 'invoke' ORDER BY g.name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(targets, ["cb_a", "cb_b"]);
+    // ... and so does the one event, primary first.
+    assert_eq!(event_callees(&conn, "invoke"), ["cb", "cb"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let invoke = trace_db::resolve_function_target(&conn, Some("invoke"), None, None).unwrap();
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Function {
+            function: trace_db::FunctionRowId(invoke.id),
+            file: None,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let frames: Vec<&str> = graph.frames.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        frames,
+        ["invoke", "cb_a", "cb_b"],
+        "both callbacks are followed"
+    );
+
+    // Merging again gives the same rows.
+    let again = root.join("again.db");
+    merge_into(&inputs, &again);
+    assert_eq!(
+        cfg_dump(&Connection::open(&again).unwrap()),
+        cfg_dump(&conn)
+    );
+}
+
+/// A header body the inputs compile differently is kept once per distinct
+/// graph, as `trace analyze` keeps configuration variants.
+#[test]
+fn a_header_body_compiled_differently_keeps_a_variant_per_input() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let inputs = header_inputs(
+        root,
+        "int local();\nint other();\ninline int common() {\n#ifdef MODE_B\n  other();\n#endif\n  return local();\n}\n",
+        [&[], &["-D", "MODE_B"]],
+    );
+    let output = root.join("merged.db");
+    let report = merge_into(&inputs, &output);
+    assert!(report.header_functions_deduped >= 1, "{report:?}");
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM functions WHERE name = 'common'"
+        ),
+        1,
+        "the body is one merged function"
+    );
+    let variants: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT c.variant, (SELECT COUNT(*) FROM cfg_events e WHERE e.cfg_id = c.id) \
+             FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'common' ORDER BY c.id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(variants, [(0, 1), (1, 2)], "one variant per distinct body");
+    assert_eq!(event_callees(&conn, "common"), ["local", "other", "local"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+}
+
+/// Swap the ids of two `call_sites` rows everywhere an input names them.
+fn swap_call_site_ids(conn: &Connection, a: i64, b: i64) {
+    let columns: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
+             WHERE m.type = 'table' AND (p.name = 'call_site_id' \
+               OR (m.name = 'call_sites_data' AND p.name = 'id'))",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    for (table, column) in columns {
+        for (from, to) in [(a, -1), (b, a), (-1, b)] {
+            conn.execute(
+                &format!("UPDATE {table} SET {column} = ?2 WHERE {column} = ?1"),
+                [from, to],
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Two inputs compiling one header body alike, whose call-site ids for
+/// the alternatives of one dispatch are numbered differently, keep one
+/// graph: a graph reads back in its written site order, not by id.
+#[test]
+fn a_body_whose_site_ids_are_numbered_differently_keeps_one_graph() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let inputs = header_inputs(
+        root,
+        "struct Base { virtual int f(); };\n\
+         struct D1 : Base { int f() override { return 1; } };\n\
+         struct D2 : Base { int f() override { return 2; } };\n\
+         Base *get();\n\
+         inline int common() { return get()->f(); }\n",
+        [&[], &[]],
+    );
+    let b = Connection::open(&inputs[1]).unwrap();
+    let overrides: Vec<i64> = b
+        .prepare(
+            "SELECT s.id FROM call_sites s JOIN functions f ON f.id = s.caller_fn_id \
+             WHERE f.name = 'common' AND s.callee_text IN ('D1::f', 'D2::f') ORDER BY s.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(overrides.len(), 2, "the dispatch has two overrides");
+    let one_event: i64 = b
+        .query_row(
+            "SELECT COUNT(DISTINCT event_id) FROM cfg_event_sites WHERE call_site_id IN (?1, ?2)",
+            [overrides[0], overrides[1]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(one_event, 1, "both overrides are alternatives of one event");
+    swap_call_site_ids(&b, overrides[0], overrides[1]);
+    drop(b);
+    let output = root.join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'common'"
+        ),
+        1,
+        "one body compiled alike is one graph"
+    );
+    let callees: Vec<String> = conn
+        .prepare(
+            "SELECT s.callee_text FROM cfg_event_sites es JOIN call_sites s ON s.id = es.call_site_id \
+             JOIN cfg_events e ON e.id = es.event_id JOIN cfg_functions c ON c.id = e.cfg_id \
+             JOIN functions f ON f.id = c.fn_id WHERE f.name = 'common' \
+             ORDER BY e.id, es.ordinal",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        callees,
+        ["get", "get", "Base::f", "D1::f", "D2::f", "Base::f", "D1::f", "D2::f"],
+        "primary first, each input's records in its written order"
+    );
+}
+
+#[test]
+fn an_event_whose_sites_were_not_carried_is_spliced_out() {
+    let tmp = tempdir().unwrap();
+    let inputs = sequencing_inputs(tmp.path(), &[("repo_a", "a.c", ORDERED, true)]);
+    // An input whose `b()` site is gone (the tables are read as written).
+    let input = Connection::open(&inputs[0]).unwrap();
+    input
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM call_edges_data WHERE call_site_id IN
+               (SELECT id FROM call_sites WHERE callee_text = 'b');
+             DELETE FROM call_sites_data WHERE id IN
+               (SELECT id FROM call_sites WHERE callee_text = 'b');",
+        )
+        .unwrap();
+    let b_line: i64 = input
+        .query_row(
+            "SELECT e.line FROM cfg_events e WHERE NOT EXISTS \
+             (SELECT 1 FROM cfg_event_sites es JOIN call_sites s ON s.id = es.call_site_id \
+              WHERE es.event_id = e.id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(input);
+    let output = tmp.path().join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(event_callees(&conn, "run"), ["a", "c"]);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_events"),
+        2,
+        "no event is left without a site"
+    );
+    assert_eq!(event_order(&conn, "run"), ["a<c"]);
+    let gap: (String, Option<i64>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT k.text, g.line, g.first_event, g.last_event FROM cfg_gaps g \
+             JOIN strings k ON k.id = g.kind_id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(gap, ("omitted_sites".into(), Some(b_line), None, None));
+    let coverage: String = conn
+        .query_row(
+            "SELECT k.text FROM cfg_functions c JOIN strings k ON k.id = c.coverage_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(coverage, "partial");
+}
+
+/// An input with more graphs than one read takes: every graph is carried,
+/// in id order, the same on every merge.
+#[test]
+fn graphs_are_carried_across_read_chunks() {
+    let tmp = tempdir().unwrap();
+    let functions = 1100;
+    let mut source = String::from("void a(void); void b(void);\n");
+    for i in 0..functions {
+        source.push_str(&format!("void f{i}(void) {{ a(); b(); }}\n"));
+    }
+    let inputs = sequencing_inputs(
+        tmp.path(),
+        &[
+            ("repo_a", "a.c", &source, true),
+            ("repo_b", "b.c", ORDERED, true),
+        ],
+    );
+    let output = tmp.path().join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_functions"),
+        functions + 1
+    );
+    assert_eq!(event_order(&conn, "f1099"), ["a<b"]);
+    assert_eq!(event_order(&conn, "run"), ["a<b", "b<c"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let again = tmp.path().join("again.db");
+    merge_into(&inputs, &again);
+    assert_eq!(
+        cfg_dump(&Connection::open(&again).unwrap()),
+        cfg_dump(&conn)
+    );
+}
+
+/// A graph row naming a file its input does not list is an error naming
+/// the input, as a call site naming one is, never a panic.
+#[test]
+fn a_cfg_row_naming_an_unknown_file_is_an_error() {
+    for update in [
+        "UPDATE cfg_events SET file_id = 9999 WHERE id = (SELECT MIN(id) FROM cfg_events)",
+        "UPDATE cfg_events SET expansion_file_id = 9999, expansion_line = 1, expansion_col = 1 \
+         WHERE id = (SELECT MIN(id) FROM cfg_events)",
+        "UPDATE cfg_blocks SET file_id = 9999, line = 1, col = 1 \
+         WHERE id = (SELECT MIN(id) FROM cfg_blocks)",
+    ] {
+        let tmp = tempdir().unwrap();
+        let inputs = sequencing_inputs(tmp.path(), &[("repo_a", "a.c", ORDERED, true)]);
+        let input = Connection::open(&inputs[0]).unwrap();
+        input.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        input.execute(update, []).unwrap();
+        drop(input);
+        let error = merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: tmp.path().join("merged.db"),
+                verbose: false,
+            },
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("9999") && error.contains("repo_a.db"),
+            "{update}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_sequenced_input_must_have_every_cfg_column() {
+    let tmp = tempdir().unwrap();
+    let inputs = sequencing_inputs(tmp.path(), &[("repo_a", "a.c", ORDERED, true)]);
+    Connection::open(&inputs[0])
+        .unwrap()
+        .execute_batch("ALTER TABLE cfg_events RENAME COLUMN expansion_col TO other")
+        .unwrap();
+    let output = tmp.path().join("merged.db");
+    fs::write(&output, b"existing output").unwrap();
+    let error = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("missing trace-merge capability"), "{error}");
+    assert!(
+        error.contains("cfg_events") && error.contains("expansion_col"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"existing output");
+}
+
+/// A merged input lists another input's copy of a header body's call as
+/// an alternative of its event: merging it again with a third input keeps
+/// one graph, as merging the three inputs at once does, and the query
+/// follows each callback once.
+#[test]
+fn re_merging_keeps_alternative_sites_one_event() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let include = root.join("include");
+    fs::create_dir_all(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "inline void common(void (*cb)()) { cb(); }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["a", "b", "c"] {
+        let repo = root.join(format!("repo_{name}"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            format!(
+                "#include \"common.h\"\nvoid mark_{name}();\n\
+                 void cb_{name}() {{ mark_{name}(); }}\n\
+                 void run_{name}() {{ common(cb_{name}); }}\n"
+            ),
+        )
+        .unwrap();
+        let db = root.join(format!("repo_{name}.db"));
+        analyze_repo_with(
+            &repo,
+            &db,
+            &[
+                "--sequencing".as_ref(),
+                "--include".as_ref(),
+                include.as_os_str(),
+            ],
+        );
+        inputs.push(db);
+    }
+    let graphs = "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+                  WHERE f.name = 'common'";
+    let flat = root.join("flat.db");
+    merge_into(&inputs, &flat);
+    let flat = Connection::open(&flat).unwrap();
+    assert_eq!(count(&flat, graphs), 1);
+
+    let ab = root.join("ab.db");
+    merge_into(&inputs[..2], &ab);
+    let nested = root.join("nested.db");
+    merge_into(&[ab, inputs[2].clone()], &nested);
+    let conn = Connection::open(&nested).unwrap();
+    assert_eq!(count(&conn, graphs), count(&flat, graphs));
+    assert_eq!(event_callees(&conn, "common"), ["cb", "cb", "cb"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let common = trace_db::resolve_function_target(&conn, Some("common"), None, None).unwrap();
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Function {
+            function: trace_db::FunctionRowId(common.id),
+            file: None,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let frames: Vec<&str> = graph.frames.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(frames, ["common", "cb_a", "cb_b", "cb_c"]);
+}

@@ -10,8 +10,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub use trace_analysis::LocKind;
 
 mod editor;
+mod sequence;
 mod slice;
 pub use editor::*;
+pub use sequence::*;
 pub use slice::*;
 
 /// A stored analysis diagnostic, with its original source path when available.
@@ -101,17 +103,9 @@ pub struct SolverInfo {
 /// Keyed off `options_json`, so it works on any `trace inspect` input
 /// without re-analysis.
 pub fn solver_outcome(conn: &Connection) -> Result<SolverInfo> {
-    let row: Option<String> = conn
-        .query_row(
-            "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(json) = row else {
+    let Some(value) = run_options(conn)? else {
         return Ok(SolverInfo::default());
     };
-    let value: serde_json::Value = serde_json::from_str(&json)?;
     Ok(SolverInfo {
         partial: value
             .get("solver_partial")
@@ -124,6 +118,23 @@ pub fn solver_outcome(conn: &Connection) -> Result<SolverInfo> {
         budget_pops: value.get("solve_budget_pops").and_then(|v| v.as_u64()),
         budget_secs: value.get("solve_budget_secs").and_then(|v| v.as_u64()),
     })
+}
+
+/// The first run's `analysis_run.options_json`, parsed; `None` when the
+/// database records none (legacy and scratch databases may lack the
+/// column). Text that is not JSON fails with a `serde_json::Error`.
+pub(crate) fn run_options(conn: &Connection) -> Result<Option<serde_json::Value>> {
+    if !column_exists(conn, "analysis_run", "options_json")? {
+        return Ok(None);
+    }
+    let options: Option<String> = conn
+        .query_row(
+            "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(options.map(|o| serde_json::from_str(&o)).transpose()?)
 }
 
 #[derive(Debug, Clone)]
@@ -596,6 +607,13 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// `name` is `want` or a C++ qualified name ending in it (`Foo::Bar` for
+/// `Bar`); [`push_fn_name_filter`] is the SQL form.
+pub(crate) fn names_function(name: &str, want: &str) -> bool {
+    name.strip_suffix(want)
+        .is_some_and(|scope| scope.is_empty() || scope.ends_with("::"))
+}
+
 /// Exact name or C++ qualified suffix (`Foo::Bar` matches `--from Bar`).
 /// User text is escaped so SQLite `LIKE` wildcards `_` / `%` are literal.
 fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str, name: &str) {
@@ -729,7 +747,9 @@ fn require_flow_tables(conn: &Connection) -> Result<()> {
 }
 
 /// Bounded BFS over the call graph from `root_fn_id`. Down follows caller →
-/// callee edges and includes unresolved call sites as leaves; up follows
+/// callee edges and includes unresolved indirect call sites as leaves (a
+/// direct site without an edge is in `call_sites` only for `--sequencing`;
+/// see `docs/SQLITE_SCHEMA.md`, "Call site export filter"); up follows
 /// callee → caller edges. Unresolved leaves have negative, query-local IDs,
 /// distinct from the nonnegative function IDs stored in the database.
 pub fn call_graph(
@@ -748,7 +768,8 @@ pub fn call_graph(
         let mut stmt = conn.prepare(
             "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
              FROM call_sites cs JOIN files p ON p.id = cs.file_id \
-             WHERE cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
+             WHERE cs.is_direct = 0 \
+               AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
              ORDER BY cs.id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1589,7 +1610,7 @@ pub fn find_functions_by_name(
     let cands: Vec<FunctionRef> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let cands = cands
         .into_iter()
-        .filter(|f| f.name == name || f.name.ends_with(&format!("::{name}")))
+        .filter(|f| names_function(&f.name, name))
         .collect();
     Ok(cands)
 }

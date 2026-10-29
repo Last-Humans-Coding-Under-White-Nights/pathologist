@@ -518,6 +518,8 @@ pub struct PreprocessOptions {
     /// Macros whose expansions are ignored during lowering (no call sites,
     /// flow constraints, or local variables). Supports wildcards (e.g. `TAG_LOG*`).
     pub ignored_macros: Vec<String>,
+    /// Record per-function call-order graphs while lowering (`--sequencing`).
+    pub call_sequencing: bool,
 }
 
 impl Default for PreprocessOptions {
@@ -567,6 +569,7 @@ impl Default for PreprocessOptions {
             explore: false,
             explore_budget: 4,
             ignored_macros: Vec::new(),
+            call_sequencing: false,
         }
     }
 }
@@ -795,6 +798,12 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_record_conditionals(mut self, record: bool) -> Self {
         self.record_conditionals = record;
+        self
+    }
+
+    #[must_use]
+    pub fn with_call_sequencing(mut self, call_sequencing: bool) -> Self {
+        self.call_sequencing = call_sequencing;
         self
     }
 

@@ -5,6 +5,9 @@ mod configured;
 #[path = "callback_declarations.rs"]
 mod callback_declarations;
 
+#[path = "cfg_build.rs"]
+mod cfg_build;
+
 use crate::cpp_type_names::is_fundamental_type_name;
 use crate::deps::IncludeGraph;
 use crate::discover::{discover_files, DiscoveredFiles};
@@ -288,6 +291,9 @@ struct LowerContext {
     pending_initializer_owners: HashMap<usize, VarId>,
     ignored_macros: Arc<[String]>,
     ignored_macro_cache: RefCell<HashMap<String, bool>>,
+    /// Which node lowered which call sites, for call-order graphs; `None`
+    /// unless `--sequencing` is on.
+    cfg_recorder: Option<cfg_build::CfgRecorder>,
 }
 
 /// C++ class scope during member lowering.
@@ -304,6 +310,47 @@ impl LowerContext {
     /// variable identity").
     fn directive_namespaces(&self) -> impl Iterator<Item = &str> {
         self.using_nss.iter().rev().map(String::as_str)
+    }
+
+    /// Record that lowering `node` emitted the sites from `first` on.
+    fn record_cfg_sites(&mut self, program: &Program, node: Node, first: usize) {
+        if let Some(recorder) = self.body_cfg_recorder() {
+            recorder.own(node, first..program.symbols.call_sites.len());
+        }
+    }
+
+    /// The recorder, inside a function body only. Outside one (file and
+    /// class scope) a site's caller is a function whose graph is already
+    /// built, such as a lambda in an initializer, so a record there would
+    /// only lengthen every later graph's claim.
+    fn body_cfg_recorder(&mut self) -> Option<&mut cfg_build::CfgRecorder> {
+        self.cfg_recorder
+            .as_mut()
+            .filter(|_| self.current_fn.is_some())
+    }
+
+    fn cfg_mark(&self) -> Option<cfg_build::RecorderMark> {
+        self.cfg_recorder.as_ref().map(|r| r.mark())
+    }
+
+    /// Drop what was recorded since `mark`.
+    fn cfg_truncate(&mut self, mark: Option<cfg_build::RecorderMark>) {
+        if let (Some(recorder), Some(mark)) = (&mut self.cfg_recorder, mark) {
+            recorder.truncate(mark);
+        }
+    }
+
+    /// Recovery lowered `node` through a scratch tree the graph never walks:
+    /// `node` owns everything recorded since `mark`.
+    fn record_recovered_cfg_sites(
+        &mut self,
+        program: &Program,
+        node: Node,
+        first: usize,
+        mark: Option<cfg_build::RecorderMark>,
+    ) {
+        self.cfg_truncate(mark);
+        self.record_cfg_sites(program, node, first);
     }
 
     fn is_macro_ignored(&self, name: &str) -> bool {
@@ -508,6 +555,7 @@ fn build_program_inner(
     program.explore = opts.explore;
     program.explore_budget = opts.explore_budget;
     program.ignored_macros = opts.ignored_macros.clone();
+    program.call_sequencing = opts.call_sequencing;
 
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
@@ -1243,7 +1291,7 @@ fn build_program_inner(
                     index_language(path, &cpp_parse, no_c_units, forced_language),
                     Some(&header_ir_map),
                     &header_order,
-                    &opts.ignored_macros,
+                    opts,
                 );
                 push_header_ir(
                     &mut header_ir_map,
@@ -1274,7 +1322,7 @@ fn build_program_inner(
                                 index_language(path, &cpp_parse, no_c_units, forced_language),
                                 Some(snapshot),
                                 &header_order,
-                                &opts.ignored_macros,
+                                opts,
                             ),
                         )
                     })
@@ -1310,7 +1358,7 @@ fn build_program_inner(
                 index_language(&path, &cpp_parse, no_c_units, forced_language),
                 Some(&header_ir_map),
                 &header_order,
-                &opts.ignored_macros,
+                opts,
             );
             push_header_ir(
                 &mut header_ir_map,
@@ -2029,6 +2077,9 @@ fn expand_virtual_overrides(program: &mut Program) {
         })
         .collect();
     let snapshot = program.symbols.call_sites.clone();
+    // `(site, added target)`: another target of the same invocation, not
+    // another call.
+    let mut alternatives = Vec::new();
     for cs in snapshot {
         let Some(fid) = cs.callee_fn_id.filter(|_| !cs.exact_receiver) else {
             continue;
@@ -2157,14 +2208,19 @@ fn expand_virtual_overrides(program: &mut Program) {
                 expansion_span: cs.expansion_span,
                 is_direct: true,
                 in_loop: cs.in_loop,
+                unevaluated: cs.unevaluated,
                 receiver_class: cs.receiver_class.clone(),
                 exact_receiver: cs.exact_receiver,
                 return_dst: cs.return_dst,
                 receiver: cs.receiver,
                 tu: cs.tu,
             });
+            if program.call_sequencing {
+                alternatives.push((cs.id, call_id));
+            }
         }
     }
+    program.attach_alternative_sites(&alternatives);
 }
 
 fn method_kind_of_function(name: &str) -> Option<(String, trace_ir::MethodKind)> {
@@ -2664,7 +2720,7 @@ fn index_header_variant(
     language: Language,
     header_ir: Option<&HeaderIr>,
     pch_order: &HeaderOrder,
-    ignored_macros: &[String],
+    opts: &PreprocessOptions,
 ) -> UnitIndex {
     let expansion = cache.read().ok().and_then(|guard| {
         guard
@@ -2679,8 +2735,7 @@ fn index_header_variant(
         };
     };
     let pre = Arc::new(PreprocessedSource::from_expansion(&expansion, language));
-    let mut program = Program::new(root.to_path_buf());
-    program.ignored_macros = ignored_macros.to_vec();
+    let mut program = unit_program(root, opts);
     match lower_prepared_source(
         &mut program,
         path,
@@ -2757,8 +2812,7 @@ fn index_source_file(
     header_ir: Option<&HeaderIr>,
     pch_order: &HeaderOrder,
 ) -> UnitIndex {
-    let mut program = Program::new(root.to_path_buf());
-    program.ignored_macros = index_opts.ignored_macros.clone();
+    let mut program = unit_program(root, index_opts);
     match process_indexed_file(
         &mut program,
         path,
@@ -2868,8 +2922,7 @@ fn index_source_file_with_variants(
         var_opts.defines.extend(variant.defines.iter().cloned());
         match source_cache.preprocess_uncached(path, graph, &var_opts) {
             Ok((var_pre, _)) => {
-                let mut var_program = Program::new(root.to_path_buf());
-                var_program.ignored_macros = var_opts.ignored_macros.clone();
+                let mut var_program = unit_program(root, &var_opts);
                 match lower_prepared_source(
                     &mut var_program,
                     path,
@@ -3075,6 +3128,7 @@ fn lower_prepared_source(
         pending_initializer_owners: HashMap::default(),
         ignored_macros: Arc::from(program.ignored_macros.clone()),
         ignored_macro_cache: RefCell::new(HashMap::default()),
+        cfg_recorder: program.call_sequencing.then(Default::default),
     };
     if ctx.record_link_ownership && ctx.has_weak {
         // Header preamble facts may already aggregate several operation sites.
@@ -3299,6 +3353,14 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &mut LowerContext) {
     }
 }
 
+/// An empty per-unit program carrying the options lowering reads from it.
+fn unit_program(root: &Path, opts: &PreprocessOptions) -> Program {
+    let mut program = Program::new(root.to_path_buf());
+    program.ignored_macros = opts.ignored_macros.clone();
+    program.call_sequencing = opts.call_sequencing;
+    program
+}
+
 fn program_into_unit(
     path: PathBuf,
     mut program: Program,
@@ -3341,6 +3403,7 @@ fn program_into_unit(
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
         anonymous_bases: std::mem::take(&mut program.anonymous_bases),
         namespaces: std::mem::take(&mut program.namespaces),
+        cfgs: program.cfgs.into_values().flatten().collect(),
         merge_descs: Vec::new(),
     }
 }
@@ -5868,21 +5931,57 @@ fn lower_function_body(
     let using_nss_len = ctx.using_nss.len();
     let using_imports_len = ctx.using_name_imports.len();
     let local_aliases_len = ctx.local_aliases.len();
+    let first_site = program.symbols.call_sites.len();
+    let cfg_mark = ctx.cfg_mark();
 
-    if let Some(body_node) = node.cached_field("body") {
+    // A constructor's function-try-block (`A::A() try : m_(f()) {...}`) is
+    // not the definition's `body` field but a child of it; its walk lowers
+    // the initializer list it holds.
+    let body = node.cached_field("body").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|c| c.cached_kind() == "try_statement")
+    });
+    if let Some(body_node) = body {
         walk_function_body(program, ctx, source, body_node, fn_id);
     }
     // Constructor-initializer lists are siblings of the body on
     // function_definition; they carry base/member ctor calls.
-    if ctx.is_cpp {
-        let init_lists: Vec<_> = node
-            .children(&mut node.walk())
+    let init_lists: Vec<_> = if ctx.is_cpp {
+        node.children(&mut node.walk())
             .filter(|c| c.cached_kind() == "field_initializer_list")
-            .collect();
-        for il in init_lists {
-            walk_function_body(program, ctx, source, il, fn_id);
-        }
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for &il in &init_lists {
+        walk_function_body(program, ctx, source, il, fn_id);
     }
+    // A function-try-block's own initializer list runs in its `try`, before
+    // any beside it.
+    let function_try = body.filter(|b| b.cached_kind() == "try_statement");
+    let in_try: Vec<_>;
+    let prologue = match function_try {
+        Some(try_node) => {
+            in_try = try_node
+                .children(&mut try_node.walk())
+                .filter(|c| c.cached_kind() == "field_initializer_list")
+                .chain(init_lists.iter().copied())
+                .collect();
+            &in_try
+        }
+        None => &init_lists,
+    };
+    cfg_build::build_function_cfg(
+        program,
+        ctx,
+        source,
+        fn_id,
+        first_site,
+        body,
+        prologue,
+        function_try.is_some(),
+    );
+    ctx.cfg_truncate(cfg_mark);
     ctx.using_nss.truncate(using_nss_len);
     ctx.using_name_imports.truncate(using_imports_len);
     ctx.local_aliases.truncate(local_aliases_len);
@@ -7471,6 +7570,7 @@ fn emit_factory_construction(
         return;
     }
     let heap = factory_object(program, ctx, call, caller, cls.clone());
+    let first = program.symbols.call_sites.len();
     emit_member_targets(
         program,
         caller,
@@ -7483,6 +7583,13 @@ fn emit_factory_construction(
         targets,
         None,
     );
+    // The object is exactly `cls`. Marked so, the constructor sites, which
+    // share the factory call's position, stay an invocation of their own
+    // rather than alternatives of the factory's (docs/ANALYSIS.md, "Call
+    // sequencing").
+    for site in &mut program.symbols.call_sites[first..] {
+        site.exact_receiver = true;
+    }
 }
 
 /// The one heap object every factory call in `caller` building `cls` takes
@@ -8299,12 +8406,21 @@ fn lower_declaration(
     // variable starts at the declarator, as an init_declarator's does.
     if let (Some(decl), Some(value)) = (node.cached_field("declarator"), node.cached_field("value"))
     {
+        let first_site = program.symbols.call_sites.len();
         lower_initialized(program, ctx, decl, decl, Some(value));
+        ctx.record_cfg_sites(program, decl, first_site);
         return false;
     }
 
+    let mut declarator = None;
     let mut cursor = node.walk();
     for (index, child) in node.children(&mut cursor).enumerate() {
+        // Each declarator owns the sites it lowered (`T a{f()}, b{g()};`).
+        if let Some((previous, first_site)) =
+            declarator.replace((child, program.symbols.call_sites.len()))
+        {
+            ctx.record_cfg_sites(program, previous, first_site);
+        }
         // Recovered declarations use class grammar, whose initializer is a
         // sibling field. Only declarators introduce names; an initializer's
         // identifier must never become a variable that shadows its function.
@@ -8399,6 +8515,7 @@ fn lower_declaration(
                                             expansion_span,
                                             is_direct: false,
                                             in_loop: false,
+                                            unevaluated: false,
                                             receiver_class: None,
                                             exact_receiver: false,
                                             return_dst: None,
@@ -8491,6 +8608,9 @@ fn lower_declaration(
             }
             _ => {}
         }
+    }
+    if let Some((last, first_site)) = declarator {
+        ctx.record_cfg_sites(program, last, first_site);
     }
     false
 }
@@ -8928,7 +9048,7 @@ fn collect_lifecycle_members<'a>(
 /// (docs/ANALYSIS.md, "Automatic objects").
 fn emit_automatic_lifecycle(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     var: VarId,
     decl: Node,
@@ -8982,28 +9102,33 @@ fn emit_automatic_lifecycle(
     // One site per class providing the members, each under its own name so
     // its overloads are ranked among themselves. The object is exactly its
     // class: the sites take no virtual dispatch.
+    let emit =
+        |program: &mut Program, kind: trace_ir::MethodKind, groups: Vec<(String, Vec<FnId>)>| {
+            for (owner, targets) in groups {
+                emit_member_targets(
+                    program,
+                    caller,
+                    &owner,
+                    &kind,
+                    Receiver::Bound(var),
+                    CallArgs::empty(),
+                    span,
+                    expansion_span,
+                    targets,
+                    None,
+                );
+            }
+        };
     let first = program.symbols.call_sites.len();
-    for (kind, groups) in [
-        (trace_ir::MethodKind::Ctor, ctors),
-        (trace_ir::MethodKind::Dtor, dtors),
-    ] {
-        for (owner, targets) in groups {
-            emit_member_targets(
-                program,
-                caller,
-                &owner,
-                &kind,
-                Receiver::Bound(var),
-                CallArgs::empty(),
-                span,
-                expansion_span,
-                targets,
-                None,
-            );
-        }
-    }
+    emit(program, trace_ir::MethodKind::Ctor, ctors);
+    let first_dtor = program.symbols.call_sites.len();
+    emit(program, trace_ir::MethodKind::Dtor, dtors);
     for site in &mut program.symbols.call_sites[first..] {
         site.exact_receiver = true;
+    }
+    // The graph runs the one destructor site at each exit of the scope.
+    if let Some(recorder) = ctx.body_cfg_recorder() {
+        recorder.destructors(span_node, first_dtor..program.symbols.call_sites.len());
     }
 }
 
@@ -9852,9 +9977,12 @@ fn walk_function_body(
     node: Node,
     caller: FnId,
 ) {
+    let first_site = program.symbols.call_sites.len();
+    let cfg_mark = ctx.cfg_mark();
     if node.cached_kind() == "expression_statement"
         && callback_declarations::try_lower(program, ctx, source, node)
     {
+        ctx.record_recovered_cfg_sites(program, node, first_site, cfg_mark);
         return;
     }
     if ctx.ast_depth >= MAX_AST_WALK_DEPTH {
@@ -9878,6 +10006,7 @@ fn walk_function_body(
             if lower_declaration(program, ctx, source, node, None) {
                 // Recovery already visited the evaluated expressions. The
                 // original misparsed children must not be walked again.
+                ctx.record_recovered_cfg_sites(program, node, first_site, cfg_mark);
                 ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
                 return;
             }
@@ -9914,6 +10043,7 @@ fn walk_function_body(
                 return;
             }
             let _ = lower_lambda_expression(program, ctx, source, node);
+            ctx.record_cfg_sites(program, node, first_site);
             ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
             return;
         }
@@ -9956,6 +10086,7 @@ fn walk_function_body(
         }
         _ => {}
     }
+    ctx.record_cfg_sites(program, node, first_site);
     // `using namespace X;` / `using X::f;` are scoped to the enclosing block
     // in C++. A directive at function-body top level applies to the whole
     // body (restored when the root `compound_statement` exits, matching
@@ -9996,7 +10127,15 @@ fn walk_function_body(
         if statement_body.is_some_and(|body| body.id() == child.id()) {
             lower_statement_local(program, ctx, source, node);
         }
+        let never_runs = unevaluated_operand(ctx.is_cpp, source, node, child);
         walk_function_body(program, ctx, source, child, caller);
+        if never_runs {
+            // As for loops: a lambda written in the operand is a function of
+            // its own.
+            for site in &mut program.symbols.call_sites[first_site..] {
+                site.unevaluated |= site.caller == caller;
+            }
+        }
         if repeats_in_loop(node, child) {
             // The calls this child lowered are the function's own; a lambda
             // written here lowered its calls into a function of its own.
@@ -10033,6 +10172,83 @@ fn repeats_in_loop(node: Node, child: Node) -> bool {
         "for_statement" => !runs_once("initializer"),
         "for_range_loop" => !runs_once("initializer") && !runs_once("right"),
         "while_statement" | "do_statement" => true,
+        _ => false,
+    }
+}
+
+/// An operator the grammars parse as a call: C++ `noexcept(e)` and
+/// `typeid(e)`, and GNU `typeof(e)` / `__typeof__(e)` with an expression
+/// operand in C (C++ parses it as `decltype`). The keyword is no call: no
+/// site is lowered for it, and its operand's calls are
+/// [unevaluated](unevaluated_operand) or ordinary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperatorCall {
+    Noexcept,
+    Typeid,
+    Typeof,
+}
+
+pub(crate) fn operator_call(is_cpp: bool, source: &str, node: Node) -> Option<OperatorCall> {
+    if node.cached_kind() != "call_expression" {
+        return None;
+    }
+    let function = node.cached_field("function")?;
+    if function.cached_kind() != "identifier" {
+        return None;
+    }
+    match node_text(source, &function) {
+        "noexcept" if is_cpp => Some(OperatorCall::Noexcept),
+        "typeid" if is_cpp => Some(OperatorCall::Typeid),
+        "typeof" | "__typeof__" | "__typeof" => Some(OperatorCall::Typeof),
+        _ => None,
+    }
+}
+
+/// Whether `child` of `node` is an operand the language never evaluates,
+/// so its calls never run (`CallSite::unevaluated`; docs/ANALYSIS.md,
+/// "Unevaluated operands"): a `noexcept` operand, a `requires` expression,
+/// `_Generic`'s controlling expression, and the operand of `sizeof`,
+/// `alignof`, `decltype` and GNU `typeof` when it is a call. Those evaluate
+/// an operand of variably modified type (C11 6.5.3.4p2), and lowering does
+/// not know types: a call's result never is one, any other expression or a
+/// type operand (`sizeof(int[n()])`) may be, as `typeid`'s operand may be
+/// evaluated. Those stay ordinary calls.
+pub(crate) fn unevaluated_operand(is_cpp: bool, source: &str, node: Node, child: Node) -> bool {
+    let is_call = |operand: Node| {
+        let mut inner = operand;
+        while inner.cached_kind() == "parenthesized_expression" {
+            match inner.named_child(0) {
+                Some(next) => inner = next,
+                None => return false,
+            }
+        }
+        inner.cached_kind() == "call_expression"
+    };
+    match node.cached_kind() {
+        "sizeof_expression" | "alignof_expression" | "decltype" => {
+            child.is_named() && child.cached_kind() != "type_descriptor" && is_call(child)
+        }
+        "requires_expression" => true,
+        "generic_expression" => {
+            let mut cursor = node.walk();
+            let control = node
+                .named_children(&mut cursor)
+                .find(|c| c.cached_kind() != "type_descriptor");
+            control.is_some_and(|c| c.id() == child.id())
+        }
+        "call_expression" => {
+            let arguments = node
+                .cached_field("arguments")
+                .filter(|a| a.id() == child.id());
+            match (operator_call(is_cpp, source, node), arguments) {
+                (Some(OperatorCall::Noexcept), Some(_)) => true,
+                (Some(OperatorCall::Typeof), Some(arguments)) => {
+                    arguments.named_child_count() == 1
+                        && arguments.named_child(0).is_some_and(is_call)
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -10144,7 +10360,7 @@ fn collect_call_at_node(
         return;
     }
 
-    if node_is_from_ignored_macro(ctx, node) {
+    if node_is_from_ignored_macro(ctx, node) || operator_call(ctx.is_cpp, source, node).is_some() {
         return;
     }
     let occurrence_node = node
@@ -10732,6 +10948,7 @@ fn collect_call_at_node_inner(
             expansion_span,
             is_direct,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
@@ -10782,6 +10999,7 @@ fn collect_call_at_node_inner(
             expansion_span,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
@@ -12134,6 +12352,7 @@ fn emit_unresolved_site(
         expansion_span,
         is_direct: false,
         in_loop: false,
+        unevaluated: false,
         receiver_class,
         exact_receiver: false,
         return_dst,
@@ -12292,6 +12511,7 @@ fn emit_member_targets(
             expansion_span,
             is_direct: false,
             in_loop: false,
+            unevaluated: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
@@ -12329,6 +12549,7 @@ fn emit_member_targets(
             expansion_span,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
@@ -14379,7 +14600,21 @@ fn lower_lambda_expression(
         .children(&mut node.walk())
         .find(|c| c.cached_kind() == "compound_statement")
     {
+        let first_site = program.symbols.call_sites.len();
+        let cfg_mark = ctx.cfg_mark();
         walk_function_body(program, ctx, source, body, fn_id);
+        cfg_build::build_function_cfg(
+            program,
+            ctx,
+            source,
+            fn_id,
+            first_site,
+            Some(body),
+            &[],
+            false,
+        );
+        // The enclosing function's graph takes none of the lambda's sites.
+        ctx.cfg_truncate(cfg_mark);
     }
     ctx.current_fn = saved_fn;
     ctx.locals = saved_locals;
@@ -17561,6 +17796,9 @@ fn resolve_call_for_return(
     source: &str,
     call_node: Node,
 ) -> Option<ResolvedCallReturn> {
+    if operator_call(ctx.is_cpp, source, call_node).is_some() {
+        return None;
+    }
     if weak_promotion(program, ctx, source, call_node).is_some() {
         return promoted_receiver_value(program, ctx, source, call_node)
             .map(ResolvedCallReturn::PromotedReceiver);
@@ -21913,6 +22151,7 @@ mod qualified_variable_lookup_tests {
             pending_initializer_owners: HashMap::default(),
             ignored_macros: Arc::from(Vec::<String>::new()),
             ignored_macro_cache: RefCell::new(HashMap::default()),
+            cfg_recorder: None,
         }
     }
 
@@ -22181,5 +22420,89 @@ mod call_args_tests {
         assert_eq!(args.argc, 2);
         assert_eq!(args.arg_desc.len(), 2);
         assert_eq!(args.null_constants, [true, false]);
+    }
+}
+
+#[cfg(test)]
+mod unit_program_tests {
+    use super::*;
+
+    /// Declarations outside a function body feed no call-order graph, so
+    /// the recorder keeps nothing for them: every later body's graph would
+    /// otherwise step over the whole unit's file-scope records.
+    #[test]
+    fn file_scope_declarations_record_no_cfg_sites() {
+        // The lambda's body is a function of its own, lowered (and its
+        // graph built) inside the file-scope declarator.
+        let source = "struct S { S(); ~S(); };\n\
+                      int f();\n\
+                      int a = f(), b = f();\n\
+                      S s;\n\
+                      auto l = [] { return f(); };\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/r.cpp"));
+        let mut ctx = super::qualified_variable_lookup_tests::test_ctx(
+            file,
+            None,
+            Vec::new(),
+            HashMap::default(),
+        );
+        ctx.cfg_recorder = Some(Default::default());
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let declarations: Vec<Node> = root
+            .named_children(&mut cursor)
+            .filter(|n| n.cached_kind() == "declaration")
+            .collect();
+        assert_eq!(declarations.len(), 4);
+        for declaration in declarations {
+            lower_declaration(&mut program, &mut ctx, source, declaration, None);
+        }
+        assert!(
+            !program.symbols.call_sites.is_empty(),
+            "the lambda body lowers a call"
+        );
+        let empty = cfg_build::CfgRecorder::default().mark();
+        assert_eq!(ctx.cfg_mark(), Some(empty));
+    }
+
+    #[test]
+    fn a_unit_program_carries_the_lowering_options() {
+        let opts = PreprocessOptions::new()
+            .with_ignored_macros(["LOG*".to_string()])
+            .with_call_sequencing(true);
+        let program = unit_program(Path::new("/t"), &opts);
+        assert_eq!(program.root, Path::new("/t"));
+        assert_eq!(program.ignored_macros, ["LOG*"]);
+        assert!(program.call_sequencing);
+        assert!(!unit_program(Path::new("/t"), &PreprocessOptions::new()).call_sequencing);
+    }
+
+    #[test]
+    fn a_unit_takes_the_program_cfgs_in_function_order() {
+        let cfg = |function: u32| trace_ir::FunctionCfg {
+            function: FnId(function),
+            tu: None,
+            variant: 0,
+            entry: trace_ir::BlockId(0),
+            exit: trace_ir::BlockId(1),
+            exceptional_exit: None,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+            events: Vec::new(),
+            order: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let mut program = Program::new(PathBuf::from("/t"));
+        program.cfgs.insert(FnId(3), vec![cfg(3)]);
+        program.cfgs.insert(FnId(1), vec![cfg(1)]);
+        let unit = program_into_unit(PathBuf::from("/t/a.c"), program, None);
+        let functions: Vec<FnId> = unit.cfgs.iter().map(|c| c.function).collect();
+        assert_eq!(functions, [FnId(1), FnId(3)]);
     }
 }

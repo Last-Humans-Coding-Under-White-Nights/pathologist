@@ -390,7 +390,7 @@ fn render_json(
     out
 }
 
-fn dot_escape(s: &str) -> String {
+pub(crate) fn dot_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -446,7 +446,7 @@ fn render_graphviz(
 
 /// Unresolved call leaves use negative query-local IDs. Keep node identifiers
 /// valid in both DOT and Mermaid while preserving existing function IDs.
-fn graph_ident(id: i64) -> String {
+pub(crate) fn graph_ident(id: i64) -> String {
     if id < 0 {
         format!("u{}", id.unsigned_abs())
     } else {
