@@ -428,13 +428,28 @@ fn run_probe_with_timeout(
             command.arg("-v");
         }
         command.args(["-dM", "-x", lang, "-"]);
-        let mut child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout.reopen().map_err(|e| e.to_string())?))
-            .stderr(Stdio::from(stderr.reopen().map_err(|e| e.to_string())?))
-            .spawn()
-            .map_err(|e| format!("cannot start compiler: {e}"))?;
+            .stderr(Stdio::from(stderr.reopen().map_err(|e| e.to_string())?));
         let start = Instant::now();
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                // An executable can briefly remain open for writing even
+                // after its producer has closed its own handle. Retry only
+                // this startup error, within the same budget as the probe.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && start.elapsed() < timeout =>
+                {
+                    std::thread::sleep(
+                        Duration::from_millis(25).min(timeout.saturating_sub(start.elapsed())),
+                    );
+                }
+                Err(error) => return Err(format!("cannot start compiler: {error}")),
+            }
+        };
         let mut marker_at = None;
         let mut output = Vec::new();
         const END_MARKER: &[u8] = b"End of search list.";
@@ -1073,6 +1088,67 @@ mod tests {
             }
             assert_eq!(result.target_defines, expected);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn busy_executable_retries_until_closed_within_the_probe_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let include = dir.path().join("include");
+        std::fs::create_dir(&include).unwrap();
+        let driver = dir.path().join("compiler");
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\nprintf '#include <...> search starts here:\\n {}\\nEnd of search list.\\n' >&2\nprintf '#define __GNUC__ 13\\n'\n",
+                include.display()
+            ),
+        ).unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&driver)
+            .unwrap();
+        assert_eq!(
+            Command::new(&driver).spawn().unwrap_err().kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        let mode = DiscoveryMode {
+            includes: true,
+            predefines: true,
+        };
+        // A persistently busy executable must fail within the caller's budget.
+        let started = Instant::now();
+        let busy = run_probe_with_timeout(
+            &driver,
+            dir.path(),
+            Language::C,
+            &[],
+            mode,
+            Duration::from_millis(100),
+        );
+        assert!(busy.failure.unwrap().starts_with("cannot start compiler:"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // Closing the writer makes exactly the same executable usable. Exercise
+        // actual kernel ETXTBSY failures rather than mocking spawn results.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        let result = run_probe_with_timeout(
+            &driver,
+            dir.path(),
+            Language::C,
+            &[],
+            mode,
+            Duration::from_secs(3),
+        );
+        release.join().unwrap();
+        assert_eq!(result.failure, None, "{result:?}");
+        assert_eq!(result.paths, [trace_ir::canonicalize(&include)]);
+        assert_eq!(result.target_defines, [("__GNUC__".into(), "13".into())]);
     }
 
     #[cfg(unix)]

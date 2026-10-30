@@ -4,6 +4,33 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Retry temporarily busy compiler probes
+
+Compiler include/predefine discovery retries `ETXTBSY` startup failures within
+the existing probe timeout, avoiding cached failures when an executable wrapper
+is temporarily open for writing. Other startup failures remain immediate.
+Linux regression coverage holds a fake compiler open for writing, checks the
+bounded failure case and then verifies successful discovery after it closes.
+Rules: [compiler-predefined macros](docs/PREPROCESSOR.md#compiler-predefined-macros-230).
+
+### Stable IDs and reachability across database merges
+
+`trace-merge` keeps the existing `call_edges.id` column stable when unchanged
+databases are added, reordered, moved or copied. Input snapshots use a stored
+SHA-256 content identity; older databases receive the same identity through a
+read-only calculation. Identical database copies contribute once. The first
+merge with this version replaces previous sequential edge IDs.
+
+Overlapping inputs such as `A + merge(A, B)` and `merge(A, B) + merge(B, C)`
+unify inherited targets, functions and call sites before deduplicating edges.
+This preserves incoming and outgoing call chains, including internal functions,
+synthetic IPC bridges, callback execution contexts and call-order graphs.
+Regression coverage checks both input orders, stable IDs and foreign keys.
+
+Rules and scope: [stable merged call-edge IDs](docs/ANALYSIS.md#stable-merged-call-edge-ids).
+Schema: [database identity](docs/SQLITE_SCHEMA.md#database-identity) and
+[merge metadata](docs/SQLITE_SCHEMA.md#merged-identity-metadata).
+
 ### Restore DataShare file-open reachability without framework sources
 
 A configurable `ipc` function-model effect connects a bodyless framework

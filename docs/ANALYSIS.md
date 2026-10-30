@@ -881,7 +881,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 
 - **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
   Existing indirect and IPC edges carry over, but the merger cannot discover a new callback target that requires pointer flow across repositories, or synthesize a new IPC bridge when the proxy and stub were analyzed in separate databases. Such edges require an analysis that sees the relevant facts together.
-- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. A context a call site starts enters what the edge from that site to its entry now goes to: the definition another repository holds of a callback this one only declares (the callback edge is re-linked to it, and so is the context), or each candidate of an ambiguous edge, one row per candidate. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
+- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. A context a call site starts enters what the edge from that site to its entry now goes to: the definition another repository holds of a callback this one only declares (the callback edge is re-linked to it, and so is the context), or each candidate of an ambiguous edge, one row per candidate. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, distinctly analysed header copies keep their call sites; repeated inherited occurrences coalesce under the stable identity contract) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
   - When multiple distinct source definitions exist across different repositories (or multiple weak definitions from distinct origins), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). Copies of one source origin retain every selected image's edge with a resolved classification; see [Database merger header copies](#database-merger-header-copies). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
@@ -889,7 +889,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 - **ELF linker semantics**:
   - `static` / internal-linkage functions are strictly kept file-local and are never exported for cross-repository resolution. An unresolved internal declaration also stays local: a same-name external definition cannot satisfy it.
   - Strong definitions (`is_weak = 0`) supersede unscoped weak definitions (`is_weak = 1`) across repositories. If an external call in Repo A binds to an unscoped weak fallback in Repo A, but Repo B supplies a strong definition for the same symbol and signature, the caller in Repo A is retargeted to Repo B's strong definition. Calls already bound to defined weak functions in a known link target retain that image's selection; definitions in another image do not override them or produce `WeakOverride` diagnostics for them.
-  - For exact-signature matches with competing strong definitions, the caller's known target takes precedence when it supplies candidates. All candidates within that target remain reachable; the merger never arbitrarily selects the first definition. Without a candidate in that target, cross-repository matching is conservative: input target IDs are remapped independently, and the merger does not infer new target-dependency links between inputs.
+  - For exact-signature matches with competing strong definitions, the caller's known target takes precedence when it supplies candidates. All candidates within that target remain reachable; the merger never arbitrarily selects the first definition. Without a candidate in that target, cross-repository matching is conservative: distinct original images remain separate after inherited copies coalesce, and the merger does not infer new target-dependency links between inputs. The caller's canonical function supplies target ownership, including when older merge metadata cannot identify its repeated target rows.
 - **Header deduplication and dependency tracking**:
   - Shared files deduplicate by path, declarations share source identity across targets, and definitions retain image ownership. Project-file ownership propagates to every function copy, preserving `--exclude-deps` visibility. The authoritative rules, including shared declarations' target metadata and the deduplication counter, are in [Database merger header copies](#database-merger-header-copies).
 - **Signature-aware C++ overload disambiguation and normalized matching**:
@@ -906,6 +906,68 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 - **Referential integrity and safety**:
   - Staging inserts and remapping are verified using `PRAGMA foreign_key_check` before transaction commit, ensuring zero orphaned foreign keys in `call_sites`, `call_edges`, or `target_sources`.
   - Rejects attempts to write output to any path matching an active input database.
+
+### Stable merged call-edge IDs
+
+`trace-merge` assigns `call_edges.id` from edge identity, independently of
+input order, edge emission order and the other databases being merged.
+An existing edge retains its ID when unchanged input databases are added or
+reordered, including when a new candidate changes its `resolution` from
+`direct` to `ambiguous`. Resolution is an attribute, not part of identity.
+If linking replaces a declaration or weak definition with a different callee,
+that is a different edge and receives a different ID. Function, call-site and
+other row IDs remain local to each output database.
+
+Identity version 1 uses SHA-256 with a domain string and length-prefixed byte
+fields (lengths are unsigned 64-bit big-endian integers). An input's namespace
+hashes its 32-byte [database content identity](SQLITE_SCHEMA.md#database-identity)
+under `trace-merge-input-v1`. Current producers persist that identity; the
+merger computes it read-only for older inputs. Database filenames and
+canonical filesystem paths do not participate. Copies with the same database
+identity are duplicate inputs and contribute once. Canonical paths still
+guard against overwriting any input and recognize repeated filesystem names.
+A call occurrence hashes the input namespace and its
+original call-site ID under `trace-merge-call-site-v1`; this keeps repeated
+macro calls and otherwise identical source positions distinct. Function
+identity follows [database merger source deduplication](#database-merger-header-copies):
+path, starting line, name, normalized signature and declaration/definition
+status under `trace-merge-source-function-v1`, plus the original input namespace
+and target ID (hashed under `trace-merge-target-v1`) for an image-owned body.
+Declarations ignore images. Functions without a deduplicable source origin,
+including internal functions, use the input namespace and original function
+ID under `trace-merge-local-function-v1`. All row IDs and source lines in
+identity fields use signed 64-bit big-endian encoding; definition status is
+one byte, zero or one, and absent target/call-site identities are empty fields.
+
+The edge hashes the caller, callee and optional call occurrence identities
+under `trace-merge-call-edge-v1`. The first eight digest bytes, interpreted
+big-endian with the sign bit cleared, become the nonnegative SQLite INTEGER
+ID. Synthetic IPC edges have no call occurrence and use their final rebound
+endpoints. The merger checks complete digests for numeric ID collisions and
+fails before publishing output rather than assigning an input-dependent
+replacement. Repeated copies of the same edge identity are emitted once.
+
+Merger-only tables retain the full 32-byte identities of targets, functions
+and call sites; see the [schema contract](SQLITE_SCHEMA.md#merged-identity-metadata).
+A subsequent merge reuses them, preserving IDs even when an intermediate
+merged database is renamed. Overlapping inputs, such as `A + merge(A, B)` or
+`merge(A, B) + merge(B, C)`, map each repeated identity to one row before
+linking and edge deduplication. This includes internal and positionless
+functions. Incoming edges, outgoing edges, execution contexts and call-order
+graphs all use those canonical references, so deduplication cannot strand a
+caller's copy of a function without its outgoing edges. Target source and
+dependency rows are unioned. Distinct original images and distinct call
+occurrences remain separate.
+
+Earlier stable-ID outputs with function/site identities but no target
+identity table still canonicalize their function/site endpoints; their targets
+use the input namespace fallback. Inputs without any identity metadata
+establish every identity from their database content namespace. This does not
+change the existing linking rules or promise that nested and flat merges
+select identical edges; it preserves the identity of edges both produce.
+Moving, renaming or copying original or merged databases
+preserves edge IDs. Stability does not cover re-analysis or source edits.
+The first merge with this version replaces the old sequential edge IDs.
 
 ## Type storage
 
@@ -5538,7 +5600,9 @@ call-site and file ids are remapped, and row ids renumbered. A body several
 inputs share (a header function the merger unifies) keeps one graph per
 structurally distinct body, in input order: an input compiling it as an
 earlier one did adds nothing, one compiling it differently adds a variant.
-Inputs share no call sites, so the comparison takes a site as its caller,
+Repeated original call sites coalesce according to the
+[stable identity contract](#stable-merged-call-edge-ids). For separately
+analysed copies of a header call, the comparison takes a site as its caller,
 position, callee spelling and directness (and how many such sites precede it
 in its input). Sites spelled alike that are alternatives of one event of an
 input (a merged input's copies of one header call) count as one site, so

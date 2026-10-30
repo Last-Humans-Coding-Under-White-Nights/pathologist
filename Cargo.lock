@@ -989,6 +989,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "trace-db",
  "trace-ir",

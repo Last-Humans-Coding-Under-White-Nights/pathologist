@@ -122,6 +122,7 @@ pub fn export_to_sqlite(
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program, analysis)?;
+        crate::record_database_identity(&conn)?;
         conn.execute_batch(INDEXES_V8)?;
         conn.execute_batch("COMMIT;")?;
     }

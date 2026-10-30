@@ -8,6 +8,16 @@ pub const SCHEMA_VERSION: i64 = 8;
 /// Versions whose call-graph columns current consumers understand.
 pub const SUPPORTED_SCHEMA_VERSIONS: &[i64] = &[7, SCHEMA_VERSION];
 
+/// Optional identity of an immutable analysis snapshot; stored by current
+/// exporters and computed read-only for earlier databases.
+pub const DATABASE_IDENTITY_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS database_identity (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    algorithm TEXT NOT NULL,
+    digest BLOB NOT NULL CHECK(length(digest) = 32)
+);
+"#;
+
 // Legacy and compact layouts share every unaffected table and index.
 macro_rules! common_tables {
     ($variables:literal, $call_sites:literal, $flow_nodes:literal, $flow_edges:literal, $without_rowid:literal) => {

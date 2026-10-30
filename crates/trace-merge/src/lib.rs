@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use trace_db::{MultiInstance, SequencingMarker, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
 
+mod identity;
+use identity::Identity;
+
 /// Call-order graph ids read from an input at a time.
 const CFG_READ_CHUNK: i64 = 1024;
 
@@ -99,7 +102,7 @@ pub enum WarningKind {
 /// once does.
 fn site_keys(
     sites: &[DbCallSite],
-    input_sites: &[std::ops::Range<usize>],
+    input_sites: &[Vec<usize>],
     alternatives: &[Vec<usize>],
 ) -> Vec<u32> {
     type Key<'s> = (
@@ -145,10 +148,14 @@ fn site_keys(
         }
     }
     let mut ids: FxHashMap<(Key<'_>, u32), u32> = FxHashMap::default();
-    let mut keys = vec![0; sites.len()];
-    for range in input_sites {
+    let mut keys = vec![None; sites.len()];
+    for input in input_sites {
         let mut repeats: FxHashMap<Key<'_>, u32> = FxHashMap::default();
-        for i in range.clone() {
+        let mut seen = FxHashSet::default();
+        for &i in input {
+            if !seen.insert(i) {
+                continue;
+            }
             let earlier = root(&first, i);
             if earlier != i {
                 keys[i] = keys[earlier];
@@ -157,11 +164,14 @@ fn site_keys(
             let key = key(&sites[i]);
             let repeat = repeats.entry(key).or_default();
             let next = ids.len() as u32;
-            keys[i] = *ids.entry((key, *repeat)).or_insert(next);
+            let id = *ids.entry((key, *repeat)).or_insert(next);
+            keys[i].get_or_insert(id);
             *repeat += 1;
         }
     }
-    keys
+    keys.into_iter()
+        .map(|key| key.expect("every site has an input"))
+        .collect()
 }
 
 /// Prepare each `(table, query)` an input is read with, failing with the
@@ -206,6 +216,42 @@ struct DbFunction {
     is_dep: i64,
     is_weak: i64,
     target_id: Option<i64>,
+}
+
+impl DbFunction {
+    fn source_origin(&self, file_id: i64) -> Option<FunctionOrigin> {
+        (self.linkage != "internal" && self.line_start > 0).then(|| {
+            (
+                file_id,
+                self.line_start,
+                self.name.clone(),
+                self.signature.clone(),
+            )
+        })
+    }
+
+    fn identity(&self, origin: Option<&FunctionOrigin>, path: &str, input: Identity) -> Identity {
+        let Some((_, line, name, signature)) = origin else {
+            return input.local("trace-merge-local-function-v1", self.id);
+        };
+        // Match source deduplication exactly: declarations ignore images;
+        // definitions retain the original input's target ownership.
+        let target = (self.is_defined != 0)
+            .then_some(self.target_id)
+            .flatten()
+            .map(|id| input.local("trace-merge-target-v1", id));
+        Identity::hash(
+            "trace-merge-source-function-v1",
+            &[
+                path.as_bytes(),
+                &line.to_be_bytes(),
+                name.as_bytes(),
+                signature.as_bytes(),
+                &[u8::from(self.is_defined != 0)],
+                target.as_ref().map_or(&[], Identity::bytes),
+            ],
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +425,7 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     let mut report = MergeReport::default();
     let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut input_identities = Vec::new();
     let mut seen_inputs: FxHashSet<PathBuf> = FxHashSet::default();
 
     for p in input_paths {
@@ -410,15 +457,17 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
     }
 
-    report.input_dbs = inputs.clone();
-
     // Verify all input databases and read schema versions.
+    let candidate_inputs = inputs;
+    let mut inputs = Vec::new();
+    let mut seen_identities = FxHashSet::default();
     let mut conns = Vec::new();
     // Per input: whether it has the `execution_contexts` table.
     let mut has_contexts_table: Vec<bool> = Vec::new();
     // Per input: whether `trace analyze --sequencing` wrote it.
     let mut input_sequencing: Vec<SequencingMarker> = Vec::new();
-    for path in &inputs {
+    let mut input_has_identities = Vec::new();
+    for path in &candidate_inputs {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
         let ver: i64 = conn
@@ -457,6 +506,23 @@ pub fn merge_databases<P: AsRef<Path>>(
                 ("diagnostics", READ_DIAGNOSTICS),
             ],
         )?;
+        let has_identities = identity::has_metadata(&conn).with_context(|| {
+            format!("invalid stable call-edge identities in {}", path.display())
+        })?;
+        let database_identity = trace_db::database_identity(&conn)
+            .with_context(|| format!("invalid database identity in {}", path.display()))?;
+        if !seen_identities.insert(database_identity) {
+            report.warnings.push(MergeWarning {
+                kind: WarningKind::DuplicateInput,
+                message: format!("duplicate database identity ignored: {}", path.display()),
+                symbol: None,
+                file_id: None,
+                line: 0,
+            });
+            continue;
+        }
+        input_identities.push(Identity::input(database_identity));
+        input_has_identities.push(has_identities);
         let has_contexts = trace_db::table_exists(&conn, "execution_contexts")?;
         if has_contexts {
             require_reads(
@@ -478,8 +544,10 @@ pub fn merge_databases<P: AsRef<Path>>(
             require_reads(&conn, path, &trace_db::CFG_READS)?;
         }
         input_sequencing.push(sequencing);
+        inputs.push(path.clone());
         conns.push(conn);
     }
+    report.input_dbs = inputs.clone();
 
     // 1. Files Ingestion & Deduplication
     let mut unified_files: Vec<DbFile> = Vec::new();
@@ -525,11 +593,18 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     // 2. Link Targets Ingestion & Remapping
     let mut unified_targets: Vec<DbLinkTarget> = Vec::new();
+    let mut target_identities = Vec::new();
+    let mut target_by_identity = FxHashMap::default();
     let mut target_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
     let mut unified_target_sources: Vec<(i64, i64)> = Vec::new();
     let mut unified_target_dependencies: Vec<(i64, i64)> = Vec::new();
 
     for (db_idx, conn) in conns.iter().enumerate() {
+        // Earlier stable-ID outputs only stored functions/sites. Preserve
+        // their endpoint identities too, with an input-local target fallback.
+        let inherited_identities = trace_db::table_exists(conn, "merge_target_identities")?
+            .then(|| identity::read(conn, "merge_target_identities", "target_id"))
+            .transpose()?;
         let mut stmt = conn.prepare(READ_TARGETS)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbLinkTarget {
@@ -540,8 +615,18 @@ pub fn merge_databases<P: AsRef<Path>>(
         })?;
         for r in rows {
             let target = r?;
+            let target_identity = identity::inherited(inherited_identities.as_ref(), target.id)?
+                .unwrap_or_else(|| {
+                    input_identities[db_idx].local("trace-merge-target-v1", target.id)
+                });
+            if let Some(&existing_id) = target_by_identity.get(&target_identity) {
+                target_remap[db_idx].insert(target.id, existing_id);
+                continue;
+            }
             let new_id = (unified_targets.len() + 1) as i64;
             target_remap[db_idx].insert(target.id, new_id);
+            target_by_identity.insert(target_identity, new_id);
+            target_identities.push(target_identity);
             unified_targets.push(DbLinkTarget {
                 id: new_id,
                 name: target.name,
@@ -575,9 +660,15 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
     }
+    unified_target_sources.sort_unstable();
+    unified_target_sources.dedup();
+    unified_target_dependencies.sort_unstable();
+    unified_target_dependencies.dedup();
 
     // 3. Functions Ingestion, Deduplication & Classification
     let mut unified_functions: Vec<DbFunction> = Vec::new();
+    let mut function_identities = Vec::new();
+    let mut function_by_identity = FxHashMap::default();
     let mut fn_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
     let mut header_def_map: FxHashMap<(Option<i64>, FunctionOrigin), i64> = FxHashMap::default();
     let mut header_decl_map: FxHashMap<FunctionOrigin, i64> = FxHashMap::default();
@@ -588,6 +679,9 @@ pub fn merge_databases<P: AsRef<Path>>(
         vec![FxHashMap::default(); inputs.len()];
 
     for (db_idx, conn) in conns.iter().enumerate() {
+        let inherited_identities = input_has_identities[db_idx]
+            .then(|| identity::read(conn, "merge_function_identities", "function_id"))
+            .transpose()?;
         let mut stmt = conn.prepare(READ_FUNCTIONS)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbFunction {
@@ -619,56 +713,57 @@ pub fn merge_databases<P: AsRef<Path>>(
             let is_dep = func
                 .is_dep
                 .min(unified_files[(new_file_id - 1) as usize].is_dep);
+            let origin = func.source_origin(new_file_id);
+            let function_identity = identity::inherited(inherited_identities.as_ref(), func.id)?
+                .unwrap_or_else(|| {
+                    func.identity(
+                        origin.as_ref(),
+                        &unified_files[(new_file_id - 1) as usize].path,
+                        input_identities[db_idx],
+                    )
+                });
 
-            // Check if this is an identical header definition or prototype that can be unified.
-            if func.linkage != "internal" && func.line_start > 0 {
-                let key = (
-                    new_file_id,
-                    func.line_start,
-                    func.name.clone(),
-                    func.signature.clone(),
-                );
-                if func.is_defined != 0 {
-                    if let Some(&existing_fn_id) = header_def_map.get(&(new_target_id, key)) {
-                        fn_remap[db_idx].insert(func.id, existing_fn_id);
-                        if is_dep == 0 {
-                            unified_functions[(existing_fn_id - 1) as usize].is_dep = 0;
-                        }
-                        report.header_functions_deduped += 1;
-                        continue;
+            // Reuse inherited endpoint rows before linking or edge deduplication.
+            // This also covers internal and positionless functions, whose source
+            // origins alone cannot identify a repeated copy of an input.
+            let existing_fn_id = function_by_identity
+                .get(&function_identity)
+                .copied()
+                .or_else(|| {
+                    let key = origin.as_ref()?;
+                    if func.is_defined != 0 {
+                        header_def_map.get(&(new_target_id, key.clone())).copied()
+                    } else {
+                        header_decl_map.get(key).copied()
                     }
-                } else if let Some(&existing_fn_id) = header_decl_map.get(&key) {
-                    fn_remap[db_idx].insert(func.id, existing_fn_id);
-                    let existing = &mut unified_functions[(existing_fn_id - 1) as usize];
-                    // A declaration shared by different images has no unique
-                    // target. Resolution still uses the original input rows.
-                    if existing.target_id != new_target_id {
-                        existing.target_id = None;
-                    }
-                    if is_dep == 0 {
-                        existing.is_dep = 0;
-                    }
-                    report.header_functions_deduped += 1;
-                    continue;
+                });
+            if let Some(existing_fn_id) = existing_fn_id {
+                fn_remap[db_idx].insert(func.id, existing_fn_id);
+                function_by_identity.insert(function_identity, existing_fn_id);
+                let existing = &mut unified_functions[(existing_fn_id - 1) as usize];
+                // A declaration shared by different images has no unique target.
+                if func.is_defined == 0 && existing.target_id != new_target_id {
+                    existing.target_id = None;
                 }
+                existing.is_dep = existing.is_dep.min(is_dep);
+                if origin.is_some() {
+                    report.header_functions_deduped += 1;
+                }
+                continue;
             }
 
             let new_fn_id = (unified_functions.len() + 1) as i64;
             fn_remap[db_idx].insert(func.id, new_fn_id);
+            function_by_identity.insert(function_identity, new_fn_id);
 
-            if func.linkage != "internal" && func.line_start > 0 {
-                let key = (
-                    new_file_id,
-                    func.line_start,
-                    func.name.clone(),
-                    func.signature.clone(),
-                );
+            if let Some(key) = origin {
                 if func.is_defined != 0 {
                     header_def_map.insert((new_target_id, key), new_fn_id);
                 } else {
                     header_decl_map.insert(key, new_fn_id);
                 }
             }
+            function_identities.push(function_identity);
 
             // Register in exported definitions catalog if defined with external linkage.
             if func.is_defined != 0 && func.linkage == "external" {
@@ -808,12 +903,17 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     // 4. Call Sites Ingestion & Remapping
     let mut unified_call_sites: Vec<DbCallSite> = Vec::new();
+    let mut site_identities = Vec::new();
+    let mut site_by_identity = FxHashMap::default();
     let mut cs_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
     // Per input: its sites' indices in `unified_call_sites`.
-    let mut input_sites: Vec<std::ops::Range<usize>> = Vec::with_capacity(inputs.len());
+    let mut input_sites: Vec<Vec<usize>> = Vec::with_capacity(inputs.len());
 
     for (db_idx, conn) in conns.iter().enumerate() {
-        let first_site = unified_call_sites.len();
+        let inherited_identities = input_has_identities[db_idx]
+            .then(|| identity::read(conn, "merge_call_site_identities", "call_site_id"))
+            .transpose()?;
+        let mut mapped_sites = Vec::new();
         let mut stmt = conn.prepare(READ_CALL_SITES)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbCallSite {
@@ -832,6 +932,15 @@ pub fn merge_databases<P: AsRef<Path>>(
 
         for r in rows {
             let cs = r?;
+            let site_identity = identity::inherited(inherited_identities.as_ref(), cs.id)?
+                .unwrap_or_else(|| {
+                    input_identities[db_idx].local("trace-merge-call-site-v1", cs.id)
+                });
+            if let Some(&existing_id) = site_by_identity.get(&site_identity) {
+                cs_remap[db_idx].insert(cs.id, existing_id);
+                mapped_sites.push((existing_id - 1) as usize);
+                continue;
+            }
             let new_caller = *fn_remap[db_idx]
                 .get(&cs.caller_fn_id)
                 .context("missing remapped caller_fn_id for call_site")?;
@@ -844,6 +953,9 @@ pub fn merge_databases<P: AsRef<Path>>(
 
             let new_cs_id = (unified_call_sites.len() + 1) as i64;
             cs_remap[db_idx].insert(cs.id, new_cs_id);
+            site_by_identity.insert(site_identity, new_cs_id);
+            site_identities.push(site_identity);
+            mapped_sites.push((new_cs_id - 1) as usize);
 
             unified_call_sites.push(DbCallSite {
                 id: new_cs_id,
@@ -858,7 +970,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                 is_direct: cs.is_direct,
             });
         }
-        input_sites.push(first_site..unified_call_sites.len());
+        input_sites.push(mapped_sites);
     }
     report.call_sites_total = unified_call_sites.len();
 
@@ -968,10 +1080,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                             (vec![candidates[0].new_fn_id], resolved_resolution)
                         } else if strong_defs.len() > 1 {
                             // Multiple conflicting strong definitions for the same signature!
-                            let caller_func = per_db_functions[db_idx].get(&edge.caller_fn_id);
-                            let caller_target = caller_func
-                                .and_then(|cf| cf.target_id)
-                                .and_then(|t| target_remap[db_idx].get(&t).copied());
+                            let caller_target = unified_functions[(new_caller_id - 1) as usize].target_id;
                             let same_target_strong: Vec<&DefRecord> = strong_defs
                                 .iter()
                                 .copied()
@@ -1049,9 +1158,8 @@ pub fn merge_databases<P: AsRef<Path>>(
                 if new_cs_id.is_some() && !emitted.insert((new_cs_id, new_callee_id)) {
                     continue;
                 }
-                let new_edge_id = (unified_call_edges.len() + 1) as i64;
                 unified_call_edges.push(DbCallEdge {
-                    id: new_edge_id,
+                    id: 0, // Assigned from final endpoints after IPC rebinding.
                     call_site_id: new_cs_id,
                     caller_fn_id: new_caller_id,
                     callee_fn_id: new_callee_id,
@@ -1065,7 +1173,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     // Reuse the exact callee redirections above rather than resolving its
     // name a second time with a different image/signature policy.
     let mut rebound = Vec::new();
-    let mut ipc_seen = FxHashSet::default();
+    let mut edge_identities = FxHashMap::default();
     for edge in unified_call_edges {
         let callers = (edge.resolution == "ipc")
             .then(|| caller_bindings.get(&edge.caller_fn_id))
@@ -1074,13 +1182,17 @@ pub fn merge_databases<P: AsRef<Path>>(
             .map(Vec::as_slice)
             .unwrap_or(std::slice::from_ref(&edge.caller_fn_id))
         {
-            if edge.resolution == "ipc"
-                && !ipc_seen.insert((*caller, edge.callee_fn_id, edge.call_site_id))
-            {
+            let caller_identity = function_identities[(*caller - 1) as usize];
+            let callee_identity = function_identities[(edge.callee_fn_id - 1) as usize];
+            let site_identity = edge
+                .call_site_id
+                .map(|id| site_identities[(id - 1) as usize]);
+            let identity = Identity::edge(caller_identity, callee_identity, site_identity);
+            if !identity::register(&mut edge_identities, identity)? {
                 continue;
             }
             let mut copy = edge.clone();
-            copy.id = (rebound.len() + 1) as i64;
+            copy.id = identity.edge_id();
             copy.caller_fn_id = *caller;
             rebound.push(copy);
         }
@@ -1189,7 +1301,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     // `trace analyze` keeps configuration variants (both through
     // `trace_ir::add_variant`): a body several inputs share (a header
     // function merged above) is kept once when they compile it alike and
-    // once more per different graph. Inputs share no call sites, so bodies
+    // once more per different graph. Distinct source copies of header calls
     // are compared with each site standing for its key (`site_keys`). An
     // event none of whose sites was carried is spliced out, leaving an
     // `omitted_sites` gap. Graphs are read a chunk of ids at a time, and a
@@ -1382,6 +1494,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         )?;
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
         out_conn.execute_batch(TABLES_V8)?;
+        out_conn.execute_batch(identity::TABLES)?;
         let mut strings = trace_db::TextPool::new(&out_conn)?;
         if any_sequenced {
             strings.seed_sequencing()?;
@@ -1396,6 +1509,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             "ambiguous_calls": report.ambiguous_calls,
             "warnings_count": report.warnings.len(),
             "call_sequencing": SequencingMarker::merged(&input_sequencing).to_json(),
+            "call_edge_identity_version": 1,
         })
         .to_string();
 
@@ -1495,6 +1609,29 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
 
+        // Persist the original identities, never the current remapped row IDs,
+        // so a merged input can be merged again under another filename.
+        for (table, column, identities) in [
+            ("merge_target_identities", "target_id", &target_identities),
+            (
+                "merge_function_identities",
+                "function_id",
+                &function_identities,
+            ),
+            (
+                "merge_call_site_identities",
+                "call_site_id",
+                &site_identities,
+            ),
+        ] {
+            let mut stmt = out_conn.prepare_cached(&format!(
+                "INSERT INTO {table} ({column}, identity) VALUES (?1, ?2)"
+            ))?;
+            for (index, identity) in identities.iter().enumerate() {
+                stmt.execute(params![index as i64 + 1, identity.bytes()])?;
+            }
+        }
+
         trace_db::export_cfg(&out_conn, unified_cfgs.values().flatten(), &mut strings)?;
 
         // Bulk insert call edges
@@ -1552,6 +1689,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         verify_foreign_keys(&out_conn)?;
 
         // Build secondary indexes
+        trace_db::record_database_identity(&out_conn)?;
         out_conn.execute_batch(INDEXES_V8)?;
         out_conn.execute_batch("COMMIT;")?;
     }
