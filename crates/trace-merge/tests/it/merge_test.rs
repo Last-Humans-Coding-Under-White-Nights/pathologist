@@ -2609,7 +2609,11 @@ fn merged_execution_contexts_keep_their_model() {
 }
 
 /// `trace analyze repo -o db ARGS…` with the workspace's own CLI.
-fn analyze_repo_with(repo: &std::path::Path, db: &std::path::Path, args: &[&std::ffi::OsStr]) {
+pub(super) fn analyze_repo_with(
+    repo: &std::path::Path,
+    db: &std::path::Path,
+    args: &[&std::ffi::OsStr],
+) {
     let status = Command::new(trace_cli_bin())
         .arg("analyze")
         .arg(repo)

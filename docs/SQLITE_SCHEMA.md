@@ -301,7 +301,7 @@ file/line/column, and resolution when comparing invocation-level coverage.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | INTEGER PK | Edge id |
+| `id` | INTEGER PK | Edge id; stable across adding/reordering unchanged merge inputs in current `trace-merge` output (see [identity contract](ANALYSIS.md#stable-merged-call-edge-ids)) |
 | `call_site_id` | INTEGER FK → `call_sites` | Call site; **`NULL` for synthetic edges** (see below) |
 | `caller_fn_id` | INTEGER FK → `functions` | Resolved caller function |
 | `callee_fn_id` | INTEGER FK → `functions` | Resolved target |
@@ -319,6 +319,89 @@ default and disabled with the `--no-ipc` analyze flag.
 
 **Indexes:** `call_edges(caller_fn_id)`, `call_edges(callee_fn_id)`,
 `call_edges(call_site_id)`
+
+### Database identity
+
+Current analysis and merge exports store one row in `database_identity`, an
+additive table in the v8 compatibility family. This identifies the immutable
+analysis snapshot independently of its SQLite filename or location.
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `id` | INTEGER PK, CHECK = 1 | Singleton metadata row |
+| `algorithm` | TEXT NOT NULL | `sha256-logical-v1` |
+| `digest` | BLOB NOT NULL, exactly 32 bytes | SHA-256 of the exported database contents |
+
+Read its printable form with
+`SELECT algorithm, lower(hex(digest)) FROM database_identity`.
+The digest covers all non-internal stored tables, their column names and
+typed row values, including analysis configuration and results. It excludes
+`database_identity` itself and `analysis_run.created_at`. Views, indexes,
+SQLite internal tables and physical page layout do not participate. Thus
+copies, renames, index creation and `VACUUM` retain the same identity.
+A repository commit alone would not distinguish analyses of the same revision
+with different configurations or uncommitted source changes.
+
+The version-1 encoding starts with a length-prefixed UTF-8 algorithm name.
+Tables sort by name with SQLite's binary collation. Each table starts with
+byte `0x10`, its length-prefixed name, an unsigned 64-bit column count and
+length-prefixed column names in schema order (omitting `created_at` only for
+`analysis_run`). Rows sort by the primary-key columns in key order, or all
+projected columns when no primary key exists, using binary collation. Each
+row starts with byte `0x20`. Value tags are NULL = 0, INTEGER = 1, REAL = 2,
+TEXT = 3 and BLOB = 4. Integers use signed 64-bit encoding; reals use IEEE-754
+64-bit bits; text and blobs use length-prefixed bytes. Each table ends with
+byte `0x30`. Integers and byte lengths use big-endian encoding; lengths are
+unsigned 64-bit. Duplicate rows are retained. Hashing streams rows; no complete
+database dump is held in memory.
+
+Computing the digest reads every stored table: hashing and read I/O cost
+O(database size). SQLite may also sort rows and use temporary storage when
+the required row order is not covered by an index. Each export pays this
+cost once, after writing its rows and before building secondary indexes;
+each merge pays it for every legacy input without a stored identity.
+Reading a valid stored identity only reads the singleton metadata row.
+
+Exports record the identity after writing every analysis row and before
+publication. Published databases are immutable: a tool deliberately changing
+their analysis rows must call `trace_db::record_database_identity` afterward.
+The merger trusts a valid stored identity, rejects unsupported algorithms or
+malformed digests, and computes the same digest read-only for older databases
+without the table or row. Its input duplicate detection uses this identity,
+so copies at different paths contribute once. It continues checking filesystem
+paths to prevent overwriting an input.
+
+### Merged identity metadata
+
+Current merger output adds three tables to v8; ordinary analysis exports and
+older merged databases do not have them. `analysis_run.options_json` records
+`call_edge_identity_version = 1`. The existing `call_edges.id` INTEGER column
+is the consumer-facing identifier; consumers do not need additional keys.
+IDs are no longer sequential and may occupy the full nonnegative signed
+64-bit range. The [identity contract](ANALYSIS.md#stable-merged-call-edge-ids)
+defines their scope and encoding.
+
+A collision between distinct edge identities in the 63-bit ID aborts the
+merge before publication, preserving any existing output database.
+
+| Table | Primary key / foreign key | Other column |
+|-------|---------------------------|--------------|
+| `merge_target_identities` | `target_id` INTEGER → `link_targets(id)` | `identity` BLOB NOT NULL, exactly 32 bytes |
+| `merge_function_identities` | `function_id` INTEGER → `functions(id)` | `identity` BLOB NOT NULL, exactly 32 bytes |
+| `merge_call_site_identities` | `call_site_id` INTEGER → `call_sites_data(id)` | `identity` BLOB NOT NULL, exactly 32 bytes |
+
+Every output target, function and call site has one identity row. These tables
+let later merges retain original identity despite row remapping. Repeated
+identities in overlapping inputs coalesce before their references and edges
+are written; see the [identity contract](ANALYSIS.md#stable-merged-call-edge-ids).
+Function and call-site tables must occur together; a marked input missing
+either, a missing identity row in a present identity table or an invalid blob
+is rejected before publication. The target table is optional on input for
+earlier stable-ID outputs, whose target identities use the input namespace
+fallback. A target identity table without function/site tables is rejected.
+Unsupported identity versions are rejected. Inputs with neither the marker
+nor the tables use the legacy namespace fallback described in the identity
+contract.
 
 ### arg_flow_edges
 

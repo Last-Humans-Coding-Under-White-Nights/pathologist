@@ -192,7 +192,10 @@ not synthesized. Build definitions such as `__USER__`, `__LITEOS__`, and
 `__HIVIEW_OHOS__` still come from build flags or manual `-D`.
 
 Macro discovery requires successful exit within 30 seconds, including when
-include discovery is also enabled. The 250 ms grace period after the complete
+include discovery is also enabled. A temporarily busy compiler executable
+(`ETXTBSY`, for example while a wrapper is open for writing) is retried at
+25 ms intervals within the same overall probe timeout; other startup errors
+are reported immediately. The 250 ms grace period after the complete
 search-list marker applies only to include-only probes. Compiler output is
 decoded lossily so non-UTF-8 bytes do not discard search paths or valid macros.
 Failed or timed-out probes discard macro dumps and retain complete include

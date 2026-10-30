@@ -33,6 +33,7 @@ macro_rules! row_id {
 
 mod export;
 mod filter;
+mod identity;
 mod inspect;
 mod render;
 mod schema;
@@ -42,6 +43,7 @@ pub use export::*;
 pub use filter::filter_call_chains;
 pub use filter::filter_query_graph;
 pub use filter::CallGraphFilter;
+pub use identity::{database_identity, record_database_identity, DatabaseIdentity};
 pub use inspect::*;
 pub use render::*;
 pub use schema::*;
