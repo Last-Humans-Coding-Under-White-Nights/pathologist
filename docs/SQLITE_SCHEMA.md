@@ -41,6 +41,46 @@ the marker existed lack the key and have no sequencing.
 
 ### Merger inputs and output
 
+New analyses populate optional linking metadata in minimal and full exports.
+`linking_facts` has one row (`id = 1`) and a format `version`. Version 1 stores
+all `trace_ir::LinkingFacts` as JSON in `data`; readers retain support for it.
+Version 2 stores only `{"complete": true/false}` in `data` and uses the following
+relational tables. New analysis and merge outputs write version 2. No payload
+is compressed.
+
+| Table | Stored information |
+|---|---|
+| `link_class_facts` | ordinal, class `name_id`, definition/final flag bits 0/1 |
+| `link_alias_facts` | ordinal, alias `name_id`, JSON type-shape `type_id` |
+| `link_base_facts` | ordinal, derived/base name IDs |
+| `link_template_facts`, `link_idl_facts` | ordinal and an interned JSON fact ID |
+| `link_method_facts` | existing `fn_id`, ordinal, nullable JSON parameter-shape ID, virtual/final/static/variadic flag bits 0–3 |
+| `link_method_origins` | `fn_id`, origin ordinal, interned defining-analysis origin ID |
+| `link_dispatch_queries` | shared query ID, member `name_id`, receiver name ID, nullable selected `callee_fn_id`, receiver-declared/exact/implicit flag bits 0–2, origin ID |
+| `link_member_calls` | existing `call_site_id`, ordinal, shared query ID, nullable `source_site_id` (NULL means the call itself) |
+| `link_ipc_senders` | existing sending `fn_id` |
+
+All text/type-shape/fact/origin IDs reference the existing `strings` dictionary.
+Method names and definition status come from `functions`; caller identities
+come from `call_sites`. They are not copied into the linking tables. Calls
+with equal dispatch facts share one query even when they occur at different
+positions. A source-site reference groups one invocation's overload/CHA
+alternatives. Ordinals preserve fact traversal order. Sites omitted by normal
+call-site export have no linking row; version-1 facts for such sites were
+already discarded during merge remapping. Definition origins preserve which
+analyses already supplied a body, avoiding redundant expansion on later merges.
+
+This is declaration/dispatch metadata, not a saved PAG. `trace-merge` remaps
+identities and retains the facts in its output for later merges; see
+[linking rules](ANALYSIS.md#invariants-and-linking-rules). The header's `complete`
+field remains false when an input lacks facts or was already a partial merge.
+An absent header table/row is supported with a `MissingLinkingFacts` diagnostic.
+Unsupported versions, malformed payloads, or missing normalized references are
+rejected before replacing output. Mixed version-1 and version-2 inputs are
+supported. Core schema v8 and ordinary query views retain their meanings.
+Merge metadata records `ipc_bridges_added` and `member_calls_added` counts.
+No variable bindings, points-to sets, or parcel/value flow are reconstructed.
+
 `trace-merge` accepts v7 and v8 and structurally validates the exact columns it reads
 in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
 `call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` and the

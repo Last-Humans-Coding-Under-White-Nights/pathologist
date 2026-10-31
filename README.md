@@ -59,6 +59,10 @@ Analyze a large tree (parallel indexing, minimal SQLite export):
 trace analyze /path/to/project -o /tmp/project.db --jobs 8
 ```
 
+For call chains across application, framework and service repositories, use
+[separate analysis followed by `trace-merge`](#cross-project-analysis-with-framework-sources).
+If an implementation is unavailable, see [missing-framework fallbacks](#missing-framework-fallbacks).
+
 ## Editor call hierarchy
 
 Build the separate snapshot language server and point it at an existing database:
@@ -116,7 +120,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
-| `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`, callback APIs and the execution context they start, and noise macro lists). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
+| `--models <FILE>` | Load TOML function-behavior summaries and noise macro lists. Repeatable; later files override earlier entries and built-ins. Project IPC shortcuts such as DataShare `OpenFile` are opt-in; see [missing-framework fallbacks](#missing-framework-fallbacks) and the [model format](docs/ANALYSIS.md#configuration-format). |
 | `--ignore-macro <NAME>` | Ignore expansions of the named macro during AST lowering (repeatable). Glob wildcards (`*`) are supported (e.g. `--ignore-macro 'LOG*'`). Suppresses boilerplate call sites, temporary variables, and flow constraints. |
 | `--ignore-logging` | Preset flag to ignore common OpenHarmony and standard logging macros (`HILOG_*`, `TAG_LOG*`, `HIVIEW_LOG*`, `MEDIA_*_LOG`, `LOGD`, `LOGI`, `LOGW`, `LOGE`, `LOGF`). |
 | `--no-test-partition` | Disable the [bare-tree test partition](docs/ANALYSIS.md#declaring-header-eligibility). |
@@ -125,7 +129,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--explore` | Enable bounded conditional-variant exploration. Discovers candidate macro definitions from project GN files (`BUILD.gn`, `*.gni`), evaluates semantic feasibility of excluded `#if`/`#ifdef`/`#elif` arms, preprocesses and lowers feasible variants independently, and unions their facts into the merged program (preserving body and call facts plus struct fields across configurations; conditional signatures retain the base arity, see [limits](docs/ANALYSIS.md#limits-of---explore)). Off by default. |
 | `--explore-budget <N>` | Maximum additional configurations per translation unit (default: 4). Budget diagnostics count omitted candidate activation goals, not proven reachable configurations. |
 | `--sequencing` | Record a compact call-order control-flow graph per function body beside the call graph, for call-sequence queries. The call graph, points-to and argument flow are unchanged. Off by default. See [call sequencing](docs/ANALYSIS.md#call-sequencing-control-flow-sidecar). |
-| `--no-ipc` | Disable detected IPC bridges and `ipc` function-model summaries (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`). The built-in DataShare `OpenFile` summary restores media-library-only reachability through indexed stub implementations when framework sources are absent; see [IPC bridges](docs/ANALYSIS.md#openharmony-ipc-bridges) for matching, overrides and limits. Service IDL and the HDI C++ IPC subset synthesize declarations-only interface/proxy/stub headers; HDI methods may omit a return type. See [IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces) for signatures, pairing and dialect limits. |
+| `--no-ipc` | Disable automatic IPC bridge detection and any loaded `ipc` function models. Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`). DataShare `OpenFile` requires an explicit `--models` file; prefer the [source-backed workflow](#cross-project-analysis-with-framework-sources) when framework sources are available. See [IPC rules](docs/ANALYSIS.md#openharmony-ipc-bridges). Service IDL and the HDI C++ IPC subset synthesize declarations-only interface/proxy/stub headers; HDI methods may omit a return type. See [IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces) for signatures, pairing and dialect limits. |
 | `--solve-budget-pops <N>` | Solver work budget in worklist pops. Default derives from the PAG constraint count (`800000 + 6×constraints`), so normal trees converge and huge ones finish instead of stopping at a partial result; `0` = unlimited. `TRACE_SOLVE_BUDGET_POPS` overrides it for experimentation. A truncated run is recorded, not silent: `analysis_run.options_json.solver_partial`, an `analyze`-stage diagnostic, and a `trace inspect` warning. |
 | `--solve-budget-secs <N>` | Solver wall-clock budget in seconds (default: off; `0` = no time limit). Checked periodically, so lead time can overshoot by up to one checkpoint, and the stop point varies with machine load. |
 
@@ -712,7 +716,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 - Prevents accidental overwriting of any input database when specifying `-o`.
 - Opens inputs read-only and publishes through a unique temporary file beside the output. Failed merges clean up staging files and preserve the existing destination.
 - Merger output supports call graphs, call chains, and editor call hierarchy. It omits variables, arg-flow, points-to, and all PAG/provenance tables; call-site variable bindings remain NULL. Dataflow inspection requires an original analysis database or a new analysis of the combined source tree; see the [merger schema contract](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
-- Existing indirect and IPC edges are retained; discovering new edges that require cross-project pointer analysis or IPC proxy/stub pairing is outside the [merge contract](docs/ANALYSIS.md#invariants-and-linking-rules).
+- Existing indirect and IPC edges are retained. New exports carry deduplicated declaration facts so the merger can recover cross-repository virtual overrides and IPC proxy/stub pairs without running pointer analysis. Names, type shapes and dispatch queries are shared through relational linking tables; legacy JSON metadata remains readable. Older inputs produce an incomplete-reconstruction diagnostic; merged outputs retain facts for later merges. See [merge linking rules](docs/ANALYSIS.md#invariants-and-linking-rules) and the [optional metadata schema](docs/SQLITE_SCHEMA.md#merger-inputs-and-output). New targets that require cross-project pointer propagation remain outside the merge contract.
 - Identifies and reports merge problems:
   - **Collisions**: Multiple strong definitions of the same symbol and signature from distinct source origins across different repositories (`MultipleDefinitions`).
   - **Unresolved externals**: External function calls that remain unresolved in all merged repositories (`UnresolvedExternal`).
@@ -720,19 +724,79 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
   - **Inputs without execution contexts**: Inputs that have no `execution_contexts` table (`MissingExecutionContexts`).
   - **Inputs without call sequencing**: Inputs analysed without `--sequencing` when another input was (`MissingSequencing`).
 
-**Example**:
+#### Cross-project analysis with framework sources
+
+**Prefer separate indexing and `trace-merge` when the framework/service
+implementation is available.** Each repository contributes its function bodies,
+and the combined declaration facts recover possible cross-project member and
+IPC paths. The DataShare `OpenFile` rule is opt-in and is unnecessary for this
+workflow. Analyze these inputs without that fallback: merging retains summary
+edges already present in an input database.
+
+For example, with media-library and DataShare source checkouts:
 
 ```bash
-# Analyze two repositories independently
-trace analyze /path/to/framework -o /tmp/framework.db
-trace analyze /path/to/app -o /tmp/app.db
+cargo build --release -p trace-cli -p trace-merge
 
-# Merge and reconstruct the cross-repository callgraph
-trace-merge /tmp/framework.db /tmp/app.db -o /tmp/unified.db
+# Index each repository's implementations, without the DataShare summary.
+target/release/trace analyze /path/to/multimedia_media_library \
+  --jobs 8 --ignore-logging -o /tmp/media.db
+target/release/trace analyze /path/to/distributeddatamgr_data_share \
+  --jobs 8 --ignore-logging -o /tmp/datashare.db
 
-# Query reconstructed cross-repository callchains
-trace inspect /tmp/unified.db callchain --from app_main --to framework_init
+# Reconstruct calls and IPC bridges from the combined source facts.
+target/release/trace-merge /tmp/media.db /tmp/datashare.db -o /tmp/combined.db
+
+# Include enough depth for the helper/controller/proxy/stub route.
+target/release/trace inspect /tmp/combined.db callchain \
+  --from 'OHOS::Media::MediaLibraryManager::OpenAsset' \
+  --to 'OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile' --depth 10 --limit 1
 ```
+
+These commands work on bare checkouts. Supply each project's matching
+`--compile-commands` and `--include` paths when available to improve declaration
+and receiver resolution. Add further projects by analyzing them into their own
+databases and passing those databases to `trace-merge` too.
+
+A framework whose implementation you want to navigate needs its own analysis
+database. `--dep` supplies declarations from external headers; its function
+bodies and source files are excluded from that analysis. Merged databases
+support call-graph navigation; keep the original analysis databases for
+argument/value-flow queries. See the [merge contract](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
+
+#### Missing-framework fallbacks
+
+When only SDK/dependency headers are available, use `--include` and `--dep`
+to supply type, inheritance and function declarations. When an unavailable
+implementation has known behavior, an explicit `--models` file can summarize
+memory operations, callbacks or an IPC boundary. Built-in libc and callback
+models load automatically; **the DataShare `OpenFile` shortcut does not**.
+
+For a media-only analysis with indexed provider implementations, save this
+optional fallback as `datashare-fallback.toml`:
+
+```toml
+[[model]]
+name = "OHOS::DataShare::DataShareHelper::OpenFile"
+effects = [
+  { kind = "ipc", target = "OHOS::DataShare::DataShareStub::OpenFile" }
+]
+```
+
+```bash
+target/release/trace analyze /path/to/multimedia_media_library \
+  --models datashare-fallback.toml --jobs 8 --ignore-logging -o /tmp/media.db
+```
+
+This connects a bodyless helper to eligible stub implementations already
+indexed in the media project. It conservatively retains possible providers and
+overloads; URI routing and parcel/value flow remain unmodeled. Use the
+[source-backed workflow](#cross-project-analysis-with-framework-sources) when
+the framework can be indexed. Re-analyze previously modeled inputs without
+the DataShare fallback to obtain that source-backed view.
+
+Matching, body/override precedence and disabling rules are specified in
+[DataShare sources and fallbacks](docs/ANALYSIS.md#datashare-sources-and-fallbacks).
 
 ## SQLite database schema
 

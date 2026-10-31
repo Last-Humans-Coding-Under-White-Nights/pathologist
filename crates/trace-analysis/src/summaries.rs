@@ -268,12 +268,6 @@ impl FnModelSet {
     pub fn builtin() -> Self {
         let mut set = Self::default();
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
-        reg(
-            "OHOS::DataShare::DataShareHelper::OpenFile",
-            vec![Effect::Ipc {
-                target: "OHOS::DataShare::DataShareStub::OpenFile".into(),
-            }],
-        );
         // Task, thread and timer primitives (`docs/ANALYSIS.md`, "Built-in
         // models"): each runs one callback, in the context it states.
         use ContextKind::{PoolTask, SerialTask, Thread};

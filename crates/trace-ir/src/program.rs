@@ -58,7 +58,7 @@ pub struct Diagnostic {
 /// `declaration_scope` is kept separately because an unqualified template
 /// argument is resolved in the namespace or enclosing class where the derived
 /// class is declared, not relative to the template itself or a later caller.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TemplateBase {
     pub derived: String,
     pub spelling: String,

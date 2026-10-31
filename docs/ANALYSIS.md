@@ -877,10 +877,42 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 1. **Intra-repository analysis**: Each repository is analyzed separately using `trace analyze`, producing a standalone SQLite database containing its callgraph, internal/external function definitions, call sites, and intra-repo points-to/dataflow facts.
 2. **Cross-repository merge (`trace-merge`)**: Merges multiple per-repository SQLite databases into a unified database, reconstructing the cross-repository callgraph without running static analysis or dataflow solvers during the merge phase.
 
+When implementation sources are available, prefer indexing each application,
+framework and service repository into its own database, then merging the results.
+The [README cross-project example](../README.md#cross-project-analysis-with-framework-sources)
+shows the complete analyze/merge/query workflow and a call-chain depth that
+covers the DataShare framework route. For partial checkouts, choose among
+[declarations and explicit IPC fallbacks](#datashare-sources-and-fallbacks).
+
 ### Invariants and linking rules
 
 - **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
-  Existing indirect and IPC edges carry over, but the merger cannot discover a new callback target that requires pointer flow across repositories, or synthesize a new IPC bridge when the proxy and stub were analyzed in separate databases. Such edges require an analysis that sees the relevant facts together.
+  Existing indirect and IPC edges carry over. New exports also retain compact
+  linking facts: declared classes and aliases, inheritance and template bases,
+  method signatures/virtual flags, IPC senders and IDL identities, and member
+  call receivers. After ordinary symbol linking, the merger combines these
+  facts, expands virtual calls to newly indexed overrides, and runs the same
+  pure IPC detector as analysis. New bridges have resolution `ipc`, no source
+  call site, and an `ipc_handler` execution context. IPC matching crosses link
+  images; ordinary member recovery stays in its caller's image or recorded
+  dependencies when image ownership is known. Source declaration certainty,
+  defining analysis roots and the shared identity of an invocation's CHA
+  alternatives are retained: ordinary recovery adds newly available
+  definitions, without re-expanding every existing intra-repository call.
+  An unresolved bare external call inside a known class also retains its
+  possible implicit receiver; the combined hierarchy can recover an inherited
+  member that was unavailable during lowering. Interface lookup through an
+  unavailable `IRemoteStub<I>` definition shares the IPC detector's template
+  argument recovery. Overload, nonvirtual and final rules apply without
+  propagating values across repositories.
+  These facts are retained by merged outputs for subsequent merges. Inputs
+  sharing an inherited source site contribute its linking call fact once;
+  reconstructed edges use the same [stable identity](#stable-merged-call-edge-ids)
+  as retained edges across reordered, staged and overlapping merges. Inputs
+  without them remain supported, with a diagnostic reporting incomplete
+  reconstruction. No new callback requiring cross-repository pointer flow is
+  discovered. `--no-ipc` inputs contribute no IPC sender facts; their ordinary
+  member linking facts remain available.
 - **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. A context a call site starts enters what the edge from that site to its entry now goes to: the definition another repository holds of a callback this one only declares (the callback edge is re-linked to it, and so is the context), or each candidate of an ambiguous edge, one row per candidate. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, distinctly analysed header copies keep their call sites; repeated inherited occurrences coalesce under the stable identity contract) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
@@ -1700,15 +1732,8 @@ the same bindings as incoming calls to their sender, including unresolved
 declarations. If callers reach both a declaration and definitions, each retains
 the bridge. Single-input merges preserve bridges without requiring a sender
 definition, and all retained bridges keep synthetic NULL call sites. Merge
-preserves these conservative summaries rather than revalidating framework absence or discovering new proxy/stub pairs.
-
-The built-in
-`OHOS::DataShare::DataShareHelper::OpenFile` model targets
-`OHOS::DataShare::DataShareStub::OpenFile`, so a media-library-only analysis
-can reach `MediaDataShareStubImpl::OpenFile` and its extension ability without
-indexing the DataShare framework. This is a may-call to every indexed provider,
-not proof that a particular URI selects one. An empty same-name model disables
-the summary; `--no-ipc` disables it together with detected bridges.
+preserves these conservative summaries rather than revalidating framework absence.
+Source-backed proxy/stub reconstruction follows the [linking rules](#invariants-and-linking-rules).
 
 Because v1 has no opcode or parcel-type information, overloaded handlers at
 the selected naming tier are all retained as a may-analysis result. With `m`
@@ -1734,6 +1759,36 @@ points-to fixpoint and do not feed the solver worklist. The analysis also does
 not model parcel argument or return-value flow. See
 [IPC_ROADMAP.md](IPC_ROADMAP.md) for the pattern study, validation targets, and
 limitations.
+
+#### DataShare sources and fallbacks
+
+**The DataShare `OpenFile` summary is opt-in.** It is absent from the built-in
+model set; normal analysis still loads the built-in libc and callback models.
+Choose the workflow according to the implementation evidence available:
+
+| Available input | Workflow |
+|---|---|
+| Application and framework/service implementation sources | Analyze each repository independently and use `trace-merge` to recover the source-backed member and proxy/stub route. Generate the inputs without the DataShare summary. |
+| Dependency/SDK headers only | Use `--include` and `--dep` for declarations, inheritance and receiver types. Dependency bodies do not contribute calls; analyze a framework's implementation separately when its sources become available. |
+| Known framework behavior, but unavailable implementation | Load an explicit `--models` summary during `trace analyze`, with its target implementations present in the indexed sources. This supplies a conservative boundary shortcut. |
+
+The DataShare fallback maps
+`OHOS::DataShare::DataShareHelper::OpenFile` to
+`OHOS::DataShare::DataShareStub::OpenFile` and its eligible indexed provider
+implementations. It retains possible providers and overloads; URI routing and
+parcel/value flow remain unmodeled. It applies to a bodyless sender, with
+indexed bodies and virtual implementations taking precedence as described
+above. The [configuration format](#configuration-format) includes the explicit
+TOML rule; the [README fallback example](../README.md#missing-framework-fallbacks)
+shows how to load it. An empty same-name model disables the configured fallback;
+`--no-ipc` disables it together with detected bridges.
+
+For source-backed cross-project navigation, follow the
+[README analyze/merge/query example](../README.md#cross-project-analysis-with-framework-sources).
+Merged outputs retain summary edges from their inputs: the merger does not
+remove a shortcut after another input supplies framework sources. Re-analyze
+any inputs previously produced with the DataShare fallback, omitting that rule,
+then merge the new databases to follow the indexed framework route.
 
 ## Field sensitivity
 
@@ -2367,11 +2422,10 @@ entries:
 | `OHOS::Thread::Run` | `entry context=thread` (c_utils runs it on the thread `Start` creates) |
 | `OHOS::AppExecFwk::EventHandler::ProcessEvent` | `entry context=serial_task` (the handler's event runner calls it) |
 | `OHOS::IRemoteObject::DeathRecipient::OnRemoteDied` | `entry context=ipc_handler` (an IPC thread calls it when the remote dies) |
-| `OHOS::DataShare::DataShareHelper::OpenFile` | `ipc target="OHOS::DataShare::DataShareStub::OpenFile"` |
 
 ### Configuration format
 
-TOML, one `[model]` table per function; loaded via `--models <FILE>` (repeatable;
+TOML, one `[[model]]` table per function; loaded via `--models <FILE>` (repeatable;
 later files override earlier entries and built-ins):
 
 ```toml
@@ -2428,10 +2482,11 @@ effects = [ { kind = "ipc", target = "MyProviderStub::OpenFile" } ]
 name = "memcpy"
 effects = []
 
-# Disable only the built-in DataShare summary, retaining detected IPC bridges.
+# Opt-in DataShare fallback for unavailable framework implementations.
+# Prefer separate indexing and trace-merge when framework sources are available.
 [[model]]
 name = "OHOS::DataShare::DataShareHelper::OpenFile"
-effects = []
+effects = [ { kind = "ipc", target = "OHOS::DataShare::DataShareStub::OpenFile" } ]
 ```
 
 `supplies`, `if_arg` and `unless_arg` belong to `invoke` and name a class or

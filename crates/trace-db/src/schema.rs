@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS analysis_run (
     options_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS linking_facts (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL,
+    data TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
@@ -319,7 +325,60 @@ CREATE TABLE IF NOT EXISTS flow_parameters (
 macro_rules! compact_storage {
     () => {
         concat!(
-            r#"CREATE TABLE IF NOT EXISTS strings (
+            r#"CREATE TABLE IF NOT EXISTS link_class_facts (
+    ordinal INTEGER PRIMARY KEY,
+    name_id INTEGER NOT NULL REFERENCES strings(id),
+    flags INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS link_alias_facts (
+    ordinal INTEGER PRIMARY KEY,
+    name_id INTEGER NOT NULL REFERENCES strings(id),
+    type_id INTEGER NOT NULL REFERENCES strings(id)
+);
+CREATE TABLE IF NOT EXISTS link_base_facts (
+    ordinal INTEGER PRIMARY KEY,
+    derived_id INTEGER NOT NULL REFERENCES strings(id),
+    base_id INTEGER NOT NULL REFERENCES strings(id)
+);
+CREATE TABLE IF NOT EXISTS link_template_facts (
+    ordinal INTEGER PRIMARY KEY,
+    fact_id INTEGER NOT NULL REFERENCES strings(id)
+);
+CREATE TABLE IF NOT EXISTS link_idl_facts (
+    ordinal INTEGER PRIMARY KEY,
+    fact_id INTEGER NOT NULL REFERENCES strings(id)
+);
+CREATE TABLE IF NOT EXISTS link_method_facts (
+    fn_id INTEGER PRIMARY KEY REFERENCES functions(id),
+    ordinal INTEGER NOT NULL,
+    params_id INTEGER REFERENCES strings(id),
+    flags INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS link_method_origins (
+    fn_id INTEGER NOT NULL REFERENCES link_method_facts(fn_id),
+    ordinal INTEGER NOT NULL,
+    origin_id INTEGER NOT NULL REFERENCES strings(id),
+    PRIMARY KEY (fn_id, ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS link_dispatch_queries (
+    id INTEGER PRIMARY KEY,
+    name_id INTEGER NOT NULL REFERENCES strings(id),
+    receiver_id INTEGER NOT NULL REFERENCES strings(id),
+    callee_fn_id INTEGER REFERENCES functions(id),
+    flags INTEGER NOT NULL,
+    origin_id INTEGER NOT NULL REFERENCES strings(id)
+);
+CREATE TABLE IF NOT EXISTS link_member_calls (
+    call_site_id INTEGER PRIMARY KEY,
+    ordinal INTEGER NOT NULL,
+    query_id INTEGER NOT NULL REFERENCES link_dispatch_queries(id),
+    source_site_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS link_ipc_senders (
+    fn_id INTEGER PRIMARY KEY REFERENCES functions(id)
+);
+
+CREATE TABLE IF NOT EXISTS strings (
     id INTEGER PRIMARY KEY,
     text TEXT NOT NULL
 );

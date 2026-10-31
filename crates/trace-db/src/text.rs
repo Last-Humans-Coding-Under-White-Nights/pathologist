@@ -7,7 +7,7 @@ use trace_ir::{BlockKind, EdgeKind, EventKind, GapKind};
 pub(crate) const COVERAGE: [&str; 2] = ["complete", "partial"];
 
 /// Identity of an interned SQLite string, independent of IR entity IDs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextId(i64);
 
 impl ToSql for TextId {
