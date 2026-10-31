@@ -1323,12 +1323,15 @@ when its definition was already visible during lowering.
 Receivers are evaluated as ordinary expression values: reference bindings
 and wrapper fields are loaded, and returned wrappers are received once.
 A wrapper descriptor present only inside a pointer/reference parameter is
-interned on demand. A call returning a wrapper reference holds the wrapper's
-address, which is loaded before extraction. Result typing and reference
+interned on demand. A call returning a wrapper reference can hold either
+its address (`return *p`) or an already-lowered wrapper value (`return global`
+or `return field`). Receiver-value lowering therefore retains the original
+result alongside a load through it. This also preserves reference-returning
+weak-pointer promotions; a subsequent owning-pointer unwrap still excludes
+wrapper storage and incompatible objects. Result typing and reference
 handling share overload selection and reference-return metadata from both
-declarations and definitions. Value-returning receivers are not loaded
-again; when unresolved overloads admit both return forms, both values are
-retained conservatively.
+declarations and definitions. Known value-returning receivers receive no
+extra load.
 
 Assignments, arguments, dereferences, returns (including cast operands),
 and field paths rooted at extraction reuse the result. The extraction adds

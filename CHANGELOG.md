@@ -17,6 +17,9 @@ Visible getter implementations keep their ordinary return behavior,
 including later definitions, shared headers and file-scope initializers
 owned by a link image. Excluded dependency bodies remain declaration-only.
 Unrelated `get` methods and calls with arguments receive no summary.
+Reference-returning receivers conservatively retain both the returned value
+and its load, preserving named/field-return aliases for owning-pointer
+extraction and `weak_ptr::lock()` / `wptr::promote()`.
 
 Rules: [smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap).
 Measurements and remaining corpus limits:

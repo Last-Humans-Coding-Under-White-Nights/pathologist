@@ -8551,6 +8551,131 @@ fn pointer_get_filters_wrapper_and_incompatible_storage_without_allocating() {
 }
 
 #[test]
+fn reference_returned_wrappers_preserve_named_and_field_values() {
+    for (wrapper, promotion) in [
+        ("std::shared_ptr<Handler>", ""),
+        ("std::unique_ptr<Handler>", ""),
+        ("std::weak_ptr<Handler>", ".lock()"),
+    ] {
+        let source = format!(
+            r#"
+namespace std {{
+template<class T> struct shared_ptr {{ T *get(); T *operator->(); }};
+template<class T> struct unique_ptr {{ T *get(); T *operator->(); }};
+template<class T> struct weak_ptr;
+}}
+struct Handler {{ void (*callback)(); }};
+Handler concrete;
+using Ptr = {wrapper};
+Ptr global = &concrete;
+Ptr &named() {{ return global; }}
+Ptr &qualified() {{ return ::global; }}
+const Ptr &constant() {{ return global; }}
+Ptr &&rvalue() {{ return static_cast<Ptr&&>(global); }}
+Ptr &dereferenced(Ptr *p) {{ return *p; }}
+Ptr &bound(Ptr &p) {{ return p; }}
+Ptr &forwarded() {{ return named(); }}
+struct Holder {{ Ptr item; Ptr &implicit() {{ return item; }} }};
+Holder holder;
+Ptr &field(Holder *h) {{ return h->item; }}
+Ptr value() {{ return global; }}
+void read() {{
+    holder.item = global;
+    Handler *control = global{promotion}.get();
+    Handler *from_named = named(){promotion}.get();
+    Handler *from_qualified = qualified(){promotion}.get();
+    Handler *from_const = constant(){promotion}.get();
+    Handler *from_rvalue = rvalue(){promotion}.get();
+    Handler *from_deref = dereferenced(&global){promotion}.get();
+    Handler *from_bound = bound(*(&global)){promotion}.get();
+    Handler *from_forwarded = forwarded(){promotion}.get();
+    Handler *from_field = field(&holder){promotion}.get();
+    Handler *from_implicit = holder.implicit(){promotion}.get();
+    Handler *from_value = value(){promotion}.get();
+}}
+void promote_only() {{ auto result = named(){promotion}; }}
+"#
+        );
+        let (_dir, p) = build_tree(&[("main.cpp", &source)], default_opts);
+        assert!(p.diagnostics.is_empty(), "{wrapper}: {:?}", p.diagnostics);
+        let (pag, a) = trace_analysis::analyze_with_options(
+            &p,
+            trace_analysis::AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        );
+        for name in [
+            "control",
+            "from_named",
+            "from_qualified",
+            "from_const",
+            "from_rvalue",
+            "from_deref",
+            "from_bound",
+            "from_forwarded",
+            "from_field",
+            "from_implicit",
+            "from_value",
+        ] {
+            let var = common::local_variable(&p, "read", name);
+            let targets: std::collections::BTreeSet<_> = a
+                .points_to
+                .get(&pag.var_node[&var])
+                .into_iter()
+                .flatten()
+                .map(|id| pag.locations[id.0 as usize].desc.as_str())
+                .collect();
+            assert_eq!(
+                targets,
+                std::collections::BTreeSet::from(["concrete"]),
+                "{wrapper}: {name}"
+            );
+        }
+        if !promotion.is_empty() {
+            let result = common::local_variable(&p, "promote_only", "result");
+            assert!(
+                a.points_to
+                    .get(&pag.var_node[&result])
+                    .into_iter()
+                    .flatten()
+                    .any(|id| pag.locations[id.0 as usize].desc == "concrete"),
+                "{wrapper}: promotion retains its pointee without a following get()"
+            );
+        }
+    }
+}
+
+#[test]
+fn reference_returned_ohos_weak_wrapper_preserves_promotion() {
+    let source = r#"
+namespace OHOS { template<class T> struct wptr; }
+struct Handler {};
+Handler concrete;
+using Ptr = OHOS::wptr<Handler>;
+Ptr global = &concrete;
+Ptr &ref() { return global; }
+void read() { auto result = ref().promote(); }
+"#;
+    let (_dir, p) = build_tree(&[("main.cpp", source)], default_opts);
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    let (pag, a) = trace_analysis::analyze_with_options(
+        &p,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let result = common::local_variable(&p, "read", "result");
+    assert!(a
+        .points_to
+        .get(&pag.var_node[&result])
+        .into_iter()
+        .flatten()
+        .any(|id| pag.locations[id.0 as usize].desc == "concrete"));
+}
+
+#[test]
 fn pointer_get_loads_reference_returned_receivers() {
     for wrapper in ["shared_ptr", "unique_ptr"] {
         let source = format!(

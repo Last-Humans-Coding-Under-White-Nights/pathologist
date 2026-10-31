@@ -8472,39 +8472,38 @@ fn receiver_value(
         }
     }?;
     let call = peel_casts(source, receiver);
-    let (reference, by_value) = call_return_kinds(program, ctx, source, call);
-    if !reference {
+    if !call_may_return_reference(program, ctx, source, call) {
         return Some(result);
     }
     let referent = receiver_desc(program, ctx, source, call)
         .map_or(type_id, |desc| program.types.intern(desc));
     let loaded = emit_load(program, ctx, receiver, result, referent);
-    if by_value {
-        // Unknown arguments can leave both reference and value returns
-        // viable. Preserve both interpretations rather than dropping one.
-        program.flow.push(FlowConstraint::Copy {
-            dst: loaded,
-            src: result,
-        });
-    }
+    // Reference-return IR carries both addresses (`return *p`) and values
+    // (`return global`, `return field`). Preserve the value interpretation
+    // alongside the load, including for weak-pointer promotions. Owning
+    // extraction subsequently filters out wrapper storage as usual.
+    program.flow.push(FlowConstraint::Copy {
+        dst: loaded,
+        src: result,
+    });
     Some(loaded)
 }
 
-/// Whether any viable declaration returns a reference or a value, using
+/// Whether any viable declaration returns a reference, using
 /// the same lookup and overload ranking as the expression's result type.
-fn call_return_kinds(
+fn call_may_return_reference(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
     call: Node,
-) -> (bool, bool) {
+) -> bool {
     if call.cached_kind() != "call_expression" {
-        return (false, false);
+        return false;
     }
     let Some(CallResult::Overload { candidates, .. }) =
         call_result_shape(program, ctx, source, call)
     else {
-        return (false, false);
+        return false;
     };
     let nodes = call_arg_nodes(call);
     let args: Vec<_> = nodes
@@ -8515,26 +8514,19 @@ fn call_return_kinds(
         Overloads::Declared(found) => found,
         Overloads::ByName(name) => {
             let Some(func) = call.cached_field("function") else {
-                return (false, false);
+                return false;
             };
             cpp_callee_candidates(program, ctx, source, func, &name, &args)
         }
     };
-    let mut reference = false;
-    let mut value = false;
-    for candidate in result_overloads(
+    result_overloads(
         program,
         candidates,
         &args,
         &null_constant_args(source, &nodes),
-    ) {
-        if ctx.reference_returns.contains(&candidate) {
-            reference = true;
-        } else {
-            value = true;
-        }
-    }
-    (reference, value)
+    )
+    .into_iter()
+    .any(|candidate| ctx.reference_returns.contains(&candidate))
 }
 
 /// `node` names an instance member: a field access other than a static data

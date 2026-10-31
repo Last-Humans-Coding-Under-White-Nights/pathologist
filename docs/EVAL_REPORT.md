@@ -78,7 +78,12 @@ Isolated reference-only/pointer-only parameters verify on-demand type
 interning without a by-value declaration masking the problem. Returned
 wrappers cover references, const references, rvalue references, references
 to pointers, member calls, and declarations preceding definitions. A
-value-returning control checks that it receives no extra load.
+value-returning control checks that it receives no extra load. Named,
+qualified, const/rvalue, forwarded, and implicit/explicit member returns are
+checked against a concrete pointee as well as address-form returns. Standalone
+`std::weak_ptr::lock()` and OHOS `wptr::promote()` regressions verify that
+reference-returned wrappers preserve their pointees without a following
+`get()`; owning-pointer extraction still excludes wrapper storage.
 
 Executable getter tests verify only `alternate` is returned, excluding the
 wrapper's unrelated modeled pointee, for later out-of-line definitions,
@@ -88,12 +93,13 @@ image or is already visible. An independent image with a bodyless getter
 keeps its extraction summary. Dependency bodies contribute declarations
 without executable flows.
 
-All 2,601 workspace tests pass. Fresh analyses pass all 115 corpus checks
+All 2,603 workspace tests pass. Fresh analyses pass all 115 corpus checks
 with both jobs=1 and jobs=8. All 34 logical SQLite relations match exactly
 between those job counts, excluding producer/run metadata with
-`scripts/compare_analysis_databases.py`. The final reference-return and
-global-initializer corrections leave the preceding corpus exports unchanged.
-Formatting and `git diff --check` pass.
+`scripts/compare_analysis_databases.py`. The receiver-reference follow-up
+preserves every analysis row from the preceding corpus exports. Only the
+producer revision stamp and its derived `database_identity` snapshot hash
+differ across those builds. Formatting and `git diff --check` pass.
 
 To compare job counts for any pinned corpus, using the current release build:
 
