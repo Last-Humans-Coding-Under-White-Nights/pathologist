@@ -28,7 +28,11 @@ fn build(
         .with_include(root.clone())
         .with_include(include_dir);
     let program = build_program(&root, &opts).expect("build program");
-    let (pag, analysis) = analyze(&program);
+    let (pag, analysis) = if name.starts_with("ipc_datashare") {
+        common::analyze_with_datashare_summary(&program)
+    } else {
+        analyze(&program)
+    };
     (program, pag, analysis)
 }
 
@@ -220,7 +224,7 @@ fn check_summary_partition(case: PartitionCase) -> Vec<PartitionEdge> {
     opts.test_partition = policy;
     let program = trace_parse::build_program_with_jobs(root, &opts, jobs).unwrap();
     assert_eq!(program.symbols.has_target_scopes(), images);
-    let (_, analysis) = analyze(&program);
+    let (_, analysis) = common::analyze_with_datashare_summary(&program);
     let functions = &program.symbols.functions;
     let caller = functions
         .iter()
@@ -314,7 +318,7 @@ fn ipc_datashare_framework_summary_with_declared_sptr_reaches_extension() {
         .with_include(root.clone())
         .with_define("DECLARED_SPTR", "1");
     let program = build_program(&root, &opts).unwrap();
-    let (_, analysis) = analyze(&program);
+    let (_, analysis) = common::analyze_with_datashare_summary(&program);
     let stub = "OHOS::DataShare::MediaDataShareStubImpl::OpenFile";
     assert!(has_bridge_edge(
         &program,
@@ -423,11 +427,29 @@ fn ipc_datashare_framework_summary_reaches_extension_ability() {
 }
 
 #[test]
+fn datashare_summary_requires_explicit_configuration() {
+    let (program, _, _) = build("ipc_datashare");
+    let (pag, analysis) = analyze(&program);
+    assert!(pag.ipc_bridges.is_empty());
+    assert!(analysis
+        .call_edges
+        .iter()
+        .all(|e| e.resolution != ResolutionKind::IpcBridge));
+    assert!(analysis
+        .call_edges
+        .iter()
+        .any(|e| fn_name(&program, e.caller)
+            == "OHOS::DataShare::MediaDataShareStubImpl::OpenFile"
+            && fn_name(&program, e.callee)
+                == "OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile"));
+}
+
+#[test]
 fn ipc_datashare_summary_respects_options_and_model_override() {
     let (program, _, _) = build("ipc_datashare");
     let opts = AnalyzeOptions {
         enable_ipc: false,
-        ..Default::default()
+        ..common::datashare_summary_options()
     };
     let (pag, analysis) = analyze_with_options(&program, opts);
     assert!(pag.ipc_bridges.is_empty());
@@ -436,7 +458,7 @@ fn ipc_datashare_summary_respects_options_and_model_override() {
         .iter()
         .all(|e| e.resolution != ResolutionKind::IpcBridge));
 
-    let mut opts = AnalyzeOptions::default();
+    let mut opts = common::datashare_summary_options();
     std::sync::Arc::make_mut(&mut opts.models)
         .merge_toml_str(
             r#"

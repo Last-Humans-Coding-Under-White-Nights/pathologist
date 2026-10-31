@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use trace_db::{MultiInstance, SequencingMarker, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
+mod linking;
 
 mod identity;
 use identity::Identity;
@@ -65,6 +66,8 @@ pub struct MergeReport {
     pub cross_repo_calls_resolved: usize,
     pub external_calls_unresolved: usize,
     pub ambiguous_calls: usize,
+    pub ipc_bridges_added: usize,
+    pub member_calls_added: usize,
     pub warnings: Vec<MergeWarning>,
 }
 
@@ -89,6 +92,8 @@ pub enum WarningKind {
     /// An input analysed without `--sequencing` while another was: its
     /// functions have no call-order graph in the merged database.
     MissingSequencing,
+    /// An older export cannot supply cross-repository hierarchy/IPC facts.
+    MissingLinkingFacts,
 }
 
 /// A key per merged call site (by index), equal for the sites of two inputs
@@ -387,16 +392,64 @@ impl DefRecord {
 // their link target so their functions and outgoing calls stay separate.
 type FunctionOrigin = (i64, i64, String, String);
 
+/// Shared external/member definition selection. Strength competes only within
+/// a signature; exact strong conflicts prefer the caller's known image.
+fn prefer_definitions(
+    candidates: Vec<&DefRecord>,
+    caller_target: Option<i64>,
+    fallback: bool,
+) -> Vec<&DefRecord> {
+    let strong: Vec<_> = candidates.iter().copied().filter(|d| !d.is_weak).collect();
+    if fallback && candidates.len() > 1 {
+        let signatures: FxHashSet<_> = strong.iter().map(|d| d.signature.as_str()).collect();
+        return candidates
+            .into_iter()
+            .filter(|d| !d.is_weak || !signatures.contains(d.signature.as_str()))
+            .collect();
+    }
+    if strong.is_empty() {
+        return candidates;
+    }
+    if strong.len() == 1 || caller_target.is_none() {
+        return strong;
+    }
+    let local: Vec<_> = strong
+        .iter()
+        .copied()
+        .filter(|d| caller_target.is_some() && d.target_id == caller_target)
+        .collect();
+    if local.is_empty() {
+        strong
+    } else {
+        local
+    }
+}
+
+fn matching_definitions<'a>(defs: &'a [DefRecord], signature: &str) -> (Vec<&'a DefRecord>, bool) {
+    if !signature.contains('(') || signature.ends_with("(...)") {
+        return (defs.iter().collect(), true);
+    }
+    let matching: Vec<_> = defs.iter().filter(|d| d.signature == signature).collect();
+    if matching.is_empty() {
+        (defs.iter().collect(), true)
+    } else {
+        (matching, false)
+    }
+}
+
+fn same_definition_origin(pool: &[&DefRecord]) -> bool {
+    let first = pool[0];
+    pool.iter()
+        .all(|d| d.source_origin() == first.source_origin())
+}
+
 fn resolve_definition_pool(
     pool: &[&DefRecord],
     db_idx: usize,
     resolved_resolution: String,
     report: &mut MergeReport,
 ) -> (Vec<i64>, String) {
-    let first = pool[0];
-    let same_origin = pool
-        .iter()
-        .all(|d| d.source_origin() == first.source_origin());
+    let same_origin = same_definition_origin(pool);
     let resolution = if same_origin {
         if pool.iter().any(|d| d.db_idx != db_idx) {
             report.cross_repo_calls_resolved += 1;
@@ -462,6 +515,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut inputs = Vec::new();
     let mut seen_identities = FxHashSet::default();
     let mut conns = Vec::new();
+    let mut input_linking = Vec::new();
     // Per input: whether it has the `execution_contexts` table.
     let mut has_contexts_table: Vec<bool> = Vec::new();
     // Per input: whether `trace analyze --sequencing` wrote it.
@@ -470,6 +524,9 @@ pub fn merge_databases<P: AsRef<Path>>(
     for path in &candidate_inputs {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
+        // Call-site text joins revisit dictionary pages across source files.
+        // Bound each input's cache at 16 MiB rather than SQLite's 2 MiB default.
+        conn.execute_batch("PRAGMA cache_size = -16384;")?;
         let ver: i64 = conn
             .query_row(
                 "SELECT schema_version FROM analysis_run ORDER BY id LIMIT 1",
@@ -506,7 +563,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                 ("diagnostics", READ_DIAGNOSTICS),
             ],
         )?;
-        let has_identities = identity::has_metadata(&conn).with_context(|| {
+        let metadata = identity::read_metadata(&conn).with_context(|| {
             format!("invalid stable call-edge identities in {}", path.display())
         })?;
         let database_identity = trace_db::database_identity(&conn)
@@ -522,7 +579,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             continue;
         }
         input_identities.push(Identity::input(database_identity));
-        input_has_identities.push(has_identities);
+        input_has_identities.push(metadata.has_identities);
         let has_contexts = trace_db::table_exists(&conn, "execution_contexts")?;
         if has_contexts {
             require_reads(
@@ -545,6 +602,21 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
         input_sequencing.push(sequencing);
         inputs.push(path.clone());
+        let mut facts = trace_db::read_linking_facts(&conn)
+            .with_context(|| format!("invalid linking facts in {}", path.display()))?;
+        if !metadata.merged {
+            if let Some(facts) = &mut facts {
+                linking::scope_origins(facts, Identity::input(database_identity));
+            }
+        }
+        if facts.as_ref().is_none_or(|facts| !facts.complete) {
+            report.warnings.push(MergeWarning {
+                kind: WarningKind::MissingLinkingFacts,
+                message: format!("{} lacks complete linking facts; re-analyze the original inputs for full cross-repository member/IPC reconstruction", path.display()),
+                symbol: None, file_id: None, line: 0,
+            });
+        }
+        input_linking.push(facts);
         conns.push(conn);
     }
     report.input_dbs = inputs.clone();
@@ -901,6 +973,9 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
     }
 
+    drop(header_def_map);
+    drop(header_decl_map);
+    drop(function_by_identity);
     // 4. Call Sites Ingestion & Remapping
     let mut unified_call_sites: Vec<DbCallSite> = Vec::new();
     let mut site_identities = Vec::new();
@@ -972,6 +1047,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
         input_sites.push(mapped_sites);
     }
+    drop(site_by_identity);
     report.call_sites_total = unified_call_sites.len();
 
     // 5. Call Edges Ingestion & Cross-Repository Resolution
@@ -982,6 +1058,23 @@ pub fn merge_databases<P: AsRef<Path>>(
     // started at that site with that callee as its entry follows them (5b):
     // a callback declared in one repository and defined in another enters
     // the definition, as the edge does.
+    // Only submitted execution contexts consult edge redirections. Recording
+    // every ordinary edge otherwise retains a vector for almost every call.
+    let mut needed_retargets = FxHashSet::default();
+    for (db_idx, conn) in conns.iter().enumerate() {
+        if !has_contexts_table[db_idx] {
+            continue;
+        }
+        let mut stmt = conn.prepare(READ_EXECUTION_CONTEXTS)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            if let (Some(site), entry) = row? {
+                needed_retargets.insert((db_idx, site, entry));
+            }
+        }
+    }
     let mut retargets: FxHashMap<(usize, i64, i64), Vec<i64>> = FxHashMap::default();
     let mut caller_bindings: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
     let mut unresolved_external_counts: FxHashMap<String, usize> = FxHashMap::default();
@@ -1030,70 +1123,10 @@ pub fn merge_databases<P: AsRef<Path>>(
                 {
                     // Try to resolve the external or weak function against all known definitions.
                     if let Some(defs) = definitions_by_name.get(&orig_callee.name) {
-                        let is_generic_sig = !orig_callee.signature.contains('(')
-                            || orig_callee.signature.ends_with("(...)");
-                        let (candidates, is_fallback): (Vec<&DefRecord>, bool) = if is_generic_sig {
-                            (defs.iter().collect(), true)
-                        } else {
-                            let matching: Vec<&DefRecord> = defs
-                                .iter()
-                                .filter(|d| d.signature == orig_callee.signature)
-                                .collect();
-                            if matching.is_empty() {
-                                // `signature` is a lossy spelling (`int[]` vs `int*`,
-                                // signedness/const dropped): fall back to every
-                                // same-name definition rather than lose the call.
-                                (defs.iter().collect(), true)
-                            } else {
-                                (matching, false)
-                            }
-                        };
-
-                        let strong_defs: Vec<&DefRecord> =
-                            candidates.iter().copied().filter(|d| !d.is_weak).collect();
-
-                        if is_fallback && candidates.len() > 1 {
-                            // Strength only competes within one signature. A strong
-                            // overload cannot suppress a different weak overload when
-                            // the call's signature is unknown or fails exact matching.
-                            let strong_signatures: FxHashSet<&str> = strong_defs
-                                .iter()
-                                .map(|d| d.signature.as_str())
-                                .collect();
-                            let pool: Vec<&DefRecord> = candidates
-                                .into_iter()
-                                .filter(|d| !d.is_weak || !strong_signatures.contains(d.signature.as_str()))
-                                .collect();
-
-                            resolve_definition_pool(&pool, db_idx, resolved_resolution, &mut report)
-                        } else if strong_defs.len() == 1 {
-                            // Exactly one strong definition found!
-                            if strong_defs[0].db_idx != db_idx {
-                                report.cross_repo_calls_resolved += 1;
-                            }
-                            (vec![strong_defs[0].new_fn_id], resolved_resolution)
-                        } else if strong_defs.is_empty() && candidates.len() == 1 {
-                            // Exactly one weak definition found!
-                            if candidates[0].db_idx != db_idx {
-                                report.cross_repo_calls_resolved += 1;
-                            }
-                            (vec![candidates[0].new_fn_id], resolved_resolution)
-                        } else if strong_defs.len() > 1 {
-                            // Multiple conflicting strong definitions for the same signature!
-                            let caller_target = unified_functions[(new_caller_id - 1) as usize].target_id;
-                            let same_target_strong: Vec<&DefRecord> = strong_defs
-                                .iter()
-                                .copied()
-                                .filter(|d| caller_target.is_some() && d.target_id == caller_target)
-                                .collect();
-                            let pool = if same_target_strong.is_empty() {
-                                strong_defs
-                            } else {
-                                same_target_strong
-                            };
-
-                            resolve_definition_pool(&pool, db_idx, resolved_resolution, &mut report)
-                        } else if !candidates.is_empty() {
+                        let (candidates, is_fallback) = matching_definitions(defs, &orig_callee.signature);
+                        let candidates = prefer_definitions(candidates,
+                            unified_functions[(new_caller_id - 1) as usize].target_id, is_fallback);
+                        if !candidates.is_empty() {
                             resolve_definition_pool(&candidates, db_idx, resolved_resolution, &mut report)
                         } else if is_weak_call {
                             // Retain local weak definition
@@ -1138,10 +1171,13 @@ pub fn merge_databases<P: AsRef<Path>>(
                 };
 
             if let Some(cs) = edge.call_site_id {
-                retargets
-                    .entry((db_idx, cs, edge.callee_fn_id))
-                    .or_default()
-                    .extend(new_callees.iter().copied());
+                let key = (db_idx, cs, edge.callee_fn_id);
+                if needed_retargets.contains(&key) {
+                    retargets
+                        .entry(key)
+                        .or_default()
+                        .extend(new_callees.iter().copied());
+                }
             }
             if orig_callee.is_defined == 0 {
                 let declaration = fn_remap[db_idx][&edge.callee_fn_id];
@@ -1168,19 +1204,54 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
     }
+    // Resolution-only catalogs must not overlap reconstruction and export.
+    drop(needed_retargets);
+    drop(per_db_functions);
+    drop(emitted);
+    let linking_facts = linking::combine(input_linking, &fn_remap, &cs_remap)?;
+    let previous_edges = unified_call_edges.len();
+    let previous_ipc = unified_call_edges
+        .iter()
+        .filter(|e| e.resolution == "ipc")
+        .count();
+    let new_handlers = linking::reconstruct(
+        &linking_facts,
+        &unified_functions,
+        &unified_target_dependencies,
+        &definitions_by_name,
+        &mut unified_call_edges,
+    )?;
+    drop(definitions_by_name);
+    report.ipc_bridges_added = unified_call_edges
+        .iter()
+        .filter(|e| e.resolution == "ipc")
+        .count()
+        - previous_ipc;
+    report.member_calls_added =
+        unified_call_edges.len() - previous_edges - report.ipc_bridges_added;
+
     // A retained summary belongs to every sender binding callers now reach,
     // including declarations that remain unresolved.
     // Reuse the exact callee redirections above rather than resolving its
     // name a second time with a different image/signature policy.
-    let mut rebound = Vec::new();
+    // Ordinary edges keep their allocation; only additional bindings of a
+    // retained summary require copies. Register identities in the original
+    // traversal order, including those additional bindings.
+    let mut additional_edges = Vec::new();
     let mut edge_identities = FxHashMap::default();
-    for edge in unified_call_edges {
+    let mut kept = 0;
+    for index in 0..unified_call_edges.len() {
+        let edge = &mut unified_call_edges[index];
+        let original_caller = edge.caller_fn_id;
         let callers = (edge.resolution == "ipc")
-            .then(|| caller_bindings.get(&edge.caller_fn_id))
+            .then(|| caller_bindings.get(&original_caller))
             .flatten();
-        for caller in callers
+        let mut retain = false;
+        for (binding, caller) in callers
             .map(Vec::as_slice)
-            .unwrap_or(std::slice::from_ref(&edge.caller_fn_id))
+            .unwrap_or(std::slice::from_ref(&original_caller))
+            .iter()
+            .enumerate()
         {
             let caller_identity = function_identities[(*caller - 1) as usize];
             let callee_identity = function_identities[(edge.callee_fn_id - 1) as usize];
@@ -1191,13 +1262,26 @@ pub fn merge_databases<P: AsRef<Path>>(
             if !identity::register(&mut edge_identities, identity)? {
                 continue;
             }
-            let mut copy = edge.clone();
-            copy.id = identity.edge_id();
-            copy.caller_fn_id = *caller;
-            rebound.push(copy);
+            if binding == 0 {
+                edge.id = identity.edge_id();
+                edge.caller_fn_id = *caller;
+                retain = true;
+            } else {
+                let mut copy = edge.clone();
+                copy.id = identity.edge_id();
+                copy.caller_fn_id = *caller;
+                additional_edges.push(copy);
+            }
+        }
+        if retain {
+            unified_call_edges.swap(kept, index);
+            kept += 1;
         }
     }
-    let unified_call_edges = rebound;
+    unified_call_edges.truncate(kept);
+    unified_call_edges.extend(additional_edges);
+    drop(edge_identities);
+    drop(caller_bindings);
     report.call_edges_total = unified_call_edges.len();
 
     // Collect top unresolved external warnings.
@@ -1293,6 +1377,19 @@ pub fn merge_databases<P: AsRef<Path>>(
                 });
             }
         }
+    }
+    drop(retargets);
+    for entry_fn_id in new_handlers {
+        carried_contexts.push(DbExecutionContext {
+            kind: "ipc_handler".into(),
+            entry_fn_id,
+            call_site_id: None,
+            api_fn_id: None,
+            param_index: None,
+            model: None,
+            multi_instance: "unknown".into(),
+            self_concurrent: 1,
+        });
     }
     let unified_contexts = unify_execution_contexts(carried_contexts);
 
@@ -1454,6 +1551,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             WarningKind::DuplicateInput => "warning",
             WarningKind::MissingExecutionContexts => "info",
             WarningKind::MissingSequencing => "info",
+            WarningKind::MissingLinkingFacts => "info",
         };
         let new_diag_id = (unified_diagnostics.len() + 1) as i64;
         unified_diagnostics.push(DbDiagnostic {
@@ -1466,6 +1564,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         });
     }
 
+    drop(conns);
     // 7. Write to Merged Output SQLite Database
     let parent = options
         .output
@@ -1492,6 +1591,9 @@ pub fn merge_databases<P: AsRef<Path>>(
         out_conn.execute_batch(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
+        // Stable edge IDs scatter parent lookups during validation. Keep the
+        // output working set cached; input connections have already closed.
+        out_conn.execute_batch("PRAGMA cache_size = -65536;")?;
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
         out_conn.execute_batch(TABLES_V8)?;
         out_conn.execute_batch(identity::TABLES)?;
@@ -1507,6 +1609,8 @@ pub fn merge_databases<P: AsRef<Path>>(
             "cross_repo_calls_resolved": report.cross_repo_calls_resolved,
             "external_calls_unresolved": report.external_calls_unresolved,
             "ambiguous_calls": report.ambiguous_calls,
+            "ipc_bridges_added": report.ipc_bridges_added,
+            "member_calls_added": report.member_calls_added,
             "warnings_count": report.warnings.len(),
             "call_sequencing": SequencingMarker::merged(&input_sequencing).to_json(),
             "call_edge_identity_version": 1,
@@ -1686,6 +1790,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
 
+        trace_db::write_linking_facts(&out_conn, &linking_facts, &mut strings)?;
         verify_foreign_keys(&out_conn)?;
 
         // Build secondary indexes

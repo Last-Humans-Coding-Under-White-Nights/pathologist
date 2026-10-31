@@ -61,9 +61,13 @@ impl Identity {
     }
 }
 
-/// Both relations must be present for a new merged input. Older inputs
-/// establish a namespace from their database content identity instead.
-pub(super) fn has_metadata(conn: &Connection) -> Result<bool> {
+/// Identity support and merge provenance are separate for legacy outputs.
+pub(super) struct InputMetadata {
+    pub has_identities: bool,
+    pub merged: bool,
+}
+
+pub(super) fn read_metadata(conn: &Connection) -> Result<InputMetadata> {
     let options: String = conn.query_row(
         "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
         [],
@@ -85,7 +89,16 @@ pub(super) fn has_metadata(conn: &Connection) -> Result<bool> {
     if functions != sites || (version.is_some() && !functions) || (targets && !functions) {
         bail!("incomplete stable call-edge identity metadata: both merge identity tables are required");
     }
-    Ok(functions)
+    let merged = functions
+        || options
+            .as_ref()
+            .and_then(|v| v.get("stage"))
+            .and_then(|v| v.as_str())
+            == Some("merge");
+    Ok(InputMetadata {
+        has_identities: functions,
+        merged,
+    })
 }
 
 pub(super) fn read(

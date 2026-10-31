@@ -53,6 +53,23 @@ pub fn analyze_with_models(program: &Program, toml: &str) -> AnalysisResult {
     trace_analysis::analyze_with_options(program, opts).1
 }
 
+/// Explicit fallback used by the configurable IPC-summary regressions.
+pub fn datashare_summary_options() -> trace_analysis::AnalyzeOptions {
+    trace_analysis::AnalyzeOptions {
+        models: std::sync::Arc::new(
+            trace_analysis::FnModelSet::from_toml_str(include_str!(
+                "../../../../../tests/fixtures/ipc_datashare/models.toml"
+            ))
+            .expect("DataShare test model"),
+        ),
+        ..Default::default()
+    }
+}
+
+pub fn analyze_with_datashare_summary(program: &Program) -> (trace_analysis::Pag, AnalysisResult) {
+    trace_analysis::analyze_with_options(program, datashare_summary_options())
+}
+
 pub fn fn_name(program: &Program, id: trace_ir::FnId) -> String {
     program.symbols.function(id).name.clone()
 }

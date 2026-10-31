@@ -5,7 +5,7 @@ use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::Program;
 use trace_preproc::PreprocessOptions;
 
-fn build(files: &[(&str, &str)]) -> (Program, AnalysisResult) {
+fn build_program(files: &[(&str, &str)]) -> Program {
     let scratch = tempfile::tempdir().unwrap();
     for (file, text) in files {
         let path = scratch.path().join(file);
@@ -13,7 +13,11 @@ fn build(files: &[(&str, &str)]) -> (Program, AnalysisResult) {
         fs::write(path, text).unwrap();
     }
     let opts = PreprocessOptions::new().with_include(scratch.path().to_path_buf());
-    let p = trace_parse::build_program_with_jobs(scratch.path(), &opts, 1).unwrap();
+    trace_parse::build_program_with_jobs(scratch.path(), &opts, 1).unwrap()
+}
+
+fn build(files: &[(&str, &str)]) -> (Program, AnalysisResult) {
+    let p = build_program(files);
     let (_, a) = analyze(&p);
     (p, a)
 }
@@ -180,10 +184,11 @@ fn synthesized_summary_sender_is_independent_of_directory_order() {
     let mut previous = None;
     for prefix in ["aa", "zz"] {
         let path = format!("{prefix}/tests/mock.cpp");
-        let (p, a) = build(&[
+        let p = build_program(&[
             ("src/main.cpp", "namespace OHOS { namespace DataShare { int prod_use(DataShareHelper *h) { return h->OpenFile(1); } }}"),
             (&path, "namespace OHOS { namespace DataShare { class DataShareStub { public: virtual int OpenFile(int) = 0; }; class MockProvider : public DataShareStub { public: int OpenFile(int x) override { return x; } }; int test_use(DataShareHelper *h) { return h->OpenFile(2); } }}"),
         ]);
+        let (_, a) = crate::common::analyze_with_datashare_summary(&p);
         assert!(!a
             .call_edges
             .iter()
@@ -217,7 +222,8 @@ fn synthesized_summary_sender_is_independent_of_directory_order() {
 fn virtual_summary_defers_to_indexed_implementation_but_retains_missing_framework_fallback() {
     for implementation in [false, true] {
         let source = format!("namespace OHOS {{ namespace DataShare {{ class DataShareHelper {{ public: virtual int OpenFile(int) = 0; }}; {} class DataShareStub {{ public: virtual int OpenFile(int) = 0; }}; class Provider : public DataShareStub {{ public: int OpenFile(int x) override {{ return x; }} }}; int use(DataShareHelper *h) {{ return h->OpenFile(1); }} }}}}", if implementation { "class DataShareHelperImpl : public DataShareHelper { public: int OpenFile(int x) override { return x+1; } };" } else { "" });
-        let (p, a) = build(&[("main.cpp", &source)]);
+        let p = build_program(&[("main.cpp", &source)]);
+        let (_, a) = crate::common::analyze_with_datashare_summary(&p);
         assert_eq!(
             a.call_edges
                 .iter()
@@ -292,7 +298,7 @@ fn ipc_summary_final_metadata_does_not_cross_provider_images() {
     for jobs in [1, 4] {
         let p =
             trace_parse::build_program_with_jobs(root, &PreprocessOptions::new(), jobs).unwrap();
-        let (_, a) = analyze(&p);
+        let (_, a) = crate::common::analyze_with_datashare_summary(&p);
         let mut bridges: Vec<_> = a
             .call_edges
             .iter()
@@ -360,4 +366,33 @@ fn sdk_photo_asset_proxy_never_becomes_the_camera_wrapper_or_closes_a_cycle() {
         must_not_have_edge(&p, &a, adapter, wrapper),
         "the SDK receiver must not close a false adapter/wrapper cycle"
     );
+}
+
+#[test]
+fn unresolved_arrow_receiver_is_retained_in_linking_facts() {
+    let p = build_program(&[(
+        "main.cpp",
+        "class Remote { public: void *operator->(); }; int use(Remote &p) { return p->Run(1); }",
+    )]);
+    assert!(
+        p.symbols
+            .call_sites
+            .iter()
+            .any(|c| c.callee_name == "p->Run"),
+        "{:?}",
+        p.symbols
+            .call_sites
+            .iter()
+            .map(|c| (&c.callee_name, &c.receiver_class))
+            .collect::<Vec<_>>()
+    );
+    let facts = trace_ir::LinkingFacts::collect(&p, true);
+    let call = facts
+        .calls
+        .iter()
+        .find(|c| c.name == "Remote::Run")
+        .expect("normalized arrow member");
+    assert_eq!(call.receiver, "Remote");
+    assert!(!call.implicit);
+    assert!(call.callee.is_none());
 }

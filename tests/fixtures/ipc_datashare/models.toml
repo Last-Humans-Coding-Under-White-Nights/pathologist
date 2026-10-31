@@ -1,0 +1,4 @@
+# Optional fallback when the DataShare framework sources are unavailable.
+[[model]]
+name = "OHOS::DataShare::DataShareHelper::OpenFile"
+effects = [{ kind = "ipc", target = "OHOS::DataShare::DataShareStub::OpenFile" }]
