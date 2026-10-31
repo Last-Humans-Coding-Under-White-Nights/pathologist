@@ -54,6 +54,7 @@ pub struct UnitIndex {
     /// Per-unit declared `operator->` returns (C++), merged in every mode.
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<trace_ir::TemplateReturn>>>,
+    pub pointer_getter_definitions: BTreeSet<String>,
     /// Per-unit class template parameters and dependent bases (C++).
     pub class_templates: BTreeMap<String, trace_ir::ClassTemplate>,
     /// Those this unit defines in an anonymous namespace, by unit-local file.
@@ -458,6 +459,9 @@ fn merge_unit(
             }
         }
     }
+    program
+        .pointer_getter_definitions
+        .extend(unit.pointer_getter_definitions.iter().cloned());
     for cls in &unit.final_classes {
         program.mark_class_final(cls);
     }

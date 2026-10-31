@@ -61,9 +61,9 @@ pub enum FlowConstraint {
     StringConst { dst: VarId, value: String },
     /// Explicit null pointer value. No abstract location or pointee is created.
     NullPointer { dst: VarId },
-    /// `sp->field`: step through a smart pointer's overloaded `->`/`*`. `src`
-    /// holds the wrapper value; `dst` is the pointee-typed receiver, and its
-    /// type is the one the solver admits locations by. See
+    /// Step through a smart pointer's overloaded `->`/`*` or modeled `get`.
+    /// `src` holds the wrapper value; `dst` is a pointee-typed receiver or
+    /// raw pointer, whose pointee type filters the admitted locations. See
     /// `docs/ANALYSIS.md`, "Smart-pointer unwrap".
     UnwrapPointer { dst: VarId, src: VarId },
 }

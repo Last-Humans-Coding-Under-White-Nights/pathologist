@@ -8359,6 +8359,581 @@ fn unwraps_in(program: &Program, func: &str) -> Vec<(trace_ir::VarId, trace_ir::
         .collect()
 }
 
+analyzed_fixture!(cpp_pointer_get);
+
+#[test]
+fn pointer_get_resolves_callbacks_and_keeps_external_calls() {
+    let (p, a) = cpp_pointer_get();
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    for caller in [
+        "control",
+        "extracted",
+        "unique",
+        "qualified",
+        "reference",
+        "unique_reference",
+        "pointer_receiver",
+        "dereferenced_receiver",
+        "const_pointee",
+        "field",
+        "returned_wrapper",
+        "assignment",
+        "use_returns",
+        "take_pointer",
+        "take_reference",
+        "take_value",
+        "Queue::ProcessUnorderedEvent",
+        "Repacked::Repacked",
+    ] {
+        let targets: std::collections::BTreeSet<_> = a
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(p, e.caller) == caller
+                    && e.resolution == trace_analysis::ResolutionKind::Indirect
+            })
+            .map(|e| fn_name(p, e.callee))
+            .collect();
+        assert_eq!(
+            targets,
+            std::collections::BTreeSet::from(["alpha".into()]),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(p, a, "extracted", "std::shared_ptr::get"));
+    assert!(has_any_edge(p, a, "unique", "std::unique_ptr::get"));
+    assert!(has_any_edge(p, a, "hiview_repack", "Repacked::Repacked"));
+    assert!(unwraps_in(p, "user_get").is_empty());
+    assert!(unwraps_in(p, "nonzero").is_empty());
+    assert!(unwraps_in(p, "custom_get").is_empty());
+}
+
+#[test]
+fn pointer_get_preserves_address_and_dereference_depth() {
+    use trace_ir::FlowConstraint as F;
+    let (p, _) = cpp_pointer_get();
+    let owner = common::only_function(p, "arguments");
+    let call_arg = |name: &str| {
+        p.symbols
+            .call_sites
+            .iter()
+            .find(|s| s.caller == owner && s.callee_name == name)
+            .unwrap()
+            .var_args[0]
+            .1
+    };
+    let pointer = call_arg("take_pointer");
+    let reference = call_arg("take_reference");
+    let value = call_arg("take_value");
+    let unwraps = unwraps_in(p, "arguments");
+    assert_eq!(unwraps.len(), 3, "one extraction per call");
+    assert!(unwraps.iter().any(|&(_, dst)| dst == pointer));
+    assert!(unwraps.iter().any(|&(_, dst)| dst == reference));
+    assert!(
+        flows_in(p, "arguments").any(|f| matches!(*f, F::Load { dst, src }
+        if dst == value && unwraps.iter().any(|&(_, result)| result == src)))
+    );
+    for caller in ["return_raw", "return_cast", "hdf_cast"] {
+        let unwraps = unwraps_in(p, caller);
+        assert_eq!(unwraps.len(), 1, "{caller}");
+        let fid = common::only_function(p, caller);
+        assert!(
+            p.fn_returns[&fid].contains(&trace_ir::ReturnFlow::Copy { src: unwraps[0].1 }),
+            "{caller}"
+        );
+        assert_eq!(
+            flows_in(p, caller)
+                .filter(|f| matches!(f, F::Load { .. }))
+                .count(),
+            usize::from(caller == "hdf_cast"),
+            "{caller}: only the reference receiver is loaded"
+        );
+        assert!(
+            !flows_in(p, caller).any(|f| matches!(f, F::NewHeap { .. })),
+            "{caller}"
+        );
+    }
+    let raw = common::local_variable(p, "assignment", "raw");
+    let assigned = common::local_variable(p, "assignment", "assigned");
+    assert_eq!(
+        unwraps_in(p, "assignment")
+            .iter()
+            .map(|&(_, dst)| dst)
+            .collect::<Vec<_>>(),
+        [raw, assigned]
+    );
+    assert!(flows_in(p, "chained")
+        .any(|f| matches!(f, F::GepField { field_name, .. } if field_name == "next")));
+    for (caller, callee) in [
+        ("hiview_queue", "Queue::ProcessUnorderedEvent"),
+        ("hiview_repack", "Repacked::Repacked"),
+    ] {
+        let owner = common::only_function(p, caller);
+        let result = unwraps_in(p, caller)[0].1;
+        let site = p
+            .symbols
+            .call_sites
+            .iter()
+            .find(|s| s.caller == owner && s.callee_name == callee)
+            .unwrap();
+        assert!(
+            site.var_args.contains(&(1, result)),
+            "{caller}: the reference argument takes the extracted address"
+        );
+    }
+}
+
+#[test]
+fn pointer_get_evaluates_receiver_values_once() {
+    use trace_ir::FlowConstraint as F;
+    let (p, _) = cpp_pointer_get();
+    for caller in [
+        "extracted",
+        "unique",
+        "qualified",
+        "reference",
+        "field",
+        "returned_wrapper",
+    ] {
+        // extracted also has an arrow store, which has its own unwrap.
+        let expected = if caller == "extracted" { 2 } else { 1 };
+        assert_eq!(unwraps_in(p, caller).len(), expected, "{caller}");
+    }
+    for caller in ["reference", "field"] {
+        let src = unwraps_in(p, caller)[0].0;
+        assert!(
+            flows_in(p, caller).any(|f| matches!(*f, F::Load { dst, .. } if dst == src)),
+            "{caller}"
+        );
+    }
+    assert_eq!(
+        flows_in(p, "returned_wrapper")
+            .filter(|f| matches!(f, F::CallReturn { callee_name, .. } if callee_name == "wrapper"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pointer_get_filters_wrapper_and_incompatible_storage_without_allocating() {
+    let (p, _) = cpp_pointer_get();
+    let (pag, a) = trace_analysis::analyze_with_options(
+        p,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for name in ["filtered", "erased"] {
+        let raw = common::local_variable(p, "concrete_alias", name);
+        let targets: Vec<_> = a.points_to[&pag.var_node[&raw]]
+            .iter()
+            .map(|id| pag.locations[id.0 as usize].desc.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            ["concrete"],
+            "{name}: only the compatible stored address survives"
+        );
+    }
+    let raw = common::local_variable(p, "hdf_alias", "raw");
+    let targets: Vec<_> = a.points_to[&pag.var_node[&raw]]
+        .iter()
+        .map(|id| pag.locations[id.0 as usize].desc.as_str())
+        .collect();
+    assert_eq!(
+        targets,
+        ["config"],
+        "HDF: extraction and cast return preserve a derived object's address"
+    );
+    assert!(!flows_in(p, "concrete_alias")
+        .any(|f| matches!(f, trace_ir::FlowConstraint::NewHeap { .. })));
+}
+
+#[test]
+fn pointer_get_loads_reference_returned_receivers() {
+    for wrapper in ["shared_ptr", "unique_ptr"] {
+        let source = format!(
+            r#"
+namespace std {{ template<class T> struct {wrapper} {{ T *get(); T *operator->(); }}; }}
+struct Handler {{ void (*callback)(); }};
+using Ptr = std::{wrapper}<Handler>;
+Handler concrete;
+Ptr &ref(Ptr *p) {{ return *p; }}
+const Ptr &cref(Ptr *p) {{ return *p; }}
+Ptr &&rref(Ptr *p) {{ return static_cast<Ptr&&>(*p); }}
+Ptr *&pref(Ptr **p) {{ return *p; }}
+Ptr value(Ptr *p) {{ return *p; }}
+Ptr &late(Ptr *p);
+struct Source {{ Ptr &member(Ptr *p) {{ return *p; }} }};
+void read() {{
+    Ptr sp = &concrete;
+    Ptr *address = &sp;
+    Source source;
+    Handler *control = sp.get();
+    Handler *through_ref = ref(&sp).get();
+    Handler *through_const_ref = cref(&sp).get();
+    Handler *through_rvalue_ref = rref(&sp).get();
+    Handler *through_pointer_ref = pref(&address)->get();
+    Handler *through_member = source.member(&sp).get();
+    Handler *through_value = value(&sp).get();
+    Handler *through_declaration = late(&sp).get();
+}}
+Ptr &late(Ptr *p) {{ return *p; }}
+"#
+        );
+        let (_dir, p) = build_tree(&[("main.cpp", &source)], default_opts);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let (pag, a) = trace_analysis::analyze_with_options(
+            &p,
+            trace_analysis::AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        );
+        for name in [
+            "control",
+            "through_ref",
+            "through_const_ref",
+            "through_rvalue_ref",
+            "through_pointer_ref",
+            "through_member",
+            "through_value",
+            "through_declaration",
+        ] {
+            let raw = common::local_variable(&p, "read", name);
+            let targets: std::collections::BTreeSet<_> = a
+                .points_to
+                .get(&pag.var_node[&raw])
+                .into_iter()
+                .flatten()
+                .map(|id| pag.locations[id.0 as usize].desc.as_str())
+                .collect();
+            assert_eq!(
+                targets,
+                std::collections::BTreeSet::from(["concrete"]),
+                "{wrapper}: {name}"
+            );
+        }
+        // A value-returning call already holds the pointee and is not loaded again.
+        let value_call = p
+            .symbols
+            .call_sites
+            .iter()
+            .find(|s| s.callee_name == "value")
+            .unwrap();
+        let result = value_call.return_dst.unwrap();
+        assert!(!flows_in(&p, "read")
+            .any(|f| matches!(*f, trace_ir::FlowConstraint::Load { src, .. } if src == result)));
+    }
+}
+
+#[test]
+fn pointer_get_settles_image_owned_global_initializers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("memory.h"), "#pragma once\nstruct Handler { void (*callback)(); };\nextern Handler alternate;\nnamespace std { template<class T> struct shared_ptr { T *get(); T *operator->(); }; }\n").unwrap();
+    std::fs::write(root.join("implementation.cpp"), "#include \"memory.h\"\ntemplate<class T> T *std::shared_ptr<T>::get() { return &alternate; }\n").unwrap();
+    let mut compiles = Vec::new();
+    for image in ["a", "b", "c"] {
+        let definition = if image == "c" {
+            "template<class T> T *std::shared_ptr<T>::get() { return &alternate; }\n"
+        } else {
+            ""
+        };
+        std::fs::write(root.join(format!("{image}.cpp")), format!("#include \"memory.h\"\nHandler concrete; Handler alternate;\n{definition}std::shared_ptr<Handler> p = &concrete;\nHandler *global_{image} = p.get();\nvoid local_{image}() {{ Handler *raw = p.get(); }}\n")).unwrap();
+    }
+    for source in ["a", "b", "c", "implementation"] {
+        compiles.push(serde_json::json!({"directory":root,"file":format!("{source}.cpp"),"output":format!("{source}.o"),"arguments":["c++","-c",format!("{source}.cpp"),"-o",format!("{source}.o")]}));
+    }
+    let links = serde_json::json!([
+        {"directory":root,"output":"a","arguments":["c++","a.o","implementation.o","-o","a"]},
+        {"directory":root,"output":"b","arguments":["c++","b.o","-o","b"]},
+        {"directory":root,"output":"c","arguments":["c++","c.o","-o","c"]}
+    ]);
+    std::fs::write(
+        root.join("compile_commands.json"),
+        serde_json::json!(compiles).to_string(),
+    )
+    .unwrap();
+    std::fs::write(root.join("link_commands.json"), links.to_string()).unwrap();
+    let p = build_program(root, &default_opts(root)).unwrap();
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    let (pag, a) = trace_analysis::analyze_with_options(
+        &p,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (image, expected) in [("a", "alternate"), ("b", "concrete"), ("c", "alternate")] {
+        for var in [
+            common::only_variable(&p, &format!("global_{image}")),
+            common::local_variable(&p, &format!("local_{image}"), "raw"),
+        ] {
+            assert!(p.symbols.variable(var).target.is_some());
+            let targets: std::collections::BTreeSet<_> = a
+                .points_to
+                .get(&pag.var_node[&var])
+                .into_iter()
+                .flatten()
+                .map(|id| pag.locations[id.0 as usize].desc.as_str())
+                .collect();
+            assert_eq!(
+                targets,
+                std::collections::BTreeSet::from([expected]),
+                "{image}: {}",
+                p.symbols.variable(var).name
+            );
+        }
+    }
+}
+
+#[test]
+fn pointer_get_interns_isolated_reference_and_pointer_receivers() {
+    for wrapper in ["shared_ptr", "unique_ptr"] {
+        for (parameter, receiver) in [
+            (format!("const std::{wrapper}<Handler> &p"), "p"),
+            (format!("std::{wrapper}<Handler> *p"), "(*p)"),
+            (format!("std::{wrapper}<Handler> *p"), "p->"),
+        ] {
+            let call = if receiver == "p->" {
+                "p->get()".to_string()
+            } else {
+                format!("{receiver}.get()")
+            };
+            let source = format!("namespace std {{ template<class T> struct {wrapper} {{ T *get() const; T *operator->(); }}; }}\nstruct Handler {{ void (*callback)(); }};\nvoid read({parameter}) {{ Handler *raw = {call}; }}\n");
+            let (_dir, p) = build_tree(&[("main.cpp", &source)], default_opts);
+            assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+            let raw = common::local_variable(&p, "read", "raw");
+            assert_eq!(unwraps_in(&p, "read").len(), 1, "{wrapper}: {call}");
+            let site = p
+                .symbols
+                .call_sites
+                .iter()
+                .find(|s| s.callee_name.ends_with("::get"))
+                .unwrap();
+            assert_eq!(site.return_dst, Some(raw), "{wrapper}: {call}");
+        }
+    }
+}
+
+#[test]
+fn pointer_get_later_and_shared_header_definitions_keep_ordinary_returns() {
+    for wrapper in ["shared_ptr", "unique_ptr"] {
+        for layout in ["later", "included", "sibling"] {
+            let shared_header = layout != "later";
+            for dependency in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let lib = root.join("lib");
+                std::fs::create_dir(&lib).unwrap();
+                let declaration = format!("#pragma once\nstruct Handler {{ void (*callback)(); }};\nextern Handler alternate;\nnamespace std {{ template<class T> struct {wrapper} {{ T *get(); T *operator->(); }}; }}\n");
+                let definition = format!(
+                    "template<class T> T *std::{wrapper}<T>::get() {{ return &alternate; }}\n"
+                );
+                let reader = format!("inline Handler *read(std::{wrapper}<Handler> p) {{ Handler *raw = p.get(); return raw; }}\n");
+                std::fs::write(lib.join("memory.h"), &declaration).unwrap();
+                let source = if shared_header {
+                    std::fs::write(
+                        lib.join("implementation.h"),
+                        format!("#pragma once\n#include \"memory.h\"\nextern Handler alternate;\n{definition}"),
+                    )
+                    .unwrap();
+                    let include = if layout == "included" {
+                        "implementation.h"
+                    } else {
+                        "memory.h"
+                    };
+                    std::fs::write(
+                        root.join("reader.h"),
+                        format!("#pragma once\n#include \"lib/{include}\"\n{reader}"),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        root.join("b.cpp"),
+                        "#include \"reader.h\"\n#include \"lib/implementation.h\"\nvoid other() {}\n",
+                    )
+                    .unwrap();
+                    "#include \"reader.h\"\n#include \"lib/implementation.h\"\n".to_string()
+                } else {
+                    // The call appears before the out-of-line implementation.
+                    format!("#include \"lib/memory.h\"\n{reader}{definition}")
+                };
+                std::fs::write(root.join("a.cpp"), format!("{source}\nHandler concrete; Handler alternate;\nvoid run() {{ std::{wrapper}<Handler> p = &concrete; Handler *result = read(p); }}\n")).unwrap();
+                let mut opts = default_opts(root);
+                if dependency {
+                    opts = opts.with_dep(lib);
+                }
+                let p = trace_parse::build_program_with_jobs(root, &opts, 2).unwrap();
+                assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+                let summarized = shared_header && dependency;
+                assert_eq!(
+                    unwraps_in(&p, "read").len(),
+                    usize::from(summarized),
+                    "{wrapper}: header={shared_header}, dep={dependency}"
+                );
+                let (pag, a) = trace_analysis::analyze_with_options(
+                    &p,
+                    trace_analysis::AnalyzeOptions {
+                        retain_points_to: true,
+                        ..Default::default()
+                    },
+                );
+                let raw = common::local_variable(&p, "read", "raw");
+                let targets: std::collections::BTreeSet<_> = a
+                    .points_to
+                    .get(&pag.var_node[&raw])
+                    .into_iter()
+                    .flatten()
+                    .map(|id| pag.locations[id.0 as usize].desc.as_str())
+                    .collect();
+                assert_eq!(
+                    targets,
+                    std::collections::BTreeSet::from([if summarized {
+                        "concrete"
+                    } else {
+                        "alternate"
+                    }]),
+                    "{wrapper}: header={shared_header}, dep={dependency}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pointer_get_dependency_declarations_and_visible_bodies() {
+    for dependency in [false, true] {
+        for implemented in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let lib = root.join("lib");
+            std::fs::create_dir(&lib).unwrap();
+            let body = if implemented {
+                "{ return &alternate; }"
+            } else {
+                ";"
+            };
+            std::fs::write(lib.join("memory.h"), format!(
+                "#pragma once\nstruct Handler {{ void (*callback)(); }};\nextern Handler alternate;\nnamespace std {{\ntemplate<class T> class shared_ptr {{ public: T* get() {body} T* operator->(); }};\ntemplate<class T> class unique_ptr {{ public: T* get() {body} T* operator->(); }};\n}}\n"
+            )).unwrap();
+            std::fs::write(root.join("reader.h"),
+                "#pragma once\n#include \"lib/memory.h\"\ninline Handler *shared(std::shared_ptr<Handler> p) { Handler *raw = p.get(); return raw; }\ninline Handler *unique(std::unique_ptr<Handler> p) { Handler *raw = p.get(); return raw; }\n"
+            ).unwrap();
+            std::fs::write(root.join("a.cpp"),
+                "#include \"reader.h\"\nHandler concrete; Handler alternate;\nvoid run() { std::shared_ptr<Handler> p = &concrete; std::unique_ptr<Handler> u = &concrete; Handler *s = shared(p); Handler *t = unique(u); }\n"
+            ).unwrap();
+            std::fs::write(
+                root.join("b.cpp"),
+                "#include \"reader.h\"\nvoid other() {}\n",
+            )
+            .unwrap();
+            let mut opts = default_opts(root);
+            if dependency {
+                opts = opts.with_dep(lib);
+            }
+            let p = trace_parse::build_program_with_jobs(root, &opts, 2).unwrap();
+            assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+            let (pag, a) = trace_analysis::analyze_with_options(
+                &p,
+                trace_analysis::AnalyzeOptions {
+                    retain_points_to: true,
+                    ..Default::default()
+                },
+            );
+            let summarized = dependency || !implemented;
+            for caller in ["shared", "unique"] {
+                assert_eq!(
+                    unwraps_in(&p, caller).len(),
+                    usize::from(summarized),
+                    "{caller}: dep={dependency}, body={implemented}"
+                );
+                let raw = common::local_variable(&p, caller, "raw");
+                let targets: Vec<_> = a.points_to[&pag.var_node[&raw]]
+                    .iter()
+                    .map(|id| pag.locations[id.0 as usize].desc.as_str())
+                    .collect();
+                assert_eq!(
+                    targets,
+                    [if summarized { "concrete" } else { "alternate" }],
+                    "{caller}: dep={dependency}, body={implemented}"
+                );
+            }
+            if dependency {
+                assert!(p
+                    .symbols
+                    .functions
+                    .iter()
+                    .filter(|f| f.name.ends_with("::get"))
+                    .all(|f| !f.is_defined));
+                assert!(p
+                    .symbols
+                    .call_sites
+                    .iter()
+                    .all(|s| !p.is_dep_file(s.span.file)));
+            }
+        }
+    }
+}
+
+#[test]
+fn pointer_get_definition_in_another_image_does_not_suppress_extraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("memory.h"), "#pragma once\nstruct Handler { void (*callback)(); };\nextern Handler alternate;\nnamespace std { template<class T> struct shared_ptr { T *get(); T *operator->(); }; }\n").unwrap();
+    let mut compiles = Vec::new();
+    let mut links = Vec::new();
+    for image in ["a", "b"] {
+        let definition = if image == "a" {
+            "template<class T> T *std::shared_ptr<T>::get() { return &alternate; }\n"
+        } else {
+            ""
+        };
+        std::fs::write(root.join(format!("{image}.cpp")), format!("#include \"memory.h\"\nHandler concrete; Handler alternate;\nvoid read_{image}() {{ std::shared_ptr<Handler> p = &concrete; Handler *raw = p.get(); }}\n{definition}")).unwrap();
+        compiles.push(serde_json::json!({"directory":root,"file":format!("{image}.cpp"),"output":format!("{image}.o"),"arguments":["c++","-c",format!("{image}.cpp"),"-o",format!("{image}.o")]}));
+        links.push(serde_json::json!({"directory":root,"output":image,"arguments":["c++",format!("{image}.o"),"-o",image]}));
+    }
+    std::fs::write(
+        root.join("compile_commands.json"),
+        serde_json::json!(compiles).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("link_commands.json"),
+        serde_json::json!(links).to_string(),
+    )
+    .unwrap();
+    let p = build_program(root, &default_opts(root)).unwrap();
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    let (pag, a) = trace_analysis::analyze_with_options(
+        &p,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (caller, expected) in [("read_a", "alternate"), ("read_b", "concrete")] {
+        let raw = common::local_variable(&p, caller, "raw");
+        let targets: std::collections::BTreeSet<_> = a
+            .points_to
+            .get(&pag.var_node[&raw])
+            .into_iter()
+            .flatten()
+            .map(|id| pag.locations[id.0 as usize].desc.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            std::collections::BTreeSet::from([expected]),
+            "{caller}"
+        );
+        assert_eq!(
+            unwraps_in(&p, caller).len(),
+            usize::from(caller == "read_b")
+        );
+    }
+}
+
 /// Whether the lowered facts carry a value from `from` to `to`, following
 /// copies, unwraps, field projections and loads forward.
 fn value_reaches(program: &Program, from: trace_ir::VarId, to: trace_ir::VarId) -> bool {

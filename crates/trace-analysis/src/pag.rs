@@ -275,9 +275,17 @@ impl Pag {
                     let PagNodeKind::Var(receiver) = self.nodes[c.dst.0 as usize].kind else {
                         unreachable!("an unwrap's destination is its receiver variable");
                     };
-                    let pointee = program
-                        .types
-                        .tag_identity(program.symbols.variable(receiver).type_id);
+                    let type_id = program.symbols.variable(receiver).type_id;
+                    let pointee = match program.types.get(type_id).desc.as_ref() {
+                        // `get()` writes a raw pointer; overloaded arrows
+                        // write a receiver typed as the class itself.
+                        trace_ir::TypeDesc::Ptr(inner) => program
+                            .types
+                            .tag_declaration(inner)
+                            .unwrap_or_else(|| program.types.resolve_type_id(inner)),
+                        _ => type_id,
+                    };
+                    let pointee = program.types.tag_identity(pointee);
                     self.indices
                         .unwrap_src
                         .entry(c.src)

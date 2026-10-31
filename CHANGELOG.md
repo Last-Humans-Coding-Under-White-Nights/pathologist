@@ -4,6 +4,24 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Preserve pointee aliases through owning-pointer `get()` (#247)
+
+Bodyless `std::shared_ptr<T>::get()` and `std::unique_ptr<T>::get()` retain
+the stored pointee address across assignments, arguments, dereferences,
+returns and chained field accesses. The existing filtered `unwrap` flow
+excludes wrapper storage and incompatible objects without allocating a new
+object. Qualified calls, field-held wrappers, pointer/reference receivers
+and wrappers returned by value or reference are covered.
+
+Visible getter implementations keep their ordinary return behavior,
+including later definitions, shared headers and file-scope initializers
+owned by a link image. Excluded dependency bodies remain declaration-only.
+Unrelated `get` methods and calls with arguments receive no summary.
+
+Rules: [smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap).
+Measurements and remaining corpus limits:
+[owning-pointer extraction](docs/EVAL_REPORT.md#owning-pointer-get-aliases--2026-10-31).
+
 ### Retry temporarily busy compiler probes
 
 Compiler include/predefine discovery retries `ETXTBSY` startup failures within

@@ -1,5 +1,108 @@
 # Evaluation Report
 
+## Owning-pointer `get()` aliases — 2026-10-31
+
+Issue #247: accessing a callback through `p.get()->callback` lost the
+pointee alias that `p->callback` retained. The reduced bodyless-library
+fixture now resolves both callback sites to exactly `alpha`, excludes
+`unrelated`, and reports no diagnostics. Semantics and supported forms are
+defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap).
+
+### Corpus comparison
+
+Compare fresh release analyses built from parent `d23d70e` and the completed
+fix, using default minimal exports and `TRACE_SOLVE_BUDGET_POPS=800000`.
+The clean checkouts are pinned in `scripts/eval_expected.json`: HDF
+`cdc75a20bb8f`, HiView `92408e2072bd`, and camera `8ffd69dcd47f`.
+Named call targets, function counts, diagnostics, call-edge resolution
+counts, and existing dispatch/calibration probes are unchanged.
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | unwrap edges | 50 | 54 |
+| HDF | load edges | 10410 | 10415 |
+| HDF | GEP edges | 29310 | 29311 |
+| HiView | unwrap edges | 486 | 526 |
+| HiView | load edges | 3065 | 3069 |
+| HiView | copy edges | 17809 | 17925 |
+| HiView | argument-flow rows | 31924 | 32048 |
+| camera | unwrap edges | 2466 | 2620 |
+| camera | load edges | 14860 | 14866 |
+| camera | GEP edges | 27036 | 27042 |
+
+HiView gains exactly 124 argument-flow rows, with none removed after matching
+source positions and named actual/formal variables (synthetic variable names
+are normalized). Of these, 109 carry extracted event pointers into existing
+`OnEventListeningCallback` candidates; the remaining 15 feed `PipelineEvent`
+constructors and event-processing helpers. No additional callee is inferred.
+The HiView expectation center moves to 32048 with its tolerance unchanged at
+120. HDF and camera argument-flow totals remain 72106 and 57894.
+
+### Production sites and limits
+
+- HDF `framework/tools/hc-gen/src/ast.cpp:493`, `:762`, and `:901` each
+  gain a wrapper-reference load and an unwrap into the `get()` result
+  returned through a named cast. The existing return copies into callers
+  remain. `:413` supplies the fourth new unwrap. A production probe checks
+  all three cast returns and their outgoing return copies.
+- HiView `base/event_dispatch_queue.cpp:87` gains an unwrap for `event.get()`
+  in the submitted lambda. Recovering this value does not establish the
+  captured `queuePtr` receiver's target or a task/bind model.
+- HiView `base/event_loop.cpp:191` gains an unwrap for `handler.get()`;
+  execution of the bound member remains the separate bound-callable issue.
+  A probe checks extraction at this site and at the submitted event site.
+- HiView
+  `plugins/performance/xperf_service/services/server/src/xperf_service_server.cpp:39`
+  gains an unwrap after `DelayedSingleton<XperfServiceServer>::GetInstance()`.
+  On-demand wrapper interning also materializes its receiver/result
+  temporaries and their flow nodes. This extraction has a dedicated probe.
+- HiView `base/include/pipeline.h:92` remains unresolved: `base` comes from
+  a `static_pointer_cast<EventType>` in an uninstantiated template, so the
+  index cannot name the held class. The reduced concrete factory test
+  verifies extraction/dereference into a constructor's reference parameter;
+  it does not claim to instantiate the production template.
+
+### Regression coverage and validation
+
+The `cpp_pointer_get` fixture and isolated integration tests cover both
+owning wrappers, bodyless declarations and excluded dependency bodies,
+qualified calls, fields, assignments, raw and dereferenced arguments,
+chained accesses, and cast/return flow. Wrapper storage and incompatible
+objects are filtered even when assigning to `void *`; extraction adds no
+allocation. User-defined `get` methods and calls with arguments are negative
+controls. The concrete HDF-style test explicitly binds a wrapper reference
+through a dereferenced wrapper pointer; general class-value to reference
+argument binding remains an independent limitation.
+
+Isolated reference-only/pointer-only parameters verify on-demand type
+interning without a by-value declaration masking the problem. Returned
+wrappers cover references, const references, rvalue references, references
+to pointers, member calls, and declarations preceding definitions. A
+value-returning control checks that it receives no extra load.
+
+Executable getter tests verify only `alternate` is returned, excluding the
+wrapper's unrelated modeled pointee, for later out-of-line definitions,
+type-only shared-header imports, and sibling headers. File-scope and local
+extractions agree when the implementation is in another TU in the same
+image or is already visible. An independent image with a bodyless getter
+keeps its extraction summary. Dependency bodies contribute declarations
+without executable flows.
+
+All 2,601 workspace tests pass. Fresh analyses pass all 115 corpus checks
+with both jobs=1 and jobs=8. All 34 logical SQLite relations match exactly
+between those job counts, excluding producer/run metadata with
+`scripts/compare_analysis_databases.py`. The final reference-return and
+global-initializer corrections leave the preceding corpus exports unchanged.
+Formatting and `git diff --check` pass.
+
+To compare job counts for any pinned corpus, using the current release build:
+
+```bash
+TRACE_SOLVE_BUDGET_POPS=800000 cargo run -p trace-cli --release -- analyze <corpus> --jobs 1 -o /tmp/get-j1.db
+TRACE_SOLVE_BUDGET_POPS=800000 cargo run -p trace-cli --release -- analyze <corpus> --jobs 8 -o /tmp/get-j8.db
+python3 scripts/compare_analysis_databases.py /tmp/get-j1.db /tmp/get-j8.db
+```
+
 ## Unevaluated operands: #249 — 2026-10-28
 
 Calls in an operand the language never evaluates are tagged at lowering

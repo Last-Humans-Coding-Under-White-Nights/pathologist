@@ -619,6 +619,10 @@ pub struct Program {
     /// Class -> full member name -> return substitutions. Ordered keys keep
     /// header merges deterministic; lookups never scan unrelated functions.
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<TemplateReturn>>>,
+    /// Owning-pointer classes with an executable zero-argument `get`.
+    /// Settled before expression lowering and kept through type-only imports;
+    /// dependency bodies are excluded. See "Smart-pointer unwrap" in ANALYSIS.md.
+    pub pointer_getter_definitions: BTreeSet<String>,
     /// Class template name -> its parameters and the bases that mention them.
     /// Ordered keys keep header merges deterministic.
     pub class_templates: BTreeMap<String, ClassTemplate>,

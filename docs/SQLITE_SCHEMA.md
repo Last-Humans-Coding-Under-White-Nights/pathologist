@@ -601,9 +601,9 @@ Edge kinds:
   flow constraints that survived solving (including param copies wired by
   the solver). `dlsym` is the symbol-lookup model: string constants in the
   name argument become function locations on the return destination.
-- `unwrap` — a smart pointer's overloaded `->`/`*` (`sp->field`): the
-  wrapper value flows into the pointee-typed receiver the field access
-  continues from. Only pointee-compatible locations cross it; see
+- `unwrap` — a smart pointer's overloaded `->`/`*` (`sp->field`) or modeled
+  owning-pointer `get()`: the wrapper value flows into a pointee-typed
+  receiver or raw-pointer result. Only pointee-compatible locations cross it; see
   [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap).
 - `points_to` — implicit var → storage-location edge derived from the final
   var→location map.
