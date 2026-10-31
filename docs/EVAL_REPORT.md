@@ -14873,3 +14873,576 @@ namespace imports, declared/dependency wrappers, test-directory renaming,
 shared senders, pure-virtual senders, independent provider images with different
 final metadata, one/four-job determinism, and merge reachability with NULL IPC
 source call sites.
+
+## Cross-repository DataShare IPC linking — 2026-10-29
+
+Two independent branches start at `609e7cb`:
+
+- `fix/datashare-ipc-summary`, commit `4ad7f8b`, adds a configurable framework
+  summary and its DataShare `OpenFile` default. Its media-only validation is
+  recorded on that branch under "Media-library DataShare file-open reachability".
+- `feat/cross-repo-ipc-linking` exports optional linking facts and reconstructs
+  member and IPC edges during merge, with no DataShare-specific model. Both
+  branches retain the same smart-pointer construction and undeclared-receiver
+  fixes, so the comparison isolates how the framework boundary is represented.
+
+The clean source checkouts were media library
+`ad09a5f888ed78c2c46f5c218fa144ef6774e8e9` and DataShare
+`560c5cdadf08b4beeb691e93d70ff32cc2dca8bd`. Each was indexed separately with
+`--jobs 8 --ignore-logging`, without SDK headers, dependency roots, system
+includes, or compilation commands. Reproduction after a release build:
+
+```bash
+cargo build --release -p trace-cli -p trace-merge
+target/release/trace analyze ~/multimedia_media_library --jobs 8 \
+  --ignore-logging -o /tmp/media-cross-ipc-final.db
+target/release/trace analyze ~/distributeddatamgr_data_share --jobs 8 \
+  --ignore-logging -o /tmp/datashare-cross-ipc-final.db
+target/release/trace-merge /tmp/media-cross-ipc-final.db \
+  /tmp/datashare-cross-ipc-final.db -o /tmp/media-cross-ipc-merged-current.db
+```
+
+A function-ID graph walk reaches the defined extension through seven edges:
+
+```text
+OHOS::Media::MediaLibraryManager::OpenAsset
+  -> OHOS::DataShare::DataShareHelperImpl::OpenFile
+  -> OHOS::DataShare::ExtSpecialController::OpenFile
+  -> OHOS::DataShare::DataShareProxy::OpenFile
+  -> OHOS::DataShare::DataShareProxy::OpenFileInner
+  --ipc--> OHOS::DataShare::DataShareStub::OpenFileInner
+  -> OHOS::DataShare::MediaDataShareStubImpl::OpenFile
+  -> OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile
+```
+
+All other edges shown are `direct`; the IPC edge has no source call-site ID.
+Both input solvers converge. The merger adds 13 IPC bridges and 5527 member
+edges beyond ordinary external-symbol relinking. The result has 53,935
+functions and 272,807 edges: 167,853 direct, 1136 indirect, 100,881 external,
+2842 ambiguous and 95 IPC. Those totals include the framework repository and
+are not comparable as precision scores against the smaller media-only graph.
+
+The bare `OpenFile(uri, mode)` inside `DataShareStub::OpenFileInner` was
+originally an external leaf: its inherited declaration was not visible while
+lowering. Retaining the enclosing class of an unresolved bare call lets the
+combined hierarchy recover it. Ordinary new candidates are restricted to
+newly available defining analyses, except these unresolved implicit-member
+calls; original intra-repository edges remain authoritative. Alternatives
+of one source invocation share a source-site identity, avoiding repeated
+new edges when the source already has CHA alternatives. Matching and limits
+are specified in [cross-repository linking](ANALYSIS.md#invariants-and-linking-rules)
+and the [optional metadata contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
+
+| Tradeoff | Framework-summary branch | Cross-repository branch |
+|---|---|---|
+| Required sources | Media library | Media library and DataShare, indexed separately |
+| Boundary evidence | Built-in `DataShareHelper::OpenFile` summary | Indexed proxy, stub, interfaces and hierarchy |
+| Observed root-to-extension path | Three edges, with a helper-to-provider IPC shortcut | Seven edges through framework implementation and IPC helpers |
+| New framework-specific model | Yes | No |
+| Per-repository value-flow queries | Available in analysis DB | Available in original analysis DBs; merged output is a call graph |
+| Missing framework sources | Summary still applies | Framework path cannot be reconstructed |
+| URI/provider selection and cross-process pointer flow | Not modeled | Not modeled |
+
+The summary media database is 168,939,520 bytes. The same media input on the
+cross-repository branch is 218,345,472 bytes, including 49,355,587 bytes of
+versioned JSON linking facts. The DataShare input is 19,083,264 bytes,
+including 6,055,172 bytes of facts. The merged output is 97,923,072 bytes,
+including 55,407,739 bytes of facts; it omits PAG/value-flow tables. This first
+implementation deliberately favors explicit, inspectable metadata over a
+more elaborate compact dictionary encoding. One warm optimized merge took
+5.06 seconds and 525,684 KiB peak RSS on this host, measured with
+`/usr/bin/time`; this is a single-run measurement, not a portable benchmark.
+
+Validation: 2471 workspace tests pass; all 49 merger integration tests pass
+after the lookup-cache optimization; all 106 pinned-corpus checks pass;
+Clippy with warnings denied and formatting/whitespace checks pass. Merger
+regressions cover split client/dispatcher/provider inputs, staged merges,
+overload/nonvirtual/final behavior, IPC across images, ordinary member
+visibility, `--no-ipc`, legacy facts, and rejection of unsupported metadata
+before output replacement. Corpus expectation centers are re-captured for
+the shared C++ fixes; tolerances and all dispatch/calibration probes are
+unchanged. The new HDF indirect target is the `NativeBufferTest008` deleter
+lambda passed through the recovered `SetBufferHandle` call (5087 -> 5088).
+HDF direct/total/argument-flow counts become 49,639 / 78,720 / 72,044;
+hiview 23,292 / 39,272 / 31,926; camera 68,969 / 116,285 / 58,373. Camera gains
+one external function; diagnostics and corpus IPC counts are unchanged.
+
+The general merge approach is preferable when dependencies can be indexed:
+it preserves the actual framework route and applies to other interfaces.
+Summaries remain useful as a deliberate fallback for unavailable frameworks.
+Logs and databases stay under `/tmp` and are not committed. Validation logs:
+`cross-ipc-workspace-final.log`, `cross-ipc-merge-tests-final.log`,
+`cross-ipc-eval-final.log`, `cross-ipc-clippy-final.log`, and
+`media-cross-ipc-current.log`.
+
+### Repeated runtime, memory, storage and coverage comparison
+
+For the follow-up comparison, the saved release binary from `4ad7f8b` and a
+fresh release build of `0c8a92a` were measured with `/usr/bin/time`. Three
+warm-filesystem runs used the same pinned checkouts above, eight jobs, and
+`--ignore-logging`, with no SDK/system includes or compilation database.
+Processes ran sequentially, alternating the order of the two workflows;
+compilation time is excluded. The merge workflow indexes both repositories
+and then merges their databases. It therefore analyzes more source code,
+not merely the same input with a different algorithm.
+
+| Stage | Median wall time | Wall-time range | Median peak RSS | Median user + system CPU |
+|---|---:|---:|---:|---:|
+| Summary: media analysis/export | 35.69 s | 34.60–44.70 s | 1003.1 MiB | 146.98 s |
+| Merge: media analysis/export | 36.21 s | 36.13–36.44 s | 1012.6 MiB | 147.41 s |
+| Merge: DataShare analysis/export | 2.21 s | 2.11–2.32 s | 115.4 MiB | 5.59 s |
+| Merge: graph reconstruction/export | 4.46 s | 4.16–4.99 s | 513.4 MiB | 4.45 s |
+| Merge: complete serial workflow | 42.80 s | 42.48–43.75 s | 1012.6 MiB | 157.46 s |
+
+Complete-workflow medians are computed from each run's sum of stage times
+and maximum stage RSS, rather than by summing component medians or memory
+peaks. Relative to the summary workflow, median wall time rises about 20%,
+CPU time about 7%, and serial peak RSS about 1%. The summary's second run
+was noticeably slower across indexing, solving and export; these three-run
+single-host measurements establish approximate costs, not a precise speed
+ratio. Neither parallel repository indexing nor cold-filesystem behavior
+was measured.
+
+| Retained artifact | Summary workflow | Merge workflow |
+|---|---:|---:|
+| Media analysis database | 161.11 MiB | 208.23 MiB |
+| DataShare analysis database | — | 18.20 MiB |
+| Merged call-graph database | — | 93.39 MiB |
+| All databases retained | 161.11 MiB | 319.82 MiB |
+
+The media database alone grows about 29%; its raw linking JSON occupies
+47.07 MiB. Retaining all three databases costs about twice the summary's
+disk space. Keeping only the merged database is smaller, but drops the
+original per-repository value-flow/arg-flow inspection capability. Its
+smaller size is not an equal-capability storage improvement. The metadata
+encoding is an implementation cost of this prototype, not an inherent
+requirement to duplicate this many bytes in a cross-repository linker.
+
+Precision and coverage were checked separately from performance:
+
+- Both graphs reach the defined `MediaDataShareExtAbility::OpenFile` from
+  `MediaLibraryManager::OpenAsset`. The summary's shortest path has three
+  edges; the merged graph's has seven and includes the actual helper,
+  controller, proxy, IPC helper and dispatcher functions.
+- The summary's modeled IPC call has one provider definition in the available
+  media tree. The merged dispatch at `DataShareStub::OpenFileInner` retains
+  five defined `OpenFile` targets: the media provider, the framework's
+  provider, and three definitions of `TestDataShareStub::OpenFile` from test
+  sources. These are may-targets; the analysis does not use the URI to select
+  the deployed provider. The larger graph therefore has better framework
+  coverage and path fidelity, but is not proven to have fewer false positives.
+- Projecting reachable defined functions onto media source keys
+  `(qualified name, source file, start line, signature)` gives 3133 for the
+  summary and 3138 for the merge. All 3133 summary keys remain reachable;
+  the five added keys concern `Query` and its media helpers. This is a
+  coverage observation, not a count of confirmed runtime calls.
+- Ordinary media analysis/export counts match on both branches: 143,353
+  direct, 985 indirect and 90,089 external edges, with 185,445 argument-flow
+  rows. The summary adds two IPC shortcut edges. Neither approach runs a
+  combined cross-repository pointer fixpoint or transfers parcel values;
+  merging improves call relationships, not cross-process pointer precision.
+- No labeled runtime call graph was available. Statistical precision,
+  recall, or false-positive percentages cannot be established from these
+  measurements or from aggregate edge counts on differently sized inputs.
+
+The measured choice is consequently: use summaries for missing dependency
+sources and a smaller single-repository result; use separate indexing and
+merge for source-backed framework navigation, accepting extra time,
+metadata storage and conservative provider candidates. Matching build
+metadata and production input selection remain relevant to controlling test
+and configuration noise.
+
+Raw measurements, binary hashes, commands, logs and fresh databases are in
+`/tmp/ipc-approach-benchmark/`: `run.py`, `results.json`, `results.csv`,
+`summary.json`, and the per-stage `.log` / `.time.json` files. The freshly
+measured merged database is 97,927,168 bytes; its extra 4 KiB relative to the
+previous table accompanies different input-path metadata in these benchmark
+outputs, with unchanged graph counts and recovered paths.
+
+### Deduplicated linking metadata — 2026-10-29
+
+The version-1 JSON snapshot is replaced on write by version-2 relational
+linking tables. This change uses no compression library or compressed payload.
+All method/call data still needed by reconstruction is retained, but names,
+receiver classes, origins and JSON type shapes share the existing string
+pool. Equal dispatch queries share a single record. Function names and
+`is_defined` come from the existing functions table; callers come from the
+existing call-sites projection. Fact ordinals retain traversal order.
+The authoritative layout is [Linking metadata](SQLITE_SCHEMA.md#merger-inputs-and-output).
+
+Fresh analyses use the same source revisions and options as the comparison
+above. One warm serial run produced:
+
+| Artifact | Previous JSON layout | Deduplicated layout |
+|---|---:|---:|
+| Media analysis DB | 208.23 MiB | 167.26 MiB |
+| DataShare analysis DB | 18.20 MiB | 13.18 MiB |
+| Merged graph DB | 93.39 MiB | 47.38 MiB |
+| All three retained | 319.82 MiB | 227.81 MiB |
+
+The media database saves 40.97 MiB (19.7%). Compared with the earlier
+161.11 MiB media-only summary database, its additional storage falls from
+47.12 MiB to approximately 6.15 MiB, an approximately 87% reduction in the
+linking overhead. Dedicated linking tables occupy 3.73 MiB and the shared
+strings table grows by 2.41 MiB; excluding that dictionary growth would
+understate the cost of the new layout. The merged database saves about 49%.
+
+In the media input, 147,949 retained call sites refer to 21,114 shared dispatch
+queries instead of repeating full objects. The old snapshot had 148,272
+call facts; 323 referenced sites already omitted from normal call-site export.
+Those facts could never survive merge remapping and are no longer persisted.
+This removes no exported site or reconstructed edge. The merged output stores
+165,894 site mappings and 24,093 shared queries. A class, origin or structured
+parameter shape is stored once in the shared dictionary and referenced by ID.
+
+The seven-edge `OpenAsset` path and all 13 added IPC bridges / 5527 added
+member edges are preserved. SHA-256 comparisons of sorted rows in 31 public
+core tables/views match the previous media, DataShare and merged databases.
+They cover function identities and source spans, call sites/edges, argument
+flow, execution contexts, PAG flow and provenance, and CFG tables. String
+storage IDs and linking-table layouts are intentionally excluded; diagnostics
+and run metadata can name different input/output paths. Merging the old JSON
+inputs into a normalized output yields the same 31 public projections as
+merging the new inputs.
+
+Timing/RSS from this one run (not a new three-run performance comparison):
+
+| Stage | Wall time | Peak RSS |
+|---|---:|---:|
+| DataShare analysis/export | 1.38 s | 111.08 MiB |
+| Media analysis/export | 36.21 s | 1006.64 MiB |
+| Normalized inputs -> normalized merge | 6.34 s | 355.08 MiB |
+| Legacy JSON inputs -> normalized merge | 4.22 s | 355.10 MiB |
+
+The merge peak is below the previous 513.35 MiB median. Reading the normalized
+relations incurs SQL lookup work: the measured normalized-input merge is
+slower than the previous 4.46 s JSON-workflow median, so this storage change
+is not claimed to improve merge latency. It removes repeated data while
+keeping facts directly queryable through SQLite.
+
+Validation: 2474 workspace tests, all 106 pinned-corpus checks, Clippy with
+warnings denied, and formatting/whitespace checks pass. Tests cover query,
+origin and parameter-shape deduplication, logical fact round trips, mixed
+JSON/normalized inputs and staged merges, and malformed normalized references.
+The full merger suite continues to exercise schema compatibility and output
+preservation on invalid inputs. Core schema v8 is unchanged; the independently
+versioned linking format advances to 2 and readers still accept version 1.
+
+Artifacts: `/tmp/ipc-dedup/` contains `run.py`, `verify.py`, per-stage logs and
+`*.time.json`, `verification.json` with per-table hashes, fresh `media.db`,
+`datashare.db`, `merged.db`, and `from-legacy.db`. Workspace, corpus and Clippy
+logs are `/tmp/ipc-dedup-workspace.log`, `/tmp/ipc-dedup-eval.log` and
+`/tmp/ipc-dedup-clippy.log`. None of the databases are committed.
+
+### Merge-only comparison with original master — 2026-10-29
+
+For measurements against current master after the rebase, see
+[the updated comparison](#cross-repository-ipc-after-rebasing-onto-master--2026-10-30).
+
+A separate release build of original master `609e7cb` was compared with
+`a6fde5e` using exactly the same normalized media and DataShare input databases
+from `/tmp/ipc-dedup/`. This isolates the merger; analysis and compilation
+are excluded. Current master had advanced to `29523e8` during the work, but
+its merger, merger dependencies and lockfile are unchanged from `609e7cb`.
+The original source was archived to `/tmp/ipc-master-comparison/source` and
+built into a separate target directory, leaving the active branch untouched.
+Both binaries use the same release profile and compiler. Three warm runs
+alternate binary order and run sequentially under `/usr/bin/time`.
+
+| Merge-only metric | Original master | Current deduplicated reconstruction |
+|---|---:|---:|
+| Median wall time | 3.67 s | 7.91 s |
+| Wall-time range | 3.39–3.75 s | 6.49–8.06 s |
+| Median user + system CPU | 3.45 s | 7.52 s |
+| Median peak RSS | 219.21 MiB | 355.21 MiB |
+| Merged output size | 40.18 MiB | 47.38 MiB |
+| Call edges | 267,267 | 272,807 |
+| IPC edges | 82 | 95 |
+| Reported OpenAsset-to-extension path recovered | No | Yes |
+
+In this paired comparison the current merger takes about 2.2 times as long
+(+4.24 s median), uses about 62% more peak RAM, and writes an approximately
+18% larger output. Original master ignores the optional linking metadata and
+performs ordinary symbol relinking. The current merger also reads and combines
+declaration/dispatch facts, recovers new member targets, detects IPC pairs,
+and retains normalized facts for subsequent merges. Its output adds exactly
+5527 direct member edges and 13 IPC edges; every original-master edge remains.
+The desired seven-edge framework path reaches the defined media extension
+only in the current output. The output-size comparison therefore includes
+additional graph coverage and retained linking capability.
+
+The earlier 4.46 s figure was the experimental JSON-metadata implementation,
+not original master. Likewise the earlier 6.34 s deduplicated result was a
+single run; the table here reports a fresh three-run paired comparison.
+These are single-host timings with observed variation, not portable fixed
+performance guarantees. No cross-repository pointer solver runs in either
+merger.
+
+Artifacts: `/tmp/ipc-master-comparison/` contains the original source/archive,
+release binaries, `setup.json` with binary hashes, `run.py`, `results.json`,
+per-run logs and timing JSON, and `master.db` / `current.db`. The original
+output has no linking metadata. The current output retains version-2 facts.
+
+## Cross-repository IPC after rebasing onto master — 2026-10-30
+
+The documentation-only commit `e66c372` documented a historical comparison
+against `609e7cb`, but its baseline predates the stable merged edge identities
+now on master. This section supersedes the preceding IPC timing and graph-count
+comparisons for the rebased branch. The fresh baseline is master `d23d70e`;
+both release executables were rebuilt with Rust 1.95.0, ThinLTO and one codegen
+unit before measurement.
+
+The branch retains master's general C++ construction and receiver-recovery
+fixes. The default DataShare-specific summary from `62544de` is removed;
+users can still load the same fallback explicitly with `--models`. Rebase
+validation caught an older wrapper-inference block duplicated ahead of master's
+constructor/ADL checks, and duplicate inherited linking call facts in overlapping
+merges. Both are fixed. Reconstructed edges receive stable identities, and a
+new regression checks reordered, staged and overlapping merges. The behavior
+contract is in [linking rules](ANALYSIS.md#invariants-and-linking-rules) and
+[IPC model configuration](ANALYSIS.md#openharmony-ipc-bridges).
+
+### Measurement setup
+
+Media library and DataShare remain clean at
+`ad09a5f888ed78c2c46f5c218fa144ef6774e8e9` and
+`560c5cdadf08b4beeb691e93d70ff32cc2dca8bd`. Analyses use eight jobs and
+`--ignore-logging`, without SDK/system headers, dependency roots or compilation
+commands. The summary-only comparison uses the current executable plus the
+explicit model in `tests/fixtures/ipc_datashare/models.toml`; the source-backed
+workflow uses no model file. Stock master still enables its built-in summary.
+
+Three warm-filesystem runs alternate workflow/binary order. Processes run
+serially, with no builds or tests overlapping. Elapsed time uses Python
+`time.perf_counter()` (monotonic); `/usr/bin/time` supplies user/system CPU and
+peak RSS. The preliminary pass exposed realtime clock adjustments: one GNU
+elapsed result was shorter than the analyzer's own phase timers. Those elapsed
+samples are excluded and all timed workflows were repeated with the monotonic
+clock. The raw preliminary logs remain available for audit. These are local
+measurements with observed variation, not portable performance guarantees.
+
+### Runtime and peak memory
+
+Wall cells show median and observed range in seconds; CPU is median user plus
+system seconds, and RSS is median peak MiB. Each complete workflow's sample is
+the sum of its stage wall/CPU times and maximum stage RSS; aggregate medians
+are computed from those samples.
+
+| Stage/workflow | Wall s (range) | CPU s | Peak RSS MiB |
+|---|---:|---:|---:|
+| Explicit summary: media only | 40.84 (40.41–45.87) | 146.89 | 1060.03 |
+| Master: media analysis/export | 41.56 (39.24–43.57) | 146.87 | 1054.30 |
+| Current: media analysis/export | 40.80 (40.56–43.67) | 147.75 | 1052.29 |
+| Master: DataShare analysis/export | 2.68 (2.65–2.79) | 5.91 | 114.11 |
+| Current: DataShare analysis/export | 2.57 (2.33–2.90) | 5.76 | 113.50 |
+| Master: merge its own exports | 6.14 (5.40–6.37) | 5.80 | 292.07 |
+| Current: reconstruct/export | 9.03 (8.64–9.05) | 8.38 | 442.50 |
+| Master: complete serial workflow | 50.49 (47.31–52.59) | 158.63 | 1054.30 |
+| Current: complete serial workflow | 52.42 (51.53–55.60) | 161.98 | 1052.29 |
+
+The current complete workflow costs 28.4%
+more median wall time than the current media-only explicit-summary workflow,
+while indexing the additional framework sources and reconstructing their graph.
+Against stock master's complete two-repository workflow, median wall time changes
+by +3.8% and CPU by
++2.1%.
+
+### Equal-input merge comparison
+
+Both mergers also receive exactly the same fresh current media/DataShare
+exports, with no summary shortcuts in either input. Analysis and compilation
+are excluded. This isolates ordinary symbol relinking plus stable identities
+on master from the additional member/IPC reconstruction and retained linking
+facts on the branch.
+
+| Merger | Wall s (range) | CPU s | Peak RSS MiB |
+|---|---:|---:|---:|
+| Master | 5.74 (5.25–6.23) | 5.33 | 292.01 |
+| Current | 9.16 (9.13–9.34) | 8.60 | 442.49 |
+
+The additional reconstruction costs 3.42 s
+median elapsed time (1.59× total),
+51.5% more peak RSS,
+and 12.3% more output bytes.
+All original-master edges retain their identities and endpoints. Reconstruction
+adds exactly 5360 direct member edges and 13 IPC edges. Master's equal-input
+output has 266,490 edges, the current output 271,863: 167,047 direct, 1136
+indirect, 100,743 external, 2842 ambiguous and 95 IPC. Both contain 53,956
+functions. Merged outputs and input linking relations pass SQLite
+foreign-key checks.
+
+Only the current equal-input output recovers the seven-edge `OpenAsset` path
+through `DataShareHelperImpl`, `ExtSpecialController`, `DataShareProxy`,
+`DataShareProxy::OpenFileInner`, `DataShareStub::OpenFileInner`,
+`MediaDataShareStubImpl` and the defined `MediaDataShareExtAbility::OpenFile`.
+The explicit-summary media graph instead reaches the extension in three edges.
+The source-backed graph reaches 3119 defined media source keys from `OpenAsset`,
+against 3114 for the explicit summary. All 3114 remain reachable; the five
+added keys are coverage evidence, not confirmed runtime calls. Provider choice
+by URI and cross-process pointer propagation remain outside the model.
+
+### Storage
+
+| Retained artifact | Stock master MiB | Current source-backed MiB |
+|---|---:|---:|
+| Media analysis | 161.12 | 167.27 |
+| DataShare analysis | 12.42 | 13.18 |
+| Merged call graph | 59.26 | 66.50 |
+| All three retained | 232.80 | 246.94 |
+
+The current media-only explicit-summary export is 167.27 MiB;
+it also carries optional linking facts. Retaining all source-backed databases
+costs 47.6% more space than that single
+summary database. Keeping only the merged graph drops per-repository value-flow
+inspection capability. Stable identity metadata is retained in both current
+master and branch merge outputs, so these sizes are not comparable to the
+older pre-identity outputs as an isolated linking-format change.
+
+### Pinned corpus performance and correctness
+
+HDF, hiview and camera use the revisions in `scripts/eval_expected.json`,
+eight jobs, the checker's 800,000-pop budget and normal logging behavior.
+Three paired warm runs alternate master/current order and run after the IPC
+measurements. Every public core projection matches master, including IDs,
+source spans, diagnostics, call edges, argument flow, value-flow provenance
+and execution contexts: 32 projections per corpus. Run metadata, the derived
+snapshot digest and new optional linking relations are excluded from this
+cross-version comparison. Master and the current explicit-summary media
+export likewise match all 32 projections. The DataShare input's core behavior
+is unchanged; the source-backed media input removes only the two optional
+summary edges and their associated handler evidence.
+
+| Corpus / executable | Wall s (range) | CPU s | Peak RSS MiB |
+|---|---:|---:|---:|
+| HDF / master | 9.26 (8.43–10.16) | 20.63 | 274.95 |
+| HDF / current | 9.55 (8.66–12.13) | 21.84 | 272.12 |
+| hiview / master | 4.69 (4.64–6.32) | 11.24 | 191.63 |
+| hiview / current | 4.60 (4.29–6.43) | 11.25 | 192.08 |
+| camera / master | 17.44 (16.91–25.51) | 52.05 | 582.91 |
+| camera / current | 17.94 (17.11–24.23) | 52.00 | 587.67 |
+
+Validation: all 2600 workspace tests pass, including all 61 merger integration
+tests. All 112 pinned-corpus checks pass; saved timed candidate exports are
+also checked against the unchanged master expectations. Clippy with warnings
+denied, formatting and whitespace checks pass. Both real-repository solvers
+converge (431,979 media pops and 24,689 DataShare pops). No combined pointer
+solver runs during merge.
+
+Reproduction after building the two release binaries:
+
+```bash
+python3 scripts/eval_check.py --outdir /tmp/trace-ipc-rebase/eval
+python3 /tmp/trace-ipc-rebase/run_monotonic.py
+python3 /tmp/trace-ipc-rebase/run_corpora.py
+```
+
+Artifacts: `/tmp/trace-ipc-rebase/monotonic/` contains final IPC measurements,
+`summary.json`, `verification.json`, binary hashes in `setup.json`, per-run
+commands/logs and the fresh databases. `/tmp/trace-ipc-rebase/corpus/` contains
+paired corpus measurements, projection hashes and `checks.json`.
+`run.py`, `run_monotonic.py`, `run_corpora.py` and `verify.py` are in the parent
+directory; archived master source/builds and excluded preliminary timings
+remain there too. Validation logs are `/tmp/trace-ipc-rebase-workspace-verified.log`,
+`/tmp/trace-ipc-rebase-eval.log` and `/tmp/trace-ipc-rebase-clippy.log`.
+
+## Cross-repository merger optimization — 2026-10-31
+
+The baseline is `fb76ef2`, including source-backed IPC reconstruction and
+stable edge identities. Fresh release binaries use the same Rust compiler and
+release profile. Inputs are newly generated, independent media-library and
+DataShare exports from the same clean pinned revisions as the preceding
+comparison, with eight jobs, `--ignore-logging` and no model file, SDK headers
+or compilation database. Indexing and compilation are outside the measured
+merge processes.
+
+Profiling identified overlapping copies of input/combined linking facts,
+resolution tables retained into later phases, callback redirection vectors
+built for ordinary calls, and repeated SQLite page lookups. The optimization:
+
+- Moves owned linking facts into the combined set and releases completed
+  resolution/identity catalogs before reconstruction or export.
+- Records callback redirections only for `(input, site, entry)` keys used by
+  retained execution-context rows. A missing edge still preserves its original
+  context entry.
+- Compacts edges in their existing allocation while assigning stable IDs;
+  only additional sender bindings require copies. Identity registration
+  retains the original traversal order.
+- Requests 16 MiB of SQLite page cache per input and 64 MiB for output writing
+  and validation. Input connections close before output writing starts.
+
+The implementation continues to use the shared linking and identity rules;
+see [linking rules](ANALYSIS.md#invariants-and-linking-rules). Temporary phase
+instrumentation was removed before building the final measured executable.
+
+### Paired merge measurements
+
+The committed `scripts/bench_merge.py` runs one warm-up per executable, then
+three serial paired measurements with alternating binary order. Python's
+monotonic clock measures elapsed time; GNU time records CPU and peak RSS.
+No builds, tests or other benchmark workloads overlap the timed processes.
+The table reports medians and observed elapsed ranges. These are local
+warm-filesystem measurements, not fixed performance guarantees.
+
+The flat workload merges the two original exports. The overlapping workload
+merges the baseline flat result with the original media export, exercising
+inherited identities and repeated linking facts.
+
+| Workload / executable | Wall s (range) | CPU s | Peak RSS MiB | Output MiB |
+|---|---:|---:|---:|---:|
+| Flat / before | 10.52 (10.51–11.61) | 10.51 | 442.46 | 66.50 |
+| Flat / optimized | 7.51 (7.21–7.76) | 7.50 | 288.43 | 66.50 |
+| Overlap / before | 11.05 (10.17–11.94) | 11.04 | 576.18 | 67.38 |
+| Overlap / optimized | 9.79 (9.19–10.48) | 9.78 | 377.93 | 67.38 |
+
+Flat merging reduces median elapsed time by 28.6% and
+peak RSS by 34.8%.
+
+Overlapping merging reduces median elapsed time by 11.4% and
+peak RSS by 34.4%.
+
+### Output preservation and validation
+
+All **48 logical output projections** match before and after in both
+workloads, including graph rows, execution contexts, CFG data, retained
+linking relations and inherited identity tables. Run timestamps are excluded
+by the shared comparison helper. The persisted database-content digests are
+also identical within each pair. Output sizes remain unchanged.
+
+Both optimized graphs contain 53,956 functions and 271,863 edges: 167,047
+direct, 1136 indirect, 100,743 external, 2842 ambiguous and 95 IPC. The complete
+seven-edge `OpenAsset` path still reaches the defined media extension through
+the helper, controller, proxy, IPC helper and stub. All IPC edges retain NULL
+source sites, and both outputs pass SQLite foreign-key checks. The overlapping
+case retains additional metadata/diagnostics, so its output is larger than the
+flat result despite identical graph counts.
+
+Validation: **2601 workspace tests** pass, including **62 merger integration
+tests**; Clippy with warnings denied, formatting and whitespace checks pass.
+A new regression preserves an execution context whose callback edge is absent.
+The summary-rebinding regression now requires every one of two reachable
+sender definitions to retain its synthetic IPC edge. Existing staged,
+overlapping, legacy-schema and malformed-input regressions continue to pass.
+
+Reproduction after separately building a baseline `fb76ef2` merger and the
+current release binaries (use separate Cargo target directories when building
+the archived baseline):
+
+```bash
+python3 scripts/bench_merge.py \
+  --baseline target/benchmarks/ipc-opt/before/trace-merge \
+  --candidate target/release/trace-merge \
+  --outdir target/benchmarks/ipc-opt/flat \
+  target/benchmarks/ipc-opt/media.db target/benchmarks/ipc-opt/datashare.db
+python3 scripts/bench_merge.py \
+  --baseline target/benchmarks/ipc-opt/before/trace-merge \
+  --candidate target/release/trace-merge \
+  --outdir target/benchmarks/ipc-opt/overlap \
+  target/benchmarks/ipc-opt/flat/baseline.db target/benchmarks/ipc-opt/media.db
+```
+
+Artifacts are retained under the ignored `target/benchmarks/ipc-opt/` directory.
+Each workload has binary/input SHA-256 hashes and commands in `setup.json`,
+per-run logs and timings, `results.json`, `summary.json`, `comparison.json` and
+both merged databases. The parent contains the source exports and analysis
+logs, `graph-verification.json`, temporary profiling source/logs, the baseline
+source/binary, `workspace-final.log`, `merge-final.log`, and `clippy.log`.

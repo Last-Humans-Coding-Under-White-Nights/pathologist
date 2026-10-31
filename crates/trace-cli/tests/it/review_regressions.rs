@@ -1,7 +1,7 @@
 //! Regressions for declaration recovery and modeled IPC boundaries.
 use crate::common::{has_any_edge, must_not_have_edge};
 use std::fs;
-use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
+use trace_analysis::{AnalysisResult, ResolutionKind};
 use trace_ir::Program;
 use trace_preproc::PreprocessOptions;
 
@@ -14,7 +14,7 @@ fn build(files: &[(&str, &str)]) -> (Program, AnalysisResult) {
     }
     let opts = PreprocessOptions::new().with_include(scratch.path().to_path_buf());
     let p = trace_parse::build_program_with_jobs(scratch.path(), &opts, 1).unwrap();
-    let (_, a) = analyze(&p);
+    let (_, a) = crate::common::analyze_with_datashare_summary(&p);
     (p, a)
 }
 
@@ -256,7 +256,7 @@ fn dependency_declared_wrapper_keeps_its_pointee() {
         .with_include(sdk.clone())
         .with_dep(&sdk);
     let p = trace_parse::build_program(&root, &opts).unwrap();
-    let (_, a) = analyze(&p);
+    let (_, a) = crate::common::analyze_with_datashare_summary(&p);
     for caller in ["OHOS::use", "OHOS::chain"] {
         assert!(has_any_edge(&p, &a, caller, "OHOS::Item::Run"), "{caller}");
     }
@@ -292,7 +292,7 @@ fn ipc_summary_final_metadata_does_not_cross_provider_images() {
     for jobs in [1, 4] {
         let p =
             trace_parse::build_program_with_jobs(root, &PreprocessOptions::new(), jobs).unwrap();
-        let (_, a) = analyze(&p);
+        let (_, a) = crate::common::analyze_with_datashare_summary(&p);
         let mut bridges: Vec<_> = a
             .call_edges
             .iter()

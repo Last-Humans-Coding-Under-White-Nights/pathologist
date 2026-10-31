@@ -2286,6 +2286,30 @@ fn execution_contexts_carry_over_with_remapped_ids() {
     );
 }
 
+#[test]
+fn execution_context_survives_an_absent_callback_edge() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("main.c"), "void *Worker(void *p) { return p; }\nvoid start(void *p) { unsigned long tid; pthread_create(&tid, 0, Worker, p); }\n").unwrap();
+    let input = tmp.path().join("input.db");
+    analyze_repo(&repo, &input);
+    let conn = Connection::open(&input).unwrap();
+    assert!(conn.execute("DELETE FROM call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)", []).unwrap() > 0);
+    trace_db::record_database_identity(&conn).unwrap();
+    drop(conn);
+
+    let output = tmp.path().join("merged.db");
+    merge_into(&[input], &output);
+    let conn = Connection::open(&output).unwrap();
+    let entry: String = conn.query_row("SELECT f.name FROM execution_contexts e JOIN functions f ON f.id=e.entry_fn_id WHERE e.kind='thread'", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        entry, "Worker",
+        "an absent edge keeps the context's original entry"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM call_edges e JOIN functions f ON f.id=e.callee_fn_id WHERE f.name='Worker'"), 0);
+}
+
 /// A callback one repository only declares and another defines: the start
 /// edge is re-linked to the definition, and so is the context it starts,
 /// whose entry would otherwise stay the declaration, with no body behind
@@ -3446,6 +3470,12 @@ fn re_merging_keeps_alternative_sites_one_event() {
     assert_eq!(frames, ["common", "cb_a", "cb_b", "cb_c"]);
 }
 
+fn analyze_datashare_repo(repo: &std::path::Path, db: &std::path::Path) {
+    let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/ipc_datashare/models.toml");
+    analyze_repo_with(repo, db, &["--models".as_ref(), models.as_os_str()]);
+}
+
 const DATASHARE_MEDIA_SOURCE: &str = r#"
 namespace OHOS { namespace DataShare {
 class DataShareHelper { public: int OpenFile(int); };
@@ -3507,6 +3537,8 @@ fn merge_preserves_unresolved_summary_senders_alone_and_with_unrelated_input() {
             ),
         ],
     );
+    assert!(ipc_targets(&Connection::open(&inputs[0]).unwrap()).is_empty());
+    analyze_datashare_repo(&scratch.path().join("media"), &inputs[0]);
     let before = ipc_targets(&Connection::open(&inputs[0]).unwrap());
     assert_eq!(before.len(), 1);
     assert!(before[0].2, "IPC source call site must be NULL");
@@ -3524,7 +3556,7 @@ fn count_reachable_media_stubs(conn: &Connection) -> i64 {
 }
 
 #[test]
-fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
+fn merge_rekeys_summary_ipc_callers_to_all_reachable_sender_definitions() {
     let scratch = tempdir().unwrap();
     let root = scratch.path();
     let media = root.join("media");
@@ -3533,10 +3565,11 @@ fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
     fs::create_dir(&framework).unwrap();
     fs::write(media.join("main.cpp"), DATASHARE_MEDIA_SOURCE).unwrap();
     fs::write(framework.join("helper.cpp"), "namespace OHOS { namespace DataShare { class DataShareProxy { public: int OpenFile(int); }; class DataShareHelper { public: int OpenFile(int); DataShareProxy *proxy_; }; int DataShareHelper::OpenFile(int x) { return proxy_->OpenFile(x); } }}").unwrap();
+    fs::copy(framework.join("helper.cpp"), framework.join("other.cpp")).unwrap();
     let m = root.join("m.db");
     let f = root.join("f.db");
     let out = root.join("out.db");
-    analyze_repo(&media, &m);
+    analyze_datashare_repo(&media, &m);
     analyze_repo(&framework, &f);
     merge_databases(
         &[m, f],
@@ -3549,5 +3582,303 @@ fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
     let c = Connection::open(&out).unwrap();
     assert_eq!(count_reachable_media_stubs(&c), 1);
     let bridges: i64 = c.query_row("SELECT count(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id WHERE e.resolution='ipc' AND e.call_site_id IS NULL AND caller.name='OHOS::DataShare::DataShareHelper::OpenFile' AND caller.is_defined=1", [], |r|r.get(0)).unwrap();
-    assert_eq!(bridges, 1);
+    assert_eq!(
+        bridges, 2,
+        "every reachable sender binding retains the summary"
+    );
+}
+
+fn cross_ipc_fixture(part: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/ipc_cross_repo")
+        .join(part)
+}
+
+fn named_edges(db: &std::path::Path) -> std::collections::BTreeSet<(String, String, String)> {
+    let c = Connection::open(db).unwrap();
+    let edges = c.prepare("SELECT a.name,b.name,e.resolution FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id")
+        .unwrap().query_map([],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+        .collect::<Result<_,_>>().unwrap();
+    edges
+}
+
+#[test]
+fn separate_repositories_restore_ipc_and_virtual_provider_path() {
+    let tmp = tempdir().unwrap();
+    let inputs: Vec<_> = ["app", "proxy", "stub"]
+        .iter()
+        .map(|part| {
+            let db = tmp.path().join(format!("{part}.db"));
+            analyze_repo(&cross_ipc_fixture(part), &db);
+            db
+        })
+        .collect();
+    assert!(inputs
+        .iter()
+        .all(|db| !named_edges(db).iter().any(|(_, _, r)| r == "ipc")));
+    let output = tmp.path().join("all.db");
+    let report = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert!(report.ipc_bridges_added > 0);
+    assert!(report.member_calls_added > 0);
+    let edges = named_edges(&output);
+    for (from, to, resolution) in [
+        (
+            "OHOS::Media::OpenAsset",
+            "OHOS::DataShare::DataShareHelperImpl::OpenFile",
+            "direct",
+        ),
+        (
+            "OHOS::DataShare::DataShareHelperImpl::OpenFile",
+            "OHOS::DataShare::DataShareProxy::OpenFile",
+            "direct",
+        ),
+        (
+            "OHOS::DataShare::DataShareProxy::OpenFileInner",
+            "OHOS::DataShare::DataShareStub::OpenFileInner",
+            "ipc",
+        ),
+        (
+            "OHOS::DataShare::DataShareStub::OpenFileInner",
+            "OHOS::DataShare::MediaDataShareStubImpl::OpenFile",
+            "direct",
+        ),
+        (
+            "OHOS::DataShare::MediaDataShareStubImpl::OpenFile",
+            "OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile",
+            "direct",
+        ),
+    ] {
+        assert!(
+            edges.contains(&(from.into(), to.into(), resolution.into())),
+            "missing {from} -> {to}: {edges:?}"
+        );
+    }
+    let c = Connection::open(&output).unwrap();
+    let invalid: i64 = c
+        .query_row(
+            "SELECT count(*) FROM call_edges WHERE resolution='ipc' AND call_site_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid, 0);
+    let contexts:i64=c.query_row("SELECT count(*) FROM execution_contexts WHERE kind='ipc_handler' AND self_concurrent=1",[],|r|r.get(0)).unwrap();
+    assert!(contexts > 0);
+    // Mix a legacy JSON input with normalized facts; both merges must recover
+    // the same edges, and the staged merge below writes the new layout again.
+    let legacy = Connection::open(&inputs[2]).unwrap();
+    let facts = trace_db::read_linking_facts(&legacy).unwrap().unwrap();
+    legacy
+        .execute(
+            "UPDATE linking_facts SET version=1,data=?1",
+            [serde_json::to_string(&facts).unwrap()],
+        )
+        .unwrap();
+    drop(legacy);
+    let mixed = tmp.path().join("mixed.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: mixed.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(edges, named_edges(&mixed));
+    let stage = tmp.path().join("stage.db");
+    merge_databases(
+        &inputs[1..],
+        &MergeOptions {
+            output: stage.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let nested = tmp.path().join("nested.db");
+    merge_databases(
+        &[inputs[0].clone(), stage],
+        &MergeOptions {
+            output: nested.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(edges, named_edges(&nested));
+}
+
+#[test]
+fn cross_repo_linking_respects_no_ipc_and_legacy_metadata() {
+    let tmp = tempdir().unwrap();
+    let proxy = tmp.path().join("proxy.db");
+    let status = Command::new(trace_cli_bin())
+        .arg("analyze")
+        .arg(cross_ipc_fixture("proxy"))
+        .arg("--no-ipc")
+        .arg("-o")
+        .arg(&proxy)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let stub = tmp.path().join("stub.db");
+    analyze_repo(&cross_ipc_fixture("stub"), &stub);
+    let output = tmp.path().join("merged.db");
+    merge_databases(
+        &[proxy.clone(), stub.clone()],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert!(named_edges(&output).iter().all(|(_, _, r)| r != "ipc"));
+    Connection::open(&proxy)
+        .unwrap()
+        .execute_batch("DROP TABLE linking_facts")
+        .unwrap();
+    let report = merge_databases(
+        &[proxy.clone(), stub.clone()],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.kind == WarningKind::MissingLinkingFacts));
+    Connection::open(&stub)
+        .unwrap()
+        .execute("UPDATE linking_facts SET version=99", [])
+        .unwrap();
+    let before = fs::read(&output).unwrap();
+    assert!(merge_databases(
+        &[proxy, stub],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false
+        }
+    )
+    .is_err());
+    assert_eq!(before, fs::read(output).unwrap());
+}
+
+#[test]
+fn cross_repo_members_keep_overload_nonvirtual_and_final_rules() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = vec![];
+    for (name, source) in [
+        (
+            "base",
+            r#"namespace api {
+            class Base {public: virtual int Run(int x); int Fixed(int x);};
+            class Final final:public Base {public:int Run(int x) override {return x;}};
+            int invoke(Base *p){return p->Run(1);}
+            int fixed(Base *p){return p->Fixed(1);}
+            int final_call(Final *p){return p->Run(1);}
+        }
+        namespace a {int unresolved(Unknown *p){return p->Run(1);}}
+        "#,
+        ),
+        (
+            "derived",
+            r#"namespace api {
+            class Derived:public Base {public:
+                int Run(int x){return x;}
+                int Run(double x){return 0;}
+                int Fixed(int x){return x;}
+            };
+            class BeyondFinal:public Final {public:int Run(int x){return x;}};
+        }
+        namespace a {class Unknown {public:int Run(int x){return x;}};}
+        namespace b {class Unknown {public:int Run(int x){return x;}};}
+        "#,
+        ),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let out = tmp.path().join("out.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: out.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let c = Connection::open(&out).unwrap();
+    let methods:Vec<String>=c.prepare("SELECT f.signature FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions f ON f.id=e.callee_fn_id WHERE a.name='api::invoke' AND f.name='api::Derived::Run'").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(methods.len(), 1, "{methods:?}");
+    assert!(methods[0].contains("int"));
+    let edges = named_edges(&out);
+    assert!(!edges
+        .iter()
+        .any(|(a, b, _)| a == "api::fixed" && b == "api::Derived::Fixed"));
+    assert!(!edges
+        .iter()
+        .any(|(a, b, _)| a == "api::final_call" && b == "api::BeyondFinal::Run"));
+    for target in ["a::Unknown::Run", "b::Unknown::Run"] {
+        assert!(
+            edges
+                .iter()
+                .any(|(a, b, _)| a == "a::unresolved" && b == target),
+            "a declaration in another input must not make a guessed namespace certain"
+        );
+    }
+}
+
+#[test]
+fn cross_repo_ipc_crosses_images_but_member_recovery_requires_link_visibility() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = vec![];
+    for (part, file) in [
+        ("app", "media.cpp"),
+        ("proxy", "client.cpp"),
+        ("stub", "server.cpp"),
+    ] {
+        let repo = tmp.path().join(part);
+        fs::create_dir(&repo).unwrap();
+        fs::copy(cross_ipc_fixture(part).join(file), repo.join(file)).unwrap();
+        fs::write(repo.join("compile_commands.json"),serde_json::json!([
+            {"directory":repo,"file":file,"output":"code.o","arguments":["c++","-c",file,"-o","code.o"]}
+        ]).to_string()).unwrap();
+        fs::write(
+            repo.join("link_commands.json"),
+            serde_json::json!([
+                {"directory":repo,"output":part,"arguments":["c++","code.o","-o",part]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let db = tmp.path().join(format!("{part}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let output = tmp.path().join("all.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let c = Connection::open(&output).unwrap();
+    let ipc:i64=c.query_row("SELECT count(*) FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id WHERE e.resolution='ipc' AND a.target_id!=b.target_id",[],|r|r.get(0)).unwrap();
+    assert!(ipc > 0);
+    let edges = named_edges(&output);
+    assert!(!edges.iter().any(|(a, b, _)| a == "OHOS::Media::OpenAsset"
+        && b == "OHOS::DataShare::DataShareHelperImpl::OpenFile"));
 }

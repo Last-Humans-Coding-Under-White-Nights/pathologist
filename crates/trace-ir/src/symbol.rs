@@ -1635,6 +1635,19 @@ impl SymbolTable {
         self.push_indexed(func)
     }
 
+    /// Restore an already linked external identity without registering it
+    /// again as a declaration. Used by the graph-only linking view; distinct
+    /// source definitions and images must keep their existing IDs.
+    pub fn restore_linking_function(&mut self, func: Function) {
+        debug_assert_eq!(func.linkage, Linkage::External);
+        self.fn_by_name.entry(func.name.clone()).or_insert(func.id);
+        self.externals_by_name
+            .entry(func.name.clone())
+            .or_default()
+            .push(func.id);
+        self.push_indexed(func);
+    }
+
     /// An external selected after context-specific lookup must retain that
     /// result, even beside another overload's production definition.
     pub fn push_context_external_function(&mut self, func: Function) -> FnId {

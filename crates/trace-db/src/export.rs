@@ -105,6 +105,11 @@ pub fn export_to_sqlite(
         export_functions(&conn, program)?;
         export_flow_parameters(&conn, program, &mut strings)?;
         export_call_sites_filtered(&conn, program, analysis, &mut strings)?;
+        crate::write_linking_facts(
+            &conn,
+            &trace_ir::LinkingFacts::collect(program, pag.ipc_enabled),
+            &mut strings,
+        )?;
         export_cfg(&conn, program.cfgs.values().flatten(), &mut strings)?;
         export_call_edges(&conn, analysis, &mut strings)?;
         conn.execute_batch(PROVENANCE_INDEXES_V8)?;

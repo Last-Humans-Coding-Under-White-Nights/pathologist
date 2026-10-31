@@ -48,6 +48,7 @@ fn main() -> Result<()> {
         let mut duplicates = Vec::new();
         let mut without_contexts = Vec::new();
         let mut without_sequencing = Vec::new();
+        let mut without_linking = Vec::new();
 
         for w in &report.warnings {
             match w.kind {
@@ -57,6 +58,7 @@ fn main() -> Result<()> {
                 WarningKind::DuplicateInput => duplicates.push(w),
                 WarningKind::MissingExecutionContexts => without_contexts.push(w),
                 WarningKind::MissingSequencing => without_sequencing.push(w),
+                WarningKind::MissingLinkingFacts => without_linking.push(w),
             }
         }
 
@@ -81,6 +83,9 @@ fn main() -> Result<()> {
             }
         }
 
+        for w in &without_linking {
+            eprintln!("    [no-linking-facts] {}", w.message);
+        }
         for w in &without_contexts {
             eprintln!("    [no-execution-contexts] {}", w.message);
         }

@@ -4,6 +4,7 @@ mod callgraph;
 mod constraints;
 mod contexts;
 mod ipc;
+mod linking;
 mod memory;
 mod pag;
 mod solver;
@@ -16,6 +17,7 @@ pub use constraints::{
 };
 pub use contexts::{strongly_connected_components, ContextStart, ExecutionContext, MultiInstance};
 pub use ipc::detect_ipc_pairs;
+pub use linking::{link_graph_facts, LinkedMember};
 pub use memory::{MemoryAccess, MEMORY_ACCESS_CAP};
 pub use pag::*;
 pub use solver::{
