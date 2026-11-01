@@ -2039,7 +2039,7 @@ are not available in this Linux workspace.
 
 ### Configured multi-command follow-up
 
-The [configured-window review finding](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/pull/212#discussion_r4208745200)
+The [configured-window review finding](https://github.com/LHCWN/pathologist/pull/212#discussion_r4208745200)
 exposes a path the four ordinary corpora do not exercise. On `b4f9b00`, four
 commands reserve 4 × 64 KiB against a fixed 1 MiB budget. Only four source
 families can run at eight jobs, regardless of source size. Larger command
@@ -11861,11 +11861,11 @@ Regression coverage maps to the review findings as follows:
 
 Verified the refs before inspecting code: local `issue-140` HEAD is
 `0457bdbb550408672d62055684217795b1800c8a`; the live GitHub API reports
-[PR #196](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/pull/196)
+[PR #196](https://github.com/LHCWN/pathologist/pull/196)
 open at `cb24452d3cc00881f5114b18d86956f05c5a4c58`. The initial working tree
 was clean. These refs identify the pre-fix snapshots compared in this audit;
 the fixes were subsequently incorporated into the local feature commit by
-amendment. [Issue #140](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/issues/140)
+amendment. [Issue #140](https://github.com/LHCWN/pathologist/issues/140)
 asks for understandable dataflow output with fewer artificial nodes and complex
 tags; it has no additional acceptance checklist or issue comments.
 
