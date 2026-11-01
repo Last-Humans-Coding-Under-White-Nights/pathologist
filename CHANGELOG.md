@@ -4,6 +4,68 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Reconstruct cross-repository IPC and virtual member paths
+
+`trace-merge` combines declarations from independently indexed repositories to
+recover virtual overrides, inherited member calls and proxy-to-stub IPC
+bridges using the analyzer's shared type/hierarchy rules and pure IPC detector.
+New bridges carry IPC-handler execution contexts. Indexing the media library
+and DataShare separately now recovers the complete file-open route
+through the framework helper, controller, proxy and dispatcher to the extension
+ability.
+
+Minimal and full analysis exports retain compact class, method, receiver,
+inheritance and IPC linking facts. Version-3 relational tables share names,
+type shapes, analysis origins and dispatch queries, and retain provider views
+and guessed parameter tags. Version-1 JSON and version-2 tables remain readable
+and can be mixed with the new layout. Exports without linking facts produce
+an incomplete-reconstruction diagnostic; malformed or unsupported metadata is
+rejected before replacing the destination.
+
+Merged outputs retain facts for later merges. Reconstructed edges keep stable
+IDs across reordered, staged and overlapping merges; inherited call facts are
+kept once, preventing duplicate-key failures when an output is merged with an
+original input. Execution contexts retain their original entry when a callback
+edge is absent, and configured IPC summaries follow every reachable sender
+binding. Independent snapshots analyzed at the same root path retain distinct
+linking origins, while repeated snapshots preserve staged-merge deduplication.
+Aliases, template bases and IDL facts are canonicalized, and member recovery
+reuses each target's dependency closure. The completion summary reports added
+IPC bridges and member calls. Documentation covers single-input recovery and
+the limits of inherited execution-context evidence. Selected-overload flags
+control virtual dispatch; unknown candidate arity and targetless callees remain
+possible matches. Missing stub hierarchy targets retain recovered interface
+methods. Unresolved arrow/field members survive fact export and legacy reads,
+and merged call facts follow remapped site order. DataShare models are scoped
+to their fallback regressions, and the cross-repository fixture uses the correct
+extension-ability namespace.
+Provider-specific final boundaries prevent one image from cutting off another
+image's virtual targets, consistently across flat and staged merges. Parameter
+uncertainty survives export and cannot be erased by a namesake class in another
+provider. Recovered definitions share the ordinary linker's weak/strong and
+image selection rules, while defined nonvirtual calls retain their TU binding.
+
+The DataShare `OpenFile` shortcut now requires an explicit `--models` file.
+With framework sources available, separate indexing and merging recover the
+source-backed route; configured summaries remain available for missing sources.
+
+The merger also moves facts instead of copying them, releases completed lookup
+tables sooner, records only needed callback redirections and assigns stable
+edge IDs in the existing edge allocation. Bounded SQLite page caches reduce
+repeated lookups. Provider finality uses indexed source lookups. Paired
+optimization benchmarks preserve all logical output
+projections, including retained linking facts and edge identities. The benchmark
+runner checks for GNU time before opening inputs or starting a merger.
+
+Rules: [Cross-repository reconstruction](docs/ANALYSIS.md#invariants-and-linking-rules)
+and [IPC models](docs/ANALYSIS.md#openharmony-ipc-bridges).
+Storage and compatibility: [Linking metadata](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
+Validation, runtime, memory, storage and coverage:
+[Rebased comparison](docs/EVAL_REPORT.md#cross-repository-ipc-after-rebasing-onto-master--2026-10-30),
+[Merger optimization](docs/EVAL_REPORT.md#cross-repository-merger-optimization--2026-10-31)
+[Dispatch and visibility review](docs/EVAL_REPORT.md#cross-repository-dispatch-and-visibility-review--2026-11-01),
+and [Provider/precedence review](docs/EVAL_REPORT.md#provider-finality-parameter-uncertainty-and-member-precedence--2026-11-01).
+
 ### Retry temporarily busy compiler probes
 
 Compiler include/predefine discovery retries `ETXTBSY` startup failures within
@@ -31,42 +93,29 @@ Rules and scope: [stable merged call-edge IDs](docs/ANALYSIS.md#stable-merged-ca
 Schema: [database identity](docs/SQLITE_SCHEMA.md#database-identity) and
 [merge metadata](docs/SQLITE_SCHEMA.md#merged-identity-metadata).
 
-### Restore DataShare file-open reachability without framework sources
+### Preserve C++ wrapper constructions and undeclared receiver calls
 
-A configurable `ipc` function-model effect connects a bodyless framework
-callee to indexed implementations of a named stub member. The built-in
-DataShare `OpenFile` summary restores the path from `MediaLibraryManager::OpenAsset`
-through `MediaDataShareStubImpl` to the extension ability when only the media
-library is indexed. Smart-pointer functional constructions retain their `auto`
-receiver types, and member calls on undeclared receiver classes retain possible
-definitions across missing namespace imports.
+Smart-pointer functional constructions retain their `auto` receiver types when
+headers are unavailable. Declared constructors and ordinary/argument-dependent
+function lookup take precedence over wrapper inference. Unqualified wrapper
+constructions preserve their canonical namespace and template arguments,
+including custom deleters and dependency-declared pointees; dependent wrapper
+names and unsupported templated owners do not acquire guessed pointee types.
 
-Wrapper inference preserves declared constructor types, including `unique_ptr`
-with a custom deleter, and checks argument-dependent factory declarations before
-guessing a wrapper, retaining subsequent calls on the declared result type.
-Unqualified template constructions retain the declared wrapper's namespace and
-template arguments, including dependency-declared pointees, and exclude
-unrelated namesakes. IPC summaries also retain inherited handlers,
-including final overriders inherited through another virtual-interface branch,
-using the actual defining function for the edge and handler execution context.
-Wrapper guesses reject dependent wrapper names and templated owners. Modeled
-IPC handlers obey the shared declaring-header/test-partition eligibility rules
-across every calling context. Test-exclusive senders retain mocks; callers
-sharing a production sender conservatively share its restrictions. Partition
-opt-out and authoritative cross-image bridges remain supported.
-Virtual senders with indexed overrides use those bodies. Merge redirects retained
-summary callers to every binding still reached, preserving unresolved
-declarations in single-input and unrelated-input merges. Imported unknown types
-retain global qualifiers unless declared scope evidence resolves them relatively.
-Undeclared-receiver recovery uses a class/member index, lexical namespace evidence, compatible
-argument counts and signature-specific TU precedence.
+Calls on undeclared receiver classes retain possible definitions across missing
+namespace imports, together with the unresolved external leaf. Recovery uses a
+class/member index, lexical namespace evidence, compatible argument counts and
+signature-specific translation-unit precedence. Imported unknown types retain
+global qualifiers unless declared scope evidence resolves them relatively.
 
-The summary retains every matching provider and overload; it does not select
-providers by URI or propagate parcel values. An empty same-name model disables
-the summary; `--no-ipc` disables summaries and detected bridges. Rules:
-[IPC bridges](docs/ANALYSIS.md#openharmony-ipc-bridges).
-Validation and re-captured corpus expectations:
-[Evaluation report](docs/EVAL_REPORT.md#media-library-datashare-file-open-reachability--2026-10-29).
+Configured IPC summaries retain inherited handlers and final overriders using
+the actual defining function and execution context. Sender bodies and indexed
+virtual overrides take precedence over summaries. Handler eligibility follows
+the shared declaring-header, image and test-partition rules.
+
+Rules: [C++ constructions](docs/ANALYSIS.md#c-support-first-step),
+[Undeclared receiver classes](docs/ANALYSIS.md#undeclared-receiver-classes)
+and [IPC models](docs/ANALYSIS.md#openharmony-ipc-bridges).
 
 ### Parse GNU visibility attributes before C linkage (#234)
 

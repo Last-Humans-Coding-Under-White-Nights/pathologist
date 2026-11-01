@@ -112,6 +112,8 @@ pub struct Pag {
     /// Detected IPC proxy→stub bridges (proxy method → stub handler).
     /// The solver emits a synthetic call edge for each bridge.
     pub ipc_bridges: Vec<trace_ir::IpcBridge>,
+    /// Retained by exports even when no pair was found in this repository.
+    pub ipc_enabled: bool,
     pub indices: SolverIndices,
 }
 
@@ -129,7 +131,10 @@ impl Pag {
         models: &ModelLookup,
         enable_ipc: bool,
     ) -> Self {
-        let mut pag = Self::default();
+        let mut pag = Self {
+            ipc_enabled: enable_ipc,
+            ..Self::default()
+        };
         pag.build_variables(program);
         pag.build_function_locations(program);
         pag.build_flow_constraints(program, models);

@@ -21,7 +21,7 @@ pub struct IpcBridge {
 
 /// One interface declared by an `.idl` file, with the classes synthesized
 /// for it (docs/ANALYSIS.md, "IDL-generated interfaces").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdlInterface {
     /// HDI stubs hold a separate implementation of `interface`; service-IDL
     /// stubs inherit it. Pairing searches interface implementations only for
@@ -38,7 +38,7 @@ pub struct IdlInterface {
     pub methods: Vec<IdlMethod>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdlMethod {
     pub name: String,
     pub ipccode: Option<u32>,

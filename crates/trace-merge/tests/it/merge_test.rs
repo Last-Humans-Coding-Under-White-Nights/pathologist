@@ -825,6 +825,7 @@ fn test_cli_trace_merge() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("merge complete"));
     assert!(stderr.contains("cross-repo resolved"));
+    assert!(stderr.contains("0 IPC bridges and 0 member calls reconstructed"));
     assert!(db_out.exists());
 }
 
@@ -2286,6 +2287,30 @@ fn execution_contexts_carry_over_with_remapped_ids() {
     );
 }
 
+#[test]
+fn execution_context_survives_an_absent_callback_edge() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("main.c"), "void *Worker(void *p) { return p; }\nvoid start(void *p) { unsigned long tid; pthread_create(&tid, 0, Worker, p); }\n").unwrap();
+    let input = tmp.path().join("input.db");
+    analyze_repo(&repo, &input);
+    let conn = Connection::open(&input).unwrap();
+    assert!(conn.execute("DELETE FROM call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)", []).unwrap() > 0);
+    trace_db::record_database_identity(&conn).unwrap();
+    drop(conn);
+
+    let output = tmp.path().join("merged.db");
+    merge_into(&[input], &output);
+    let conn = Connection::open(&output).unwrap();
+    let entry: String = conn.query_row("SELECT f.name FROM execution_contexts e JOIN functions f ON f.id=e.entry_fn_id WHERE e.kind='thread'", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        entry, "Worker",
+        "an absent edge keeps the context's original entry"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM call_edges e JOIN functions f ON f.id=e.callee_fn_id WHERE f.name='Worker'"), 0);
+}
+
 /// A callback one repository only declares and another defines: the start
 /// edge is re-linked to the definition, and so is the context it starts,
 /// whose entry would otherwise stay the declaration, with no body behind
@@ -3446,6 +3471,12 @@ fn re_merging_keeps_alternative_sites_one_event() {
     assert_eq!(frames, ["common", "cb_a", "cb_b", "cb_c"]);
 }
 
+fn analyze_datashare_repo(repo: &std::path::Path, db: &std::path::Path) {
+    let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/ipc_datashare/models.toml");
+    analyze_repo_with(repo, db, &["--models".as_ref(), models.as_os_str()]);
+}
+
 const DATASHARE_MEDIA_SOURCE: &str = r#"
 namespace OHOS { namespace DataShare {
 class DataShareHelper { public: int OpenFile(int); };
@@ -3507,6 +3538,8 @@ fn merge_preserves_unresolved_summary_senders_alone_and_with_unrelated_input() {
             ),
         ],
     );
+    assert!(ipc_targets(&Connection::open(&inputs[0]).unwrap()).is_empty());
+    analyze_datashare_repo(&scratch.path().join("media"), &inputs[0]);
     let before = ipc_targets(&Connection::open(&inputs[0]).unwrap());
     assert_eq!(before.len(), 1);
     assert!(before[0].2, "IPC source call site must be NULL");
@@ -3524,7 +3557,7 @@ fn count_reachable_media_stubs(conn: &Connection) -> i64 {
 }
 
 #[test]
-fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
+fn merge_rekeys_summary_ipc_callers_to_all_reachable_sender_definitions() {
     let scratch = tempdir().unwrap();
     let root = scratch.path();
     let media = root.join("media");
@@ -3533,10 +3566,11 @@ fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
     fs::create_dir(&framework).unwrap();
     fs::write(media.join("main.cpp"), DATASHARE_MEDIA_SOURCE).unwrap();
     fs::write(framework.join("helper.cpp"), "namespace OHOS { namespace DataShare { class DataShareProxy { public: int OpenFile(int); }; class DataShareHelper { public: int OpenFile(int); DataShareProxy *proxy_; }; int DataShareHelper::OpenFile(int x) { return proxy_->OpenFile(x); } }}").unwrap();
+    fs::copy(framework.join("helper.cpp"), framework.join("other.cpp")).unwrap();
     let m = root.join("m.db");
     let f = root.join("f.db");
     let out = root.join("out.db");
-    analyze_repo(&media, &m);
+    analyze_datashare_repo(&media, &m);
     analyze_repo(&framework, &f);
     merge_databases(
         &[m, f],
@@ -3549,5 +3583,682 @@ fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
     let c = Connection::open(&out).unwrap();
     assert_eq!(count_reachable_media_stubs(&c), 1);
     let bridges: i64 = c.query_row("SELECT count(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id WHERE e.resolution='ipc' AND e.call_site_id IS NULL AND caller.name='OHOS::DataShare::DataShareHelper::OpenFile' AND caller.is_defined=1", [], |r|r.get(0)).unwrap();
-    assert_eq!(bridges, 1);
+    assert_eq!(
+        bridges, 2,
+        "every reachable sender binding retains the summary"
+    );
+}
+
+fn cross_ipc_fixture(part: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/ipc_cross_repo")
+        .join(part)
+}
+
+fn named_edges(db: &std::path::Path) -> std::collections::BTreeSet<(String, String, String)> {
+    let c = Connection::open(db).unwrap();
+    let edges = c.prepare("SELECT a.name,b.name,e.resolution FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id")
+        .unwrap().query_map([],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+        .collect::<Result<_,_>>().unwrap();
+    edges
+}
+
+#[test]
+fn separate_repositories_restore_ipc_and_virtual_provider_path() {
+    let tmp = tempdir().unwrap();
+    let inputs: Vec<_> = ["app", "proxy", "stub"]
+        .iter()
+        .map(|part| {
+            let db = tmp.path().join(format!("{part}.db"));
+            analyze_repo(&cross_ipc_fixture(part), &db);
+            db
+        })
+        .collect();
+    assert!(inputs
+        .iter()
+        .all(|db| !named_edges(db).iter().any(|(_, _, r)| r == "ipc")));
+    let output = tmp.path().join("all.db");
+    let report = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert!(report.ipc_bridges_added > 0);
+    assert!(report.member_calls_added > 0);
+    let cli_output = tmp.path().join("cli.db");
+    let cli = Command::new(trace_bin())
+        .args(&inputs)
+        .arg("-o")
+        .arg(&cli_output)
+        .output()
+        .unwrap();
+    assert!(cli.status.success());
+    assert!(String::from_utf8_lossy(&cli.stderr).contains(&format!(
+        "{} IPC bridges and {} member calls reconstructed",
+        report.ipc_bridges_added, report.member_calls_added
+    )));
+    let edges = named_edges(&output);
+    assert_eq!(edges, named_edges(&cli_output));
+    for (from, to, resolution) in [
+        (
+            "OHOS::Media::OpenAsset",
+            "OHOS::DataShare::DataShareHelperImpl::OpenFile",
+            "direct",
+        ),
+        (
+            "OHOS::DataShare::DataShareHelperImpl::OpenFile",
+            "OHOS::DataShare::DataShareProxy::OpenFile",
+            "direct",
+        ),
+        (
+            "OHOS::DataShare::DataShareProxy::OpenFileInner",
+            "OHOS::DataShare::DataShareStub::OpenFileInner",
+            "ipc",
+        ),
+        (
+            "OHOS::DataShare::DataShareStub::OpenFileInner",
+            "OHOS::DataShare::MediaDataShareStubImpl::OpenFile",
+            "direct",
+        ),
+        (
+            "OHOS::DataShare::MediaDataShareStubImpl::OpenFile",
+            "OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile",
+            "direct",
+        ),
+    ] {
+        assert!(
+            edges.contains(&(from.into(), to.into(), resolution.into())),
+            "missing {from} -> {to}: {edges:?}"
+        );
+    }
+    let c = Connection::open(&output).unwrap();
+    let invalid: i64 = c
+        .query_row(
+            "SELECT count(*) FROM call_edges WHERE resolution='ipc' AND call_site_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid, 0);
+    let contexts:i64=c.query_row("SELECT count(*) FROM execution_contexts WHERE kind='ipc_handler' AND self_concurrent=1",[],|r|r.get(0)).unwrap();
+    assert!(contexts > 0);
+    // Mix a legacy JSON input with normalized facts; both merges must recover
+    // the same edges, and the staged merge below writes the new layout again.
+    let legacy = Connection::open(&inputs[2]).unwrap();
+    let facts = trace_db::read_linking_facts(&legacy).unwrap().unwrap();
+    legacy
+        .execute(
+            "UPDATE linking_facts SET version=1,data=?1",
+            [serde_json::to_string(&facts).unwrap()],
+        )
+        .unwrap();
+    drop(legacy);
+    let mixed = tmp.path().join("mixed.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: mixed.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(edges, named_edges(&mixed));
+    let stage = tmp.path().join("stage.db");
+    merge_databases(
+        &inputs[1..],
+        &MergeOptions {
+            output: stage.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let nested = tmp.path().join("nested.db");
+    merge_databases(
+        &[inputs[0].clone(), stage],
+        &MergeOptions {
+            output: nested.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(edges, named_edges(&nested));
+}
+
+#[test]
+fn cross_repo_linking_respects_no_ipc_and_legacy_metadata() {
+    let tmp = tempdir().unwrap();
+    let proxy = tmp.path().join("proxy.db");
+    let status = Command::new(trace_cli_bin())
+        .arg("analyze")
+        .arg(cross_ipc_fixture("proxy"))
+        .arg("--no-ipc")
+        .arg("-o")
+        .arg(&proxy)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let stub = tmp.path().join("stub.db");
+    analyze_repo(&cross_ipc_fixture("stub"), &stub);
+    let output = tmp.path().join("merged.db");
+    merge_databases(
+        &[proxy.clone(), stub.clone()],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert!(named_edges(&output).iter().all(|(_, _, r)| r != "ipc"));
+    Connection::open(&proxy)
+        .unwrap()
+        .execute_batch("DROP TABLE linking_facts")
+        .unwrap();
+    let report = merge_databases(
+        &[proxy.clone(), stub.clone()],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.kind == WarningKind::MissingLinkingFacts));
+    Connection::open(&stub)
+        .unwrap()
+        .execute("UPDATE linking_facts SET version=99", [])
+        .unwrap();
+    let before = fs::read(&output).unwrap();
+    assert!(merge_databases(
+        &[proxy, stub],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false
+        }
+    )
+    .is_err());
+    assert_eq!(before, fs::read(output).unwrap());
+}
+
+#[test]
+fn cross_repo_members_keep_overload_nonvirtual_and_final_rules() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = vec![];
+    for (name, source) in [
+        (
+            "base",
+            r#"namespace api {
+            class Base {public: virtual int Run(int x); int Fixed(int x);};
+            class Final final:public Base {public:int Run(int x) override {return x;}};
+            int invoke(Base *p){return p->Run(1);}
+            int fixed(Base *p){return p->Fixed(1);}
+            int final_call(Final *p){return p->Run(1);}
+        }
+        namespace a {int unresolved(Unknown *p){return p->Run(1);}}
+        "#,
+        ),
+        (
+            "derived",
+            r#"namespace api {
+            class Derived:public Base {public:
+                int Run(int x){return x;}
+                int Run(double x){return 0;}
+                int Fixed(int x){return x;}
+            };
+            class BeyondFinal:public Final {public:int Run(int x){return x;}};
+        }
+        namespace a {class Unknown {public:int Run(int x){return x;}};}
+        namespace b {class Unknown {public:int Run(int x){return x;}};}
+        "#,
+        ),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let out = tmp.path().join("out.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: out.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let c = Connection::open(&out).unwrap();
+    let methods:Vec<String>=c.prepare("SELECT f.signature FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions f ON f.id=e.callee_fn_id WHERE a.name='api::invoke' AND f.name='api::Derived::Run'").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(methods.len(), 1, "{methods:?}");
+    assert!(methods[0].contains("int"));
+    let edges = named_edges(&out);
+    assert!(!edges
+        .iter()
+        .any(|(a, b, _)| a == "api::fixed" && b == "api::Derived::Fixed"));
+    assert!(!edges
+        .iter()
+        .any(|(a, b, _)| a == "api::final_call" && b == "api::BeyondFinal::Run"));
+    for target in ["a::Unknown::Run", "b::Unknown::Run"] {
+        assert!(
+            edges
+                .iter()
+                .any(|(a, b, _)| a == "a::unresolved" && b == target),
+            "a declaration in another input must not make a guessed namespace certain"
+        );
+    }
+}
+
+#[test]
+fn cross_repo_ipc_crosses_images_but_member_recovery_requires_link_visibility() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = vec![];
+    for (part, file) in [
+        ("app", "media.cpp"),
+        ("proxy", "client.cpp"),
+        ("stub", "server.cpp"),
+    ] {
+        let repo = tmp.path().join(part);
+        fs::create_dir(&repo).unwrap();
+        fs::copy(cross_ipc_fixture(part).join(file), repo.join(file)).unwrap();
+        fs::write(repo.join("compile_commands.json"),serde_json::json!([
+            {"directory":repo,"file":file,"output":"code.o","arguments":["c++","-c",file,"-o","code.o"]}
+        ]).to_string()).unwrap();
+        fs::write(
+            repo.join("link_commands.json"),
+            serde_json::json!([
+                {"directory":repo,"output":part,"arguments":["c++","code.o","-o",part]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let db = tmp.path().join(format!("{part}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let output = tmp.path().join("all.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let c = Connection::open(&output).unwrap();
+    let ipc:i64=c.query_row("SELECT count(*) FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id WHERE e.resolution='ipc' AND a.target_id!=b.target_id",[],|r|r.get(0)).unwrap();
+    assert!(ipc > 0);
+    let edges = named_edges(&output);
+    assert!(!edges.iter().any(|(a, b, _)| a == "OHOS::Media::OpenAsset"
+        && b == "OHOS::DataShare::DataShareHelperImpl::OpenFile"));
+}
+
+#[test]
+fn different_snapshots_at_one_root_recover_members_across_merge_stages() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("same");
+    fs::create_dir(&repo).unwrap();
+    fs::write(
+        repo.join("base.h"),
+        "class Base { public: virtual int Run(int); };\n",
+    )
+    .unwrap();
+    let one = tmp.path().join("one.db");
+    fs::write(
+        repo.join("main.cpp"),
+        "#include \"base.h\"\nint invoke(Base *p) { return p->Run(1); }\n",
+    )
+    .unwrap();
+    analyze_repo(&repo, &one);
+    let two = tmp.path().join("two.db");
+    fs::write(
+        repo.join("main.cpp"),
+        "#include \"base.h\"\nclass Derived : public Base { public: int Run(int x) override { return x; } };\n",
+    )
+    .unwrap();
+    analyze_repo(&repo, &two);
+    let a = Connection::open(&one).unwrap();
+    let b = Connection::open(&two).unwrap();
+    let root = |c: &Connection| -> String {
+        c.query_row("SELECT target_root FROM analysis_run", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(root(&a), root(&b));
+    assert_ne!(
+        trace_db::database_identity(&a).unwrap(),
+        trace_db::database_identity(&b).unwrap()
+    );
+    let flat = tmp.path().join("flat.db");
+    assert!(merge_into(&[one.clone(), two.clone()], &flat).member_calls_added > 0);
+    let expected = named_edges(&flat);
+    assert!(expected.contains(&("invoke".into(), "Derived::Run".into(), "direct".into())));
+    assert!(expected.contains(&("invoke".into(), "Base::Run".into(), "external".into())));
+    let stage = tmp.path().join("stage.db");
+    merge_into(std::slice::from_ref(&one), &stage);
+    let recovered_id = |db: &std::path::Path| -> i64 {
+        Connection::open(db).unwrap().query_row(
+            "SELECT e.id FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id
+             JOIN functions b ON b.id=e.callee_fn_id WHERE a.name='invoke' AND b.name='Derived::Run'",
+            [], |r| r.get(0)).unwrap()
+    };
+    let flat_conn = Connection::open(&flat).unwrap();
+    let flat_facts = trace_db::read_linking_facts(&flat_conn).unwrap().unwrap();
+    let origin = &flat_facts
+        .calls
+        .iter()
+        .find(|c| c.name == "Base::Run")
+        .unwrap()
+        .origin;
+    assert!(origin.starts_with("analysis:"));
+    assert!(!flat_facts
+        .functions
+        .iter()
+        .find(|f| f.name == "Derived::Run")
+        .unwrap()
+        .definition_origins
+        .contains(origin));
+    for (name, inputs) in [
+        ("reverse", vec![two.clone(), one.clone()]),
+        ("staged", vec![stage, two]),
+        ("overlap", vec![flat.clone(), one.clone()]),
+        ("reverse-overlap", vec![one, flat.clone()]),
+    ] {
+        let output = tmp.path().join(format!("{name}.db"));
+        merge_into(&inputs, &output);
+        assert_eq!(expected, named_edges(&output), "{name}");
+        assert_eq!(recovered_id(&flat), recovered_id(&output), "{name}");
+        let c = Connection::open(output).unwrap();
+        let facts = trace_db::read_linking_facts(&c).unwrap().unwrap();
+        assert_eq!(flat_facts.calls.len(), facts.calls.len(), "{name}");
+        assert_eq!(
+            origin,
+            &facts
+                .calls
+                .iter()
+                .find(|c| c.name == "Base::Run")
+                .unwrap()
+                .origin,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn single_input_merge_recovers_implicit_inherited_members() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input.db");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/cpp_singleton_ipc");
+    analyze_repo(&fixture, &input);
+    let recovered = (
+        "FooStub::OnRemoteRequest".into(),
+        "FooService::Start".into(),
+        "direct".into(),
+    );
+    assert!(!named_edges(&input).contains(&recovered));
+    let output = tmp.path().join("output.db");
+    assert!(merge_into(&[input], &output).member_calls_added > 0);
+    assert!(named_edges(&output).contains(&recovered));
+}
+
+#[test]
+fn stored_alias_facts_are_canonical_and_do_not_accumulate_on_overlap() {
+    let tmp = tempdir().unwrap();
+    let inputs: Vec<_> = ["A", "B"]
+        .into_iter()
+        .map(|name| {
+            let repo = tmp.path().join(name);
+            fs::create_dir(&repo).unwrap();
+            fs::write(
+                repo.join("main.cpp"),
+                format!("class {name} {{}}; using Handle = {name};\n"),
+            )
+            .unwrap();
+            let db = tmp.path().join(format!("{name}.db"));
+            analyze_repo(&repo, &db);
+            db
+        })
+        .collect();
+    let flat = tmp.path().join("flat.db");
+    merge_into(&inputs, &flat);
+    let aliases = |db: &std::path::Path| {
+        let c = Connection::open(db).unwrap();
+        trace_db::read_linking_facts(&c).unwrap().unwrap().aliases
+    };
+    let expected = aliases(&flat);
+    assert_eq!(
+        expected.iter().filter(|(name, _)| name == "Handle").count(),
+        2
+    );
+    let reversed = tmp.path().join("reversed.db");
+    merge_into(&[inputs[1].clone(), inputs[0].clone()], &reversed);
+    assert_eq!(expected, aliases(&reversed));
+    let overlap = tmp.path().join("overlap.db");
+    merge_into(&[flat, inputs[0].clone()], &overlap);
+    assert_eq!(expected, aliases(&overlap));
+}
+
+#[test]
+fn scoped_caller_recovers_targetless_virtuals_without_dispatching_nonvirtual_overloads() {
+    let tmp = tempdir().unwrap();
+    let include = tmp.path().join("include");
+    let caller = tmp.path().join("caller");
+    let provider = tmp.path().join("provider");
+    for dir in [&include, &caller, &provider] {
+        fs::create_dir(dir).unwrap();
+    }
+    fs::write(
+        include.join("base.h"),
+        "class Base { public: virtual int Run(int) = 0; int Run(double); };\n",
+    )
+    .unwrap();
+    fs::write(caller.join("main.cpp"), "#include \"base.h\"\nint use_double(Base *p) { return p->Run(3.14); } int use_int(Base *p) { return p->Run(1); }\n").unwrap();
+    fs::write(provider.join("main.cpp"), "#include \"base.h\"\nclass Derived : public Base { public: int Run(int x) override { return x; } int Run(double x) { return 2; } };\n").unwrap();
+    let a = tmp.path().join("caller.db");
+    let b = tmp.path().join("provider.db");
+    analyze_executable(&caller, &include, &a, false);
+    analyze_repo_with(
+        &provider,
+        &b,
+        &[std::ffi::OsStr::new("--include"), include.as_os_str()],
+    );
+    let input = Connection::open(&a).unwrap();
+    assert!(input
+        .query_row(
+            "SELECT target_id IS NOT NULL FROM functions WHERE name='use_int'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+    let input = Connection::open(&b).unwrap();
+    assert_eq!(input.query_row("SELECT count(*) FROM functions WHERE name='Derived::Run' AND is_defined=1 AND target_id IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    let output = tmp.path().join("output.db");
+    merge_into(&[a, b], &output);
+    let edges = named_edges(&output);
+    assert!(edges.contains(&("use_int".into(), "Derived::Run".into(), "direct".into())));
+    assert!(!edges
+        .iter()
+        .any(|(from, to, _)| from == "use_double" && to == "Derived::Run"));
+}
+
+#[test]
+fn provider_final_boundaries_are_image_specific_in_flat_and_staged_merges() {
+    for final_class in [false, true] {
+        let tmp = tempdir().unwrap();
+        let include = tmp.path().join("include");
+        fs::create_dir(&include).unwrap();
+        fs::write(
+            include.join("base.h"),
+            "class Base { public: virtual int Run(int) = 0; };\n",
+        )
+        .unwrap();
+        let mut dbs = Vec::new();
+        for (name, source) in [
+            ("caller", "#include \"base.h\"\nint invoke(Base *p) { return p->Run(1); }".to_owned()),
+            ("final", format!("#include \"base.h\"\nclass Derived {} : public Base {{ public: int Run(int x) {} {{ return x; }} }};", if final_class {"final"} else {""}, if final_class {"override"} else {"final"})),
+            ("open", "#include \"base.h\"\nclass Derived : public Base { public: int Run(int x) override { return x; } }; class Leaf : public Derived { public: int Run(int x) override { return x+1; } };".into()),
+        ] {
+            let repo = tmp.path().join(name);
+            fs::create_dir(&repo).unwrap();
+            fs::write(repo.join("main.cpp"), source).unwrap();
+            let db = tmp.path().join(format!("{name}.db"));
+            if name == "caller" {
+                analyze_repo_with(&repo, &db, &[std::ffi::OsStr::new("--include"), include.as_os_str()]);
+            } else {
+                analyze_executable(&repo, &include, &db, false);
+            }
+            dbs.push(db);
+        }
+        let flat = tmp.path().join("flat.db");
+        merge_into(&dbs, &flat);
+        let expected = named_edges(&flat);
+        assert!(
+            expected
+                .iter()
+                .any(|(a, b, _)| a == "invoke" && b == "Leaf::Run"),
+            "class final={final_class}: {expected:?}"
+        );
+        let edge_ids = |db: &std::path::Path| {
+            let c = Connection::open(db).unwrap();
+            let ids = c
+                .prepare("SELECT id FROM call_edges ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            ids
+        };
+        for (first, last) in [(2, 1), (1, 2)] {
+            let stage = tmp.path().join(format!("stage-{first}.db"));
+            merge_into(&[dbs[0].clone(), dbs[first].clone()], &stage);
+            let output = tmp.path().join(format!("staged-{first}.db"));
+            merge_into(&[stage, dbs[last].clone()], &output);
+            assert_eq!(expected, named_edges(&output));
+            assert_eq!(edge_ids(&flat), edge_ids(&output));
+        }
+        let reverse = tmp.path().join("reverse.db");
+        merge_into(&[dbs[2].clone(), dbs[1].clone(), dbs[0].clone()], &reverse);
+        assert_eq!(expected, named_edges(&reverse));
+        assert_eq!(edge_ids(&flat), edge_ids(&reverse));
+    }
+}
+
+#[test]
+fn unresolved_parameter_typedef_remains_uncertain_after_fact_roundtrip() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        ("caller", "class Base { public: virtual int Run(MySize) = 0; }; int invoke(Base *p) { return p->Run(1); }"),
+        ("provider", "using MySize = unsigned long; class Base { public: virtual int Run(MySize) = 0; }; class Derived : public Base { public: int Run(MySize x) override { return x; } };"),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("main.cpp"),source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo,&db);
+        inputs.push(db);
+    }
+    let c = Connection::open(&inputs[0]).unwrap();
+    let facts = trace_db::read_linking_facts(&c).unwrap().unwrap();
+    assert!(facts
+        .functions
+        .iter()
+        .any(|f| f.guessed_params.iter().any(|n| n.ends_with("MySize"))));
+    let flat = tmp.path().join("flat.db");
+    merge_into(&inputs, &flat);
+    assert!(named_edges(&flat)
+        .iter()
+        .any(|(a, b, _)| a == "invoke" && b == "Derived::Run"));
+    let stage = tmp.path().join("stage.db");
+    merge_into(&inputs[..1], &stage);
+    let staged = tmp.path().join("staged.db");
+    merge_into(&[stage, inputs[1].clone()], &staged);
+    assert_eq!(named_edges(&flat), named_edges(&staged));
+}
+
+#[test]
+fn reconstructed_members_obey_weak_strength_for_each_overload() {
+    for virtual_call in [false, true] {
+        let tmp = tempdir().unwrap();
+        let include = tmp.path().join("include");
+        fs::create_dir(&include).unwrap();
+        fs::write(include.join("api.h"), if virtual_call {
+            "class Base { public: virtual int Run(int) = 0; }; class Api : public Base { public: int Run(int) override; };"
+        } else { "class Api { public: int Run(int); };" }).unwrap();
+        let mut inputs = Vec::new();
+        for (name, source) in [
+            (
+                "caller",
+                format!(
+                    "#include \"api.h\"\nint invoke({} *p) {{ return p->Run(1); }}",
+                    if virtual_call { "Base" } else { "Api" }
+                ),
+            ),
+            (
+                "weak",
+                "#include \"api.h\"\n__attribute__((weak)) int Api::Run(int x) { return x; }"
+                    .into(),
+            ),
+            (
+                "strong",
+                "#include \"api.h\"\nint Api::Run(int x) { return x+1; }".into(),
+            ),
+        ] {
+            let repo = tmp.path().join(name);
+            fs::create_dir(&repo).unwrap();
+            fs::write(repo.join("main.cpp"), source).unwrap();
+            let db = tmp.path().join(format!("{name}.db"));
+            analyze_repo_with(
+                &repo,
+                &db,
+                &[std::ffi::OsStr::new("--include"), include.as_os_str()],
+            );
+            inputs.push(db);
+        }
+        let out = tmp.path().join("out.db");
+        merge_into(&inputs, &out);
+        let c = Connection::open(out).unwrap();
+        let callees:Vec<String>=c.prepare("SELECT file.path FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id JOIN files file ON file.id=b.file_id WHERE a.name='invoke' AND b.is_defined=1").unwrap()
+            .query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert!(!callees.is_empty(), "virtual={virtual_call}");
+        assert!(
+            callees
+                .iter()
+                .all(|path| std::path::Path::new(path).ends_with("strong/main.cpp")),
+            "virtual={virtual_call}: {callees:?}"
+        );
+    }
+}
+
+#[test]
+fn defined_nonvirtual_member_binding_stays_in_its_translation_unit() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for name in ["caller", "foreign"] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        let source = format!(
+            "class Api {{ public: int Run(int); }}; int Api::Run(int x) {{return x;}} {}",
+            if name == "caller" {
+                "int invoke(Api *p) {return p->Run(1);}"
+            } else {
+                ""
+            }
+        );
+        fs::write(repo.join("main.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let out = tmp.path().join("out.db");
+    merge_into(&inputs, &out);
+    let c = Connection::open(out).unwrap();
+    let targets:Vec<String>=c.prepare("SELECT file.path FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id JOIN files file ON file.id=b.file_id WHERE a.name='invoke'").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert!(std::path::Path::new(&targets[0]).ends_with("caller/main.cpp"));
 }

@@ -58,7 +58,7 @@ pub struct Diagnostic {
 /// `declaration_scope` is kept separately because an unqualified template
 /// argument is resolved in the namespace or enclosing class where the derived
 /// class is declared, not relative to the template itself or a later caller.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TemplateBase {
     pub derived: String,
     pub spelling: String,
@@ -1044,27 +1044,6 @@ impl Program {
         ids
     }
 
-    /// Whether dispatch stops at `cls`, seen from the files `sees` admits: it
-    /// is `final`, or declares the method `final`. Another file's class in an
-    /// anonymous namespace is another class, and does not stop it.
-    fn dispatch_stops_at(
-        &self,
-        cls: &str,
-        kind: &MethodKind,
-        sees: &dyn Fn(FileId) -> bool,
-    ) -> bool {
-        self.class_is_final(cls)
-            || Self::defined_in(&self.anonymous_final_classes, cls, sees)
-            || self
-                .symbols
-                .functions_named(&kind.name_on(cls))
-                .iter()
-                .any(|&id| {
-                    let f = self.symbols.function(id);
-                    f.is_final && (f.linkage != Linkage::Internal || sees(f.file))
-                })
-    }
-
     /// Direct base classes of `cls` as the files `sees` admits see it: an
     /// anonymous-namespace class there derives from its own bases, not from
     /// those every file's class of its name declares.
@@ -1153,18 +1132,13 @@ impl Program {
 
     /// Subclass closure used for virtual dispatch: stop at `final` classes
     /// and at classes that declare this method `final`.
-    fn dispatch_subclass_closure(
-        &self,
-        root: &str,
-        kind: &MethodKind,
-        sees: &dyn Fn(FileId) -> bool,
-    ) -> Vec<String> {
+    fn dispatch_subclass_closure(&self, root: &str, stops: &dyn Fn(&str) -> bool) -> Vec<String> {
         let mut out = vec![root.to_string()];
         let mut i = 0;
         while i < out.len() {
             let cur = out[i].clone();
             i += 1;
-            if self.dispatch_stops_at(&cur, kind, sees) {
+            if stops(&cur) {
                 continue;
             }
             for &index in self.derived_by_class.get(&cur).into_iter().flatten() {
@@ -1197,8 +1171,40 @@ impl Program {
         sees: &dyn Fn(FileId) -> bool,
         targets: &dyn Fn(FnId) -> bool,
     ) -> Vec<FnId> {
+        self.method_targets_with_finality(
+            cls,
+            kind,
+            sees,
+            targets,
+            &|c| self.class_is_final(c) || Self::defined_in(&self.anonymous_final_classes, c, sees),
+            &|id| {
+                let f = self.symbols.function(id);
+                f.is_final && (f.linkage != Linkage::Internal || sees(f.file))
+            },
+        )
+    }
+
+    /// The same dispatch traversal with final boundaries supplied by a provider
+    /// view. Filtering endpoints alone cannot undo a foreign final boundary.
+    pub fn method_targets_with_finality(
+        &self,
+        cls: &str,
+        kind: &MethodKind,
+        sees: &dyn Fn(FileId) -> bool,
+        targets: &dyn Fn(FnId) -> bool,
+        final_class: &dyn Fn(&str) -> bool,
+        final_method: &dyn Fn(FnId) -> bool,
+    ) -> Vec<FnId> {
+        let stops = |class: &str| {
+            final_class(class)
+                || self
+                    .symbols
+                    .functions_named(&kind.name_on(class))
+                    .into_iter()
+                    .any(final_method)
+        };
         let mut out = Vec::new();
-        for c in self.dispatch_subclass_closure(cls, kind, sees) {
+        for c in self.dispatch_subclass_closure(cls, &stops) {
             for id in self.inherited_method_targets_among(&c, kind, sees, targets) {
                 if !out.contains(&id) {
                     out.push(id);

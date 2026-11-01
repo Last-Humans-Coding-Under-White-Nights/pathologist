@@ -618,3 +618,37 @@ fn damaged_identity_metadata_is_rejected_without_replacing_output() {
         assert_eq!(fs::read(output).unwrap(), b"previous output");
     }
 }
+
+#[test]
+fn reconstructed_member_and_ipc_edges_keep_ids_across_overlap_and_staging() {
+    let tmp = tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ipc_cross_repo");
+    let inputs: Vec<_> = ["app", "proxy", "stub"]
+        .into_iter()
+        .map(|part| {
+            let db = tmp.path().join(format!("{part}.db"));
+            super::merge_test::analyze_repo_with(&fixture.join(part), &db, &[]);
+            db
+        })
+        .collect();
+    let flat_path = tmp.path().join("flat.db");
+    let flat = merge(&inputs, &flat_path);
+    assert!(flat.values().any(|v| v.values().any(|r| r == "ipc")));
+    let reverse = merge(
+        &[inputs[2].clone(), inputs[1].clone(), inputs[0].clone()],
+        &tmp.path().join("reverse.db"),
+    );
+    assert_eq!(flat, reverse);
+    let ab = tmp.path().join("ab.db");
+    merge(&inputs[..2], &ab);
+    assert_eq!(
+        flat,
+        merge(&[ab, inputs[2].clone()], &tmp.path().join("nested.db"))
+    );
+    for order in [
+        vec![flat_path.clone(), inputs[0].clone()],
+        vec![inputs[0].clone(), flat_path.clone()],
+    ] {
+        assert_eq!(flat, merge(&order, &tmp.path().join("overlap.db")));
+    }
+}

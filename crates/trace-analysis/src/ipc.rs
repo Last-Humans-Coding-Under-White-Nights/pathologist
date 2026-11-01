@@ -512,6 +512,25 @@ fn find_interface_methods(
         .collect()
 }
 
+/// Declaration lookup for an inherited member when the remote-stub
+/// wrapper's definition was outside the indexed trees. Shares the IPC
+/// detector's lexical argument/alias recovery rather than guessing a base.
+pub(crate) fn remote_stub_methods(program: &Program, class: &str, method: &str) -> Vec<FnId> {
+    let mut ancestors: Vec<_> = Hierarchy::new(program)
+        .fallback_classes(class)
+        .into_iter()
+        .collect();
+    ancestors.sort();
+    ancestors
+        .iter()
+        .flat_map(|owner| {
+            program
+                .symbols
+                .functions_named(&format!("{owner}::{method}"))
+        })
+        .collect()
+}
+
 /// Whether a proxy and the stub its name pairs with serve two interfaces:
 /// both name declared classes in their `IRemoteProxy<I>` / `IRemoteStub<I>`
 /// bases, and no proxy interface is a stub interface or derives from or to
