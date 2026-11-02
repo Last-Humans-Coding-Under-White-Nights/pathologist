@@ -1,5 +1,297 @@
 # Evaluation Report
 
+## Owning-pointer `get()` aliases — 2026-10-31
+
+Issue #247: accessing a callback through `p.get()->callback` lost the
+pointee alias that `p->callback` retained. The reduced bodyless-library
+fixture now resolves both callback sites to exactly `alpha`, excludes
+`unrelated`, and reports no diagnostics. Semantics and supported forms are
+defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap).
+
+### Corpus comparison
+
+Compare fresh release analyses built from parent `d23d70e` and the completed
+fix, using default minimal exports and `TRACE_SOLVE_BUDGET_POPS=800000`.
+The clean checkouts are pinned in `scripts/eval_expected.json`: HDF
+`cdc75a20bb8f`, HiView `92408e2072bd`, and camera `8ffd69dcd47f`.
+Named call targets, function counts, diagnostics, call-edge resolution
+counts, and existing dispatch/calibration probes are unchanged.
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | unwrap edges | 50 | 54 |
+| HDF | load edges | 10410 | 10415 |
+| HDF | GEP edges | 29310 | 29311 |
+| HiView | unwrap edges | 486 | 526 |
+| HiView | load edges | 3065 | 3069 |
+| HiView | copy edges | 17809 | 17925 |
+| HiView | argument-flow rows | 31924 | 32048 |
+| camera | unwrap edges | 2466 | 2620 |
+| camera | load edges | 14860 | 14866 |
+| camera | GEP edges | 27036 | 27042 |
+
+HiView gains exactly 124 argument-flow rows, with none removed after matching
+source positions and named actual/formal variables (synthetic variable names
+are normalized). Of these, 109 carry extracted event pointers into existing
+`OnEventListeningCallback` candidates; the remaining 15 feed `PipelineEvent`
+constructors and event-processing helpers. No additional callee is inferred.
+The HiView expectation center moves to 32048 with its tolerance unchanged at
+120. HDF and camera argument-flow totals remain 72106 and 57894.
+
+### Production sites and limits
+
+- HDF `framework/tools/hc-gen/src/ast.cpp:493`, `:762`, and `:901` each
+  gain a wrapper-reference load and an unwrap into the `get()` result
+  returned through a named cast. The existing return copies into callers
+  remain. `:413` supplies the fourth new unwrap. A production probe checks
+  all three cast returns and their outgoing return copies.
+- HiView `base/event_dispatch_queue.cpp:87` gains an unwrap for `event.get()`
+  in the submitted lambda. Recovering this value does not establish the
+  captured `queuePtr` receiver's target or a task/bind model.
+- HiView `base/event_loop.cpp:191` gains an unwrap for `handler.get()`;
+  execution of the bound member remains the separate bound-callable issue.
+  A probe checks extraction at this site and at the submitted event site.
+- HiView
+  `plugins/performance/xperf_service/services/server/src/xperf_service_server.cpp:39`
+  gains an unwrap after `DelayedSingleton<XperfServiceServer>::GetInstance()`.
+  On-demand wrapper interning also materializes its receiver/result
+  temporaries and their flow nodes. This extraction has a dedicated probe.
+- HiView `base/include/pipeline.h:92` remains unresolved: `base` comes from
+  a `static_pointer_cast<EventType>` in an uninstantiated template, so the
+  index cannot name the held class. The reduced concrete factory test
+  verifies extraction/dereference into a constructor's reference parameter;
+  it does not claim to instantiate the production template.
+
+### Regression coverage and validation
+
+The `cpp_pointer_get` fixture and isolated integration tests cover both
+owning wrappers, bodyless declarations and excluded dependency bodies,
+qualified calls, fields, assignments, raw and dereferenced arguments,
+chained accesses, and cast/return flow. Wrapper storage and incompatible
+objects are filtered even when assigning to `void *`; extraction adds no
+allocation. User-defined `get` methods and calls with arguments are negative
+controls. The concrete HDF-style test passes a named wrapper directly to a
+reference parameter; isolated tests also cover dereferenced-address arguments.
+
+Isolated reference-only/pointer-only parameters verify on-demand type
+interning without a by-value declaration masking the problem. Returned
+wrappers cover references, const references, rvalue references, references
+to pointers, member calls, and declarations preceding definitions. A
+value-returning control checks that it receives no extra load. Named,
+qualified, const/rvalue, forwarded, and implicit/explicit member returns are
+checked against a concrete pointee as well as address-form returns. Standalone
+`std::weak_ptr::lock()` and OHOS `wptr::promote()` regressions verify that
+reference-returned wrappers preserve their pointees without a following
+`get()`; owning-pointer extraction still excludes wrapper storage.
+
+Executable getter tests verify only `alternate` is returned, excluding the
+wrapper's unrelated modeled pointee, for later out-of-line definitions,
+type-only shared-header imports, and sibling headers. Namespace-directive
+regressions cover both wrappers with `using namespace std` and
+`using namespace ::std`, before and after the extraction site. A local
+wrapper namesake verifies that its getter cannot suppress the standard
+wrapper's bodyless extraction. File-scope and local extractions agree when
+the implementation is in another TU in the same image or is already visible.
+An independent image with a bodyless getter keeps its extraction summary. Dependency bodies contribute declarations
+without executable flows.
+
+The original validation passed all 2,603 workspace tests and all 115 corpus
+checks with both jobs=1 and jobs=8. All 34 logical SQLite relations matched
+between those job counts, excluding producer/run metadata with
+`scripts/compare_analysis_databases.py`. The receiver-reference follow-up
+preserved every analysis row from the preceding corpus exports. Only the
+producer revision stamp and its derived `database_identity` snapshot hash
+differed across those builds. Formatting and `git diff --check` passed.
+
+The namespace-directive follow-up was validated on 2026-11-02 after rebasing
+onto local master `25ebffa`. Both reduced failures were reproduced before
+the corresponding fixes: an imported executable getter retained its stored
+pointee, and registering only the standard declarations incorrectly
+suppressed extraction when a local namesake defined `get`. The regressions
+now require exactly `alternate` and `concrete`, respectively.
+
+All 2,637 workspace tests pass. Fresh release analyses of the same pinned
+corpora pass all 115 checks with jobs=1 and jobs=8, without expectation
+updates. All 49 logical SQLite relations in the rebased schema match exactly
+between job counts for each corpus, using
+`scripts/compare_analysis_databases.py`. These are current expectation and
+determinism checks; the before/after corpus measurements above remain the
+original feature comparison against `d23d70e`. Formatting and
+`git diff --check` pass.
+
+### Inline-review follow-up — 2026-11-02
+
+Four priority failures were reproduced on reduced sources before changing
+the implementation. Eight added integration tests now cover these and the
+related receiver/typing cases:
+
+| Reduced case | Pre-review result | Current result |
+|--------------|-------------------|----------------|
+| `H *&pref()` with a prototype, returning `*gg` | `g` | `c`, matching the no-prototype control |
+| Value-returning overload sharing an indexed function with a reference prototype | `c`, `g` | `c` |
+| Executable getter in an explicit specialization | `c`, `alternate` | `alternate` |
+| Named `const Ptr &` argument, both owning wrappers | empty | `c` |
+
+Definition load depth now comes from the body's own declarator, with the
+same classification used by prototypes. Named references, `auto &`,
+`auto &&`, range-for bindings and captured reference parameters retain their
+pointees. The HDF fixture no longer needs an explicit-address argument.
+Further checks cover custom unique-pointer deleters, union pointees,
+`(*p.get()).field`, array/pointer/member subscripts, `std::move`, owning-pointer
+casts, init-captures, specific class imports and short member qualification.
+
+Getter eligibility is now decided once after merge. The declaration prepass
+and its separate visibility metadata were removed. Visible implementations
+replace provisional unwraps with ordinary image-aware return flow; unused
+receiver support is pruned. Both sibling-header and directly included
+implementations verify that erased-pointer copies have a live return source
+and that unused reference-receiver loads are absent.
+
+Fresh release analyses compare the pre-review tree `eefa41b` with this
+follow-up on the same pinned clean corpora and 800000-pop budget. Comparing
+call-edge multisets by source position, caller name, target name and
+resolution gives HDF +52/-28, HiView +2/-2 and camera +5/-0. These changes
+were inspected before validating the existing expectations:
+
+- HDF specific class imports now resolve `NativeBuffer`, `SharedMemQueue`,
+  `SharedMemQueueMeta`, `IServiceManager` and `IDeviceManager` to their declared
+  namespaces. Qualified direct calls replace unqualified external stubs;
+  redundant `SharedMemQueue` stubs disappear while their existing direct
+  targets remain. Known `BufferHandle *` constructor arguments narrow to the
+  matching overload. Newly typed service-manager results reach their declared
+  interface methods and the existing proxy candidates. External function
+  symbols fall from 1892 to 1882; defined function counts do not change.
+- HiView `sys_event_db_mgr.cpp:34` and `:53` replace external `SysEventDao`
+  stubs with direct `OHOS::HiviewDFX::EventStore::SysEventDao::{Insert,Clear}`
+  calls through the existing class import. Defined function counts do not
+  change; two external symbols disappear.
+- Camera `movie_file_controller_base.h:67-68` infers a vector from an array
+  element, adding the three external `begin`/`end` sites. In
+  `unified_pipeline.cpp:127-129`, the `inCommand = std::move(command)`
+  init-capture retains its unique-pointer type, adding an external `get`, a
+  single unwrap and direct `UnifiedPipelineCommand::IsConsumed`. Unrelated
+  cast receivers keep their prior behavior.
+
+| Corpus | Direct edges before → after | External edges before → after | Argument-flow rows before → after |
+|--------|----------------------------:|------------------------------:|----------------------------------:|
+| HDF | 49673 → 49712 | 23909 → 23894 | 72106 → 72125 |
+| HiView | 23319 → 23321 | 15690 → 15688 | 32048 → 32049 |
+| camera | 68819 → 68820 | 46066 → 46070 | 57894 → 57894 |
+
+Indirect and IPC edge counts, diagnostics and existing dispatch probes are
+unchanged. HDF gains three load and four GEP edges; copy edges change
+36733 → 36754 (HDF), 17925 → 17926 (HiView) and 55574 → 55579 (camera).
+Only camera gains an unwrap, 2620 → 2621. All changes remain within the
+existing corpus expectations, which were not updated.
+
+All 2,645 workspace tests and all 115 pinned-corpus checks pass. For each
+corpus, all 49 logical relations match exactly between jobs=1 and jobs=8,
+using `scripts/compare_analysis_databases.py`. Formatting and
+`git diff --check` pass.
+
+Remaining limits are documented in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap):
+alias templates and namespace aliases are not resolved here, and the mixed
+reference representation can admit an additional same-typed pointee. A
+separate reduced probe confirms `g.get()` and `val().get()` retain only `c`,
+while `ref().get()` also admits `third` after storing `&third` through a cast
+of `&c`. This precision issue is not claimed fixed by the current receiver
+normalization.
+
+### Overload and extraction-filter review — 2026-11-02
+
+Five regressions were reproduced before the fixes, and eight more integration
+tests cover them plus filter identity and variant merging. The full suite now
+passes 2,653 tests; workspace Clippy passes with all targets, all features and
+`-D warnings`.
+
+| Reduced case | Pre-review behavior | Current behavior |
+|--------------|---------------------|------------------|
+| Executable `get()` alongside `get(int)` | zero-argument result also contains the integer overload's pointee | only the selected overload's pointee |
+| `get(int = 0)` or inherited getter | provisional stored-pointee alias remains | only implementation return |
+| Getter on `fp()->v`, whose receiver value cannot be lowered | return is lost | ordinary member-return wiring survives |
+| C/C++ nested table dereferences | callback edges disappear; function-pointer read includes table storage | callbacks reach `alpha`; read contains only `alpha` |
+| `move`/`forward` around a cast to a base reference | false derived-class method edge | derived edge excluded; unsupported non-owning cast remains unresolved |
+
+The overload test covers inline definitions, definitions in another TU, and
+separately defined overloads where only the unrelated integer overload is local
+to the caller. Both local calls and file-scope initializers are checked. A separate full
+export probe also verifies that the global result contains only `a` and that
+its return-value provenance points at the `p.get()` expression.
+Function-body extraction now keeps the original call site's selected return
+slot. File-scope extraction records exact function bindings, with callable
+arity filtered by the shared resolver before TU-local definition precedence.
+Default arguments, inherited owners and link-image ownership remain intact.
+
+Dedicated extraction temporaries carry canonical held-tag filters and pair
+by type across configurations. `T *raw` imported through a project namespace
+and `auto raw` now retain the same `N::T` object. A template-held `Box<int>`
+retains its object and callback target. Two compile commands selecting
+`shared_ptr<A>` or `shared_ptr<B>` retain both aliases in either command order,
+with jobs=1 and jobs=4. Existing tests now follow the result's copy into a
+named destination rather than requiring that destination to own the filter.
+Pointer-table extraction also checks an actual wrapper address, alongside
+array-decay summaries.
+
+Subscript typing is limited to extraction receivers. General C/C++ table
+reads retain the parent's interpretation. Receiver-support collection and
+liveness use fixed-point closures independent of merged flow order; one
+helper identifies prunable producers. The unused prepass helpers were inlined,
+cast descriptor traversal is shared, C receiver probes return immediately,
+and extraction probes no longer clone held-class layouts.
+
+Fresh release analyses compare the pre-review release snapshot with the
+corrected build, using the same pinned corpora and 800000-pop budget. Both
+jobs=1 and jobs=8 pass all 115 checks without expectation updates. All 49
+logical SQLite relations match exactly between job counts for every corpus.
+
+| Corpus | Copy edges before → after | Unwrap edges before → after | Named call-edge changes |
+|--------|--------------------------:|----------------------------:|-------------------------|
+| HDF | 36754 → 36756 | 54 → 55 | none |
+| HiView | 17926 → 17966 | 526 → 526 | none |
+| camera | 55579 → 55736 | 2621 → 2621 | three external iterator edges removed |
+
+The extra copies connect each extraction's typed filter to its destination.
+HDF's additional unwrap is `smqMeta.get()` at
+`adapter/uhdf2/host/test/unittest/sample_driver/sample_hdi_service_stub.cpp:200`,
+whose held class is `SharedMemQueueMeta<SampleSmqElement>`. Its template's
+layout is now found through the declared tag. Camera removes only the
+`std::vector::begin`/`end` edges at `movie_file_controller_base.h:68` that the
+previous broad subscript probe introduced; external edges change
+46070 → 46067 and total edges 116140 → 116137. All other named call targets,
+function counts, argument-flow totals, diagnostics, indirect/IPC counts and
+existing correctness probes are unchanged. Formatting and `git diff --check`
+pass.
+
+[Extraction limits](ANALYSIS.md#smart-pointer-unwrap) now explicitly cover
+alias templates, namespace aliases, unqualified wrappers without declarations,
+indirect reference-returned wrappers, same-typed reference imprecision and
+class-pointer arguments converted to `void *`. These cases are not claimed
+fixed by this follow-up.
+
+### Approval follow-up fixture check
+
+The `ipc_cross_repo` regression now requires
+`OHOS::DataShare::MediaDataShareStubImpl::OpenFile` to reach the defined
+`OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile` exclusively among
+extension `OpenFile` targets. This pins the class-import improvement that
+removes the undefined `OHOS::DataShare::MediaDataShareExtAbility::OpenFile`
+phantom identified by the fixture review. The changelog records this edge
+change. General move/forward and init-capture receiver typing is documented
+under [C++ support](ANALYSIS.md#c-support-first-step).
+
+All 2,654 workspace tests pass, including the new assertion; full-workspace
+Clippy with all targets/features and `-D warnings`, formatting and
+`git diff --check` pass. This follow-up changes tests and documentation;
+the corpus measurements above remain applicable.
+
+To compare job counts for any pinned corpus, using the current release build:
+
+```bash
+TRACE_SOLVE_BUDGET_POPS=800000 cargo run -p trace-cli --release -- analyze <corpus> --jobs 1 -o /tmp/get-j1.db
+TRACE_SOLVE_BUDGET_POPS=800000 cargo run -p trace-cli --release -- analyze <corpus> --jobs 8 -o /tmp/get-j8.db
+python3 scripts/compare_analysis_databases.py /tmp/get-j1.db /tmp/get-j8.db
+```
+
 ## Unevaluated operands: #249 — 2026-10-28
 
 Calls in an operand the language never evaluates are tagged at lowering

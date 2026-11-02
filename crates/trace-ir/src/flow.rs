@@ -51,6 +51,9 @@ pub enum FlowConstraint {
         callee_name: String,
         caller: Option<FnId>,
     },
+    /// Return from an exact, already-resolved function (not name-only lookup).
+    /// Used after merge when a file-scope initializer has no CallSite.
+    CallReturnResolved { dst: VarId, callee: FnId },
     /// `dst = callee_var()` — callee resolved at analysis time from the
     /// function-pointer variable's points-to set (indirect / virtual calls).
     CallReturnIndirect { dst: VarId, callee_var: VarId },
@@ -61,9 +64,9 @@ pub enum FlowConstraint {
     StringConst { dst: VarId, value: String },
     /// Explicit null pointer value. No abstract location or pointee is created.
     NullPointer { dst: VarId },
-    /// `sp->field`: step through a smart pointer's overloaded `->`/`*`. `src`
-    /// holds the wrapper value; `dst` is the pointee-typed receiver, and its
-    /// type is the one the solver admits locations by. See
+    /// Step through a smart pointer's overloaded `->`/`*` or modeled `get`.
+    /// `src` holds the wrapper value; `dst` is a pointee-typed receiver or
+    /// raw pointer, whose pointee type filters the admitted locations. See
     /// `docs/ANALYSIS.md`, "Smart-pointer unwrap".
     UnwrapPointer { dst: VarId, src: VarId },
 }
@@ -82,6 +85,7 @@ impl FlowConstraint {
             FlowConstraint::ArrayFnMember { array, .. } => (array, None),
             FlowConstraint::AddrOfFn { dst, .. }
             | FlowConstraint::CallReturn { dst, .. }
+            | FlowConstraint::CallReturnResolved { dst, .. }
             | FlowConstraint::NewHeap { dst }
             | FlowConstraint::StringConst { dst, .. }
             | FlowConstraint::NullPointer { dst } => (dst, None),

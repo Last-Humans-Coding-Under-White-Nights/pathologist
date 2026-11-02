@@ -145,7 +145,7 @@ type SiteKey<'a> = trace_ir::CallSourceKey<'a>;
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum TempKey {
-    Site(FnId, trace_ir::FileId, u32, u32, TempKind),
+    Site(FnId, trace_ir::FileId, u32, u32, TempKind, Option<TypeId>),
     Factory(FnId, TypeId),
 }
 
@@ -167,18 +167,23 @@ type FileTempKey = (u32, trace_ir::FileId, u32, u32, TempPairing);
 /// `make_shared<A>()`'s object never takes `make_shared<B>()`'s. `new`'s
 /// ([`TempKind::New`]) exists whenever its expression spells a class, in
 /// every configuration alike, and pairs by position alone, whether or not a
-/// configuration indexes that class.
+/// configuration indexes that class. Extraction results ([`TempKind::Unwrap`])
+/// pair by position and type: their type is a compatibility filter, so two
+/// configurations with distinct held classes must keep distinct temporaries.
 fn temp_pairing(var: &Variable, ty: TypeId) -> Option<TempPairing> {
     let kind = var.temp?;
-    Some((kind, (kind == TempKind::Make).then_some(ty)))
+    Some((
+        kind,
+        matches!(kind, TempKind::Make | TempKind::Unwrap).then_some(ty),
+    ))
 }
 
 /// Factory lowering guarantees one object per function/class. Its first
 /// call's position is descriptive, not its identity across configurations.
 fn temp_key(var: &Variable, owner: FnId, file: trace_ir::FileId, ty: TypeId) -> Option<TempKey> {
-    temp_pairing(var, ty).map(|(kind, class)| match class {
-        Some(class) => TempKey::Factory(owner, class),
-        None => TempKey::Site(owner, file, var.span.line, var.span.col, kind),
+    temp_pairing(var, ty).map(|(kind, class)| match (kind, class) {
+        (TempKind::Make, Some(class)) => TempKey::Factory(owner, class),
+        _ => TempKey::Site(owner, file, var.span.line, var.span.col, kind, class),
     })
 }
 
@@ -1643,9 +1648,9 @@ fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool 
 
 fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
     match flow {
-        FlowConstraint::AddrOfFn { callee, .. } | FlowConstraint::ArrayFnMember { callee, .. } => {
-            Some(*callee)
-        }
+        FlowConstraint::AddrOfFn { callee, .. }
+        | FlowConstraint::ArrayFnMember { callee, .. }
+        | FlowConstraint::CallReturnResolved { callee, .. } => Some(*callee),
         // A call follows the function it is written in: dropped with it in
         // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
         FlowConstraint::CallReturn { caller, .. } => *caller,
@@ -1920,6 +1925,10 @@ fn remap_flow(
             dst: rv(*dst),
             callee_name: callee_name.clone(),
             caller: caller.map(rf),
+        },
+        FlowConstraint::CallReturnResolved { dst, callee } => FlowConstraint::CallReturnResolved {
+            dst: rv(*dst),
+            callee: rf(*callee),
         },
         FlowConstraint::CallReturnIndirect { dst, callee_var } => {
             FlowConstraint::CallReturnIndirect {

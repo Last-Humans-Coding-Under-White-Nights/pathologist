@@ -4,6 +4,48 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Preserve pointee aliases through owning-pointer `get()` (#247)
+
+Bodyless `std::shared_ptr<T>::get()` and `std::unique_ptr<T>::get()` retain
+the stored pointee address across assignments, arguments, dereferences,
+returns and chained field accesses. The existing filtered `unwrap` flow
+excludes wrapper storage and incompatible objects without allocating a new
+object. Qualified calls, field-held wrappers, pointer/reference receivers
+and wrappers returned by value or reference are covered.
+
+Visible getter implementations keep their ordinary return behavior,
+including later definitions, namespace-directive owner lookup, shared headers
+and file-scope initializers owned by a link image. Excluded dependency bodies
+remain declaration-only. Unrelated `get` methods and calls with arguments
+receive no summary.
+Reference-returning receivers conservatively retain both the returned value
+and its load, preserving named/field-return aliases for owning-pointer
+extraction and `weak_ptr::lock()` / `wptr::promote()`.
+
+Getter visibility now resolves once after merge through image-aware lookup,
+including explicit specializations. Prototypes and overloads cannot change a
+definition's return depth. Named reference parameters and bindings preserve
+their pointees; custom deleters, union pointees, dereferenced field paths,
+subscripts, moves, typed casts and init-captures are covered. Unused provisional
+receiver flows are removed. Remaining alias and reference precision limits
+are documented in the analysis rules.
+
+Getter return wiring preserves selected overloads, default arguments and
+inherited methods. Failed receiver lowering falls back to ordinary method
+returns. Extraction filters use dedicated temporaries paired by type across
+configuration variants, and canonical held tags handle namespace imports and
+template-held classes. Extraction subscript typing leaves general C/C++ array
+flows unchanged; move/forward receivers preserve cast targets.
+
+In `ipc_cross_repo`, class-import resolution removes the undefined
+`DataShare::MediaDataShareExtAbility::OpenFile` phantom edge from
+`MediaDataShareStubImpl::OpenFile`, retaining the defined `AbilityRuntime`
+implementation.
+
+Rules: [smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap).
+Measurements and remaining corpus limits:
+[owning-pointer extraction](docs/EVAL_REPORT.md#owning-pointer-get-aliases--2026-10-31).
+
 ### Reconstruct cross-repository IPC and virtual member paths
 
 `trace-merge` combines declarations from independently indexed repositories to

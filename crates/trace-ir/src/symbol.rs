@@ -91,6 +91,9 @@ pub enum TempKind {
     Ret,
     /// The pointee-typed receiver an overloaded `->` yields.
     Recv,
+    /// A pointer extraction result whose type is its compatibility filter.
+    /// Variant merges pair by position and type to retain every filter.
+    Unwrap,
     /// The heap object of `new T(..)`.
     New,
     /// The heap object a smart-pointer factory builds; paired by its class
@@ -107,6 +110,7 @@ impl TempKind {
             TempKind::Load => "_load",
             TempKind::Ret => "_ret",
             TempKind::Recv => "_recv",
+            TempKind::Unwrap => "_unwrap",
             TempKind::New => "$new",
             TempKind::Make => "$make",
         }
@@ -2459,7 +2463,7 @@ impl SymbolTable {
         let contexts = self
             .contributing_tus(caller)
             .map(|tu| (tu, if shared { tu } else { function.file }));
-        self.candidates_in_contexts(contexts, function.target, name)
+        self.candidates_in_contexts(contexts, function.target, name, None)
     }
 
     /// Resolve the callee of `dst = name()`. With a caller this is
@@ -2477,12 +2481,25 @@ impl SymbolTable {
             None => {
                 let var = self.variable(dst);
                 let file = var.span.file;
-                self.candidates_in_contexts([(file, file)], var.target, name)
+                self.candidates_in_contexts([(file, file)], var.target, name, None)
             }
         }
     }
 
-    /// The one resolution policy behind both entry points above: per
+    /// Candidates callable with `count` explicit arguments in a file-scope
+    /// initializer. Filter arity before TU-local definition precedence, so an
+    /// unrelated overload defined in this TU cannot hide the selected overload.
+    pub fn initializer_call_candidates(&self, dst: VarId, name: &str, count: u32) -> Vec<FnId> {
+        let var = self.variable(dst);
+        self.candidates_in_contexts(
+            [(var.span.file, var.span.file)],
+            var.target,
+            name,
+            Some(count),
+        )
+    }
+
+    /// The shared resolution policy behind return and initializer lookup: per
     /// `(tu, lookup file)` context, the image-scoped candidates seen from the
     /// file, narrowed to the unit's own definitions when it has any.
     fn candidates_in_contexts(
@@ -2490,11 +2507,21 @@ impl SymbolTable {
         contexts: impl IntoIterator<Item = (FileId, FileId)>,
         target: Option<crate::TargetId>,
         name: &str,
+        argument_count: Option<u32>,
     ) -> Vec<FnId> {
         let mut result = Vec::new();
         for (tu, file) in contexts {
             let mut candidates =
                 self.resolve_function_candidates_in_target(name, Some(file), target);
+            if let Some(count) = argument_count {
+                candidates.retain(|&id| {
+                    let f = self.function(id);
+                    let arity = f
+                        .explicit_arity
+                        .or_else(|| self.explicit_params(f).map(|p| p.len() as u32));
+                    arity.is_none_or(|arity| f.takes_argument_count(arity, count))
+                });
+            }
             if candidates.iter().any(|&c| self.defined_in_tu(c, tu)) {
                 candidates.retain(|&c| self.defined_in_tu(c, tu));
             }
