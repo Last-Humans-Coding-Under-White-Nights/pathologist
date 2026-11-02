@@ -718,7 +718,8 @@ fn export_flow_provenance(
         .iter()
         .filter_map(|flow| match flow {
             trace_ir::FlowConstraint::CallReturn { dst, .. }
-            | trace_ir::FlowConstraint::CallReturnIndirect { dst, .. } => {
+            | trace_ir::FlowConstraint::CallReturnIndirect { dst, .. }
+            | trace_ir::FlowConstraint::CallReturnResolved { dst, .. } => {
                 pag.var_node.get(dst).copied()
             }
             _ => None,
@@ -774,6 +775,7 @@ fn export_flow_provenance(
                     .call_return_candidates(*caller, *dst, callee_name)
                     .to_vec(),
             ),
+            trace_ir::FlowConstraint::CallReturnResolved { dst, callee } => (*dst, vec![*callee]),
             trace_ir::FlowConstraint::CallReturnIndirect { dst, callee_var } => {
                 let candidates = indirect_return_callees
                     .query_map(params![callee_var.0, dst.0], |r| Ok(FnId(r.get(0)?)))?

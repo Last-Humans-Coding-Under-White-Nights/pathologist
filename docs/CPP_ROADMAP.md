@@ -24,6 +24,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 |------------|-----------------|
 | CHA from static receiver + implicit `this` | `Plugin::OnEventProxy` → 22 plugin `OnEvent` bodies |
 | Smart-pointer / `operator->` unwrap, by declaration not by name (C12); an undeclared wrapper guessed from its one class argument (#86) | `call_sp` fixture; typed `Plugin*` paths; hdf `AutoPtr<T>` (+4,551 direct edges); camera `sptr<T>` (+16,587 direct edges) |
+| Owning-pointer `get()` pointee aliases (#247; [rules](ANALYSIS.md#smart-pointer-unwrap)) | `cpp_pointer_get` fixture; HiView extraction arguments and HDF cast/return sites; [measurements and remaining limits](EVAL_REPORT.md#owning-pointer-get-aliases--2026-10-31) |
 | `auto` from declared returns and smart-pointer factories (C1, #87) | eval H5; see `docs/EVAL_REPORT.md` |
 | `final` / virtual bases | fixtures only (`cpp_dispatch`); hiview barely uses them |
 | Direct `std::function` field store | `cpp_callable`; **not** the factory path (C3) |

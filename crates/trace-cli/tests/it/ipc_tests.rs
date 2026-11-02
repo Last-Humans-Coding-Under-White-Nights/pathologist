@@ -312,6 +312,27 @@ fn check_summary_partition(case: PartitionCase) -> Vec<PartitionEdge> {
 }
 
 #[test]
+fn ipc_cross_repo_extension_import_excludes_phantom_owner() {
+    let (program, _, analysis) = build("ipc_cross_repo");
+    let stub = "OHOS::DataShare::MediaDataShareStubImpl::OpenFile";
+    let extension = "OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile";
+    let targets: std::collections::BTreeSet<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == stub)
+        .map(|edge| fn_name(&program, edge.callee))
+        .filter(|name| name.ends_with("::MediaDataShareExtAbility::OpenFile"))
+        .collect();
+    assert_eq!(
+        targets,
+        std::collections::BTreeSet::from([extension.to_owned()]),
+        "the imported class must not add a DataShare-namespace phantom"
+    );
+    let implementation = common::only_function(&program, extension);
+    assert!(program.symbols.function(implementation).is_defined);
+}
+
+#[test]
 fn ipc_datashare_framework_summary_with_declared_sptr_reaches_extension() {
     let root = fixture("ipc_datashare");
     let opts = PreprocessOptions::new()

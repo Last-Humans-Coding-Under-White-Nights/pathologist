@@ -1171,11 +1171,12 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
 | `CallReturn { dst, callee_name, caller }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer) | `p = GetOps()`; `void *g = GetOps();` |
+| `CallReturnResolved { dst, callee }` | return from an exact selected function | post-merge file-scope getter return |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
 | `StringConst { dst, value }` | `dst` points at a string literal | `p = "target"`; `dlsym(h, "target")` |
 | `NullPointer { dst }` | explicit null pointer value with no points-to target | C++ `nullptr`, including a call argument |
-| `UnwrapPointer { dst, src }` | cross a smart-pointer wrapper into its pointee; `dst` is the pointee-typed receiver (see [Smart-pointer unwrap](#smart-pointer-unwrap)) | C++ `sp->field`, `(*sp).field` |
+| `UnwrapPointer { dst, src }` | cross a smart-pointer wrapper into its pointee (see [Smart-pointer unwrap](#smart-pointer-unwrap)) | C++ `sp->field`, `(*sp).field`, `sp.get()` |
 
 `NullPointer` copies from an interned immutable PAG value node into `dst`.
 That source is not an abstract location and always has an empty points-to set:
@@ -1313,6 +1314,10 @@ Arguments `f(*x)`:
   (`resolve_expr_var`): `o` in `take(*o->absent)`, where no layout declares
   `absent`, and `arr` in `take(*arr[i])`.
 
+A dereferenced owning-pointer extraction, `*sp.get()`, follows the same
+argument rules; supported extraction forms are defined in
+[Smart-pointer unwrap](#smart-pointer-unwrap).
+
 Field-path roots:
 
 - `(*X).f` is rooted at `X`'s value: `(*h->in).f` projects `f` from the object
@@ -1325,7 +1330,6 @@ Limits:
 
 - A call lowering cannot name a callee for (a function-pointer call, a lambda
   called through its closure variable) passes the combined temporary for `*x`.
-- `sp.get()` is not modeled, so `*sp.get()` passes nothing.
 - `*h->t[i]` on a member table of pointers reads one level short, as
   `field_table` reads a table element.
 - Casts, pointer arithmetic (`*(p + 1)`) and elements of a local array
@@ -1362,7 +1366,7 @@ A C-style cast to the operand's own class keeps the operand as the root.
 
 ### Smart-pointer unwrap
 
-`UnwrapPointer { dst, src }` is the step through a smart pointer's overloaded `operator->` or `operator*`. `src` holds the wrapper value (`sp`, or the loaded `h.item`); `dst` is the pointee-typed receiver temporary (`_recv`) that field accesses continue from. The receiver's type is the pointee class, and it is the only type the constraint consults, so merge remaps nothing but the two variables.
+`UnwrapPointer { dst, src }` is the step through a smart pointer's overloaded `operator->` or `operator*`, or its modeled raw-pointer extraction. `src` holds the wrapper value (`sp`, or the loaded `h.item`); `dst` is the pointee-typed receiver temporary (`_recv`) that field accesses continue from, or the raw pointer returned by extraction. The destination's class type (through one pointer layer for a raw pointer) is the only type the constraint consults, so merge remaps nothing but the two variables.
 
 The wrapper and its pointee are separate objects. A plain `Copy` would let the wrapper's own storage reach GEPs typed for the pointee, and the GEP field-name guard cannot tell two classes apart when they share a field name at the same position. The PAG kind therefore filters: `pts(dst) ⊇ { o ∈ pts(src) | o is compatible with dst's pointee type P }`, where a location is judged by its recorded type:
 
@@ -1381,7 +1385,89 @@ The unwrap adds no fallback of its own. The receiver's GEPs already fall back to
 
 A wrapper variable is a pointer to its pointee as far as the solver is concerned: after merging, `mark_wrapper_values` (`lower.rs`) sets `is_pointer` on every variable whose type `operator->` steps through. Its value and its storage are therefore kept in step ([Variable cells](#propagation-highlights)), so an object stored through `&sp` (`Fill(&sp)` writing `*out = &obj`) reaches `sp->f`, and `(*w)->f` sees `sp = x` copies; and a wrapper argument is wired to its parameter by a persistent copy, as a raw pointer is.
 
-A field path may also start at a call's result when it crosses a wrapper at its root (`GetSp()->cb()`, `GetSp()->value`): the path validates first, then the call's result is lowered into a temporary (`CallReturn`) that the unwrap reads. Only a direct call by plain name has a return flow to read; a qualified or member call (`Foo::GetInstance()->f`) is not decomposed, and a call returning a raw pointer keeps its previous handling. A dereferenced root is a value ([Dereferenced operands](#dereferenced-operands)): `(*h->sp).f` unwraps the value the member `h->sp` holds.
+A field path may also start at a call's result when it crosses a wrapper at its root (`GetSp()->cb()`, `GetSp()->value`): the path validates first, then the call's result is lowered into a temporary (`CallReturn`) that the unwrap reads. Apart from the modeled `get()` extraction below, only a direct call by plain name has a return flow to read; a qualified or member call (`Foo::GetInstance()->f`) is not decomposed, and a call returning a raw pointer keeps its previous handling. A dereferenced root is a value ([Dereferenced operands](#dereferenced-operands)): `(*h->sp).f` unwraps the value the member `h->sp` holds.
+
+**Raw-pointer extraction (`get()`).** Zero-argument `get()` on
+`std::shared_ptr<T>` and `std::unique_ptr<T, D>`, with a held class or union
+`T` the call site can name, yields a raw `T *` alias through the same
+filtered unwrap. The optional unique-pointer deleter does not affect the
+pointee. Explicitly qualified member names, namespace directives and specific
+class imports use the ordinary class resolver, including namespace shadowing.
+One recognizer supplies both the result type and value flow. Other classes'
+`get` methods, calls with arguments, and `unique_ptr::release` receive no
+extraction summary.
+
+Expression lowering emits a provisional unwrap regardless of getter
+visibility. Each extraction has a `TempKind::Unwrap` result typed to the
+canonical held tag, followed by a copy into its destination. The type is a
+compatibility filter, so variant merges pair this temporary by position,
+kind and type; differently configured held classes retain separate filters.
+Named destination spellings, including bare names imported from a namespace,
+cannot replace the held tag's identity. Template-held classes use the declared
+template's layout, consistently with the existing arrow model.
+
+After unit and link-target merging, getter settlement uses the actual call
+site's resolved candidates and return slot. An executable getter removes the
+provisional unwrap and leaves ordinary member-return expansion, preserving
+overloads, default arguments, inherited owners and per-image selection.
+File-scope initializers have no `CallSite`: zero-argument-compatible getters
+are resolved through the same member hierarchy and image-aware resolver, then
+recorded as exact `CallReturnResolved { dst, callee }` bindings. The PAG
+expands these from the selected `FnId`'s return facts. No name-only return
+lookup runs after this selection. Unused supporting loads, copies and field-address
+computations are pruned using dependency closures independent of flow order;
+call, argument and return uses remain. There is no declaration prepass or
+getter-definition visibility set. Excluded dependency bodies remain
+declarations and retain summaries. If a receiver value cannot be lowered,
+the call falls back to ordinary member-return handling.
+
+Receivers are evaluated as ordinary expression values, including wrapper
+fields, owning-pointer array elements, `std::move`/`std::forward`, casts with
+known owning-pointer targets and init-captures. Subscript typing applies only
+to extraction receivers; ordinary C/C++ array reads retain their existing
+summary semantics. General move/forward and init-capture receiver typing
+also applies outside extraction (see [C++ support](#c-support-first-step)).
+Returned wrappers are received once. A wrapper descriptor
+present only inside a pointer/reference parameter is interned on demand.
+Reference bindings and reference-returned wrappers can hold either addresses
+(`return *p`, dereferenced arguments) or already-lowered wrapper values
+(`return global`, `return field`, named arguments and local bindings).
+Receiver-value lowering therefore retains the original value alongside a
+load through it. This preserves named const/reference parameters, `auto &`
+and `auto &&` bindings, range-for references, captured reference parameters
+and reference-returning weak-pointer promotions. Subsequent owning-pointer
+unwraps exclude wrapper storage and incompatible objects. Result typing and
+receiver normalization share overload selection and reference-return
+metadata from declarations and definitions. Return statements use their own
+definition's declarator to decide load depth, so a prototype or another
+overload sharing an indexed function cannot alter the body. A `T *&` return
+retains the pointer-value convention described in [Dereferenced operands](#dereferenced-operands).
+Known value-returning receivers receive no extra load.
+
+Assignments, arguments, dereferences, returns (including cast operands),
+and field paths rooted at extraction, such as `p.get()->field` and
+`(*p.get()).field`, reuse the result. The unwrap adds no allocation or
+pointee load; `*p.get()` adds the ordinary dereference load, and reference
+arguments retain the extracted address. Conversions such as
+`void *raw = p.get()` still filter against the held class before copying to
+the destination. The external getter call site is retained when the expression
+appears in a function body.
+
+Extraction limits: alias-template substitution and namespace aliases are not
+resolved by this recognizer. An unqualified owning-pointer name found only
+through `using namespace std` or `using std::shared_ptr` without an in-tree
+declaration can also remain untyped; use a qualified standard name or provide
+the declaration. Reference-returned wrappers through function pointers are
+not normalized by the declaration-based receiver probe and can lose their
+pointees. The mixed value/address reference representation can conservatively
+add a same-typed pointee read from an already-returned object's cell. The
+compatibility filter removes wrapper storage and incompatible objects but
+cannot distinguish that extra same-typed alias. Normalizing reference
+bindings, arguments and returns to one address representation remains a
+separate change. Assignment conversions to `void *` retain extraction, but
+existing pointer-argument wiring can still lose a class pointer passed to a
+`void *` formal (`take(p.get())`). Non-owning cast receivers remain subject to
+the general cast-typing limits; a move does not turn them into their operands.
 
 Limits. Each leaves the receiver on the pointee's field summary, which is what every smart-pointer field access resolved through before `UnwrapPointer` existed:
 
@@ -3745,6 +3831,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Call-result receivers**: `S::GetInstance().Open()` and pointer-returning
   chains reuse declared return-type inference. Ambiguous return types stay
   unknown; receiver probes do not mutate the index.
+- **Move/forward receivers**: qualified `std::move` and `std::forward` reuse
+  their argument's static receiver type for general member calls, including
+  `std::move(d).M()`. Only the move/forward's own argument is inspected,
+  preserving any cast beneath it; unsupported cast targets remain unknown.
 - **Templates**: lowered once per primary name. Class-template members
   returning a bare type parameter (`T Get()`, `T *Get()`) preserve its
   parameter position and pointer depth as type metadata across header merges.
@@ -3824,6 +3914,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   A base that names a template parameter is substituted per concrete base
   instead ([Template-parameter bases](#template-parameter-bases)).
 - **Lambda captures**: explicit (`[var]`, `[&var]`, `[this]`, `[*this]`), default (`[&]`, `[=]`), and init-captures (`[x = expr]`, `[&x = expr]`) bind the enclosing scope's variables, members, and `this` into the lowered lambda body.
+  Init-captures preserve the initializer's expression type, including its
+  pointer layers, before falling back to class inference. This enables
+  general member and callback receivers such as `[q = &ga]() { q->cb(); }`,
+  as well as captures holding an owning pointer.
 
 Known C++ imprecision (in addition to the general list below):
 
@@ -3834,8 +3928,9 @@ Known C++ imprecision (in addition to the general list below):
   remain unknown. Named casts (`auto p = static_cast<T *>(v)`) parse as calls
   to the cast and stay unknown until C2, as do conditional expressions
   (`auto p = c ? a : b`). Cast arguments in a call-result receiver probe are
-  conservatively unknown for overload ranking. `shared_ptr::get` and
-  `unique_ptr::release` are not unwrapped to the held class.
+  conservatively unknown for overload ranking. `unique_ptr::release` has no
+  extraction summary; supported `get()` forms are described in
+  [Smart-pointer unwrap](#smart-pointer-unwrap).
 - In-class prototypes record no parameter variables. They record their
   parameter types where those decide something: a name the class body
   declares or defines more than once, or brings in again with
