@@ -167,10 +167,8 @@ fn combined_constructs_index_declarations_aliases_and_positions() {
         "Second::M",
     ] {
         let desc = alias(&program, member);
-        let inner = match &desc {
-            TypeDesc::Ptr(inner) => inner.as_ref(),
-            other => other,
-        };
+        assert!(desc.is_member_function_pointer(), "{member}: {desc:?}");
+        let inner = desc.innermost().0;
         assert!(
             matches!(inner, TypeDesc::FnPtr { ret, .. } if !matches!(ret.as_ref(), TypeDesc::FnPtr { .. })),
             "{member}: {desc:?}"

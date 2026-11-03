@@ -89,6 +89,8 @@ pub enum TempKind {
     Load,
     /// A call's return value, or another value temporary.
     Ret,
+    /// A function value explicitly reinterpreted before storage or invocation.
+    Reinterpret,
     /// The pointee-typed receiver an overloaded `->` yields.
     Recv,
     /// A pointer extraction result whose type is its compatibility filter.
@@ -109,6 +111,7 @@ impl TempKind {
             TempKind::Gep => "_gep",
             TempKind::Load => "_load",
             TempKind::Ret => "_ret",
+            TempKind::Reinterpret => "_reinterpret",
             TempKind::Recv => "_recv",
             TempKind::Unwrap => "_unwrap",
             TempKind::New => "$new",
@@ -318,9 +321,10 @@ pub struct CallSite {
     /// The variable a member call is made on, when its receiver is one by
     /// name (`queue.submit(f)`, `handler->PostTask(f)`, `this->Run()`, the
     /// object a constructor builds); `None` for a field, a call result or any
-    /// other expression, and for a free function. Identity only: it is not
-    /// bound to the callee's `this` (`docs/ANALYSIS.md`, "Execution
-    /// contexts").
+    /// other expression, and for a free function. Receiver identity; argument
+    /// bindings are recorded separately in `var_args` (constructors and
+    /// member-pointer invocation bind `this`). See `docs/ANALYSIS.md`,
+    /// "Execution contexts" and "C++ parse-input normalization".
     pub receiver: Option<VarId>,
     /// Originating translation unit, recorded by merge. Absent before merge.
     pub tu: Option<crate::FileId>,
@@ -765,6 +769,19 @@ pub fn spelled_alike(
 /// with `parameters_match`, a template argument the index does not know (a
 /// template parameter) matches any.
 fn class_names_alike(types: &crate::TypeTable, x: &str, y: &str, parameters_match: bool) -> bool {
+    class_names_alike_with(types, x, y, &|arg| {
+        parameters_match && !arg.contains('<') && !types.declares_class(arg)
+    })
+}
+
+/// Keep the class-head lookup policy shared while callers choose which
+/// template arguments can stand for unresolved instantiations.
+fn class_names_alike_with(
+    types: &crate::TypeTable,
+    x: &str,
+    y: &str,
+    unknown: &impl Fn(&str) -> bool,
+) -> bool {
     fn split(name: &str) -> (&str, Vec<&str>) {
         crate::types::split_instance(name).unwrap_or((name, Vec::new()))
     }
@@ -780,10 +797,79 @@ fn class_names_alike(types: &crate::TypeTable, x: &str, y: &str, parameters_matc
             || ya.is_empty()
             || (xa.len() == ya.len()
                 && xa.iter().zip(&ya).all(|(p, q)| {
-                    let unknown = |arg: &str| !arg.contains('<') && !types.declares_class(arg);
-                    (parameters_match && (unknown(p) || unknown(q)))
-                        || class_names_alike(types, p, q, parameters_match)
+                    unknown(p) || unknown(q) || class_names_alike_with(types, p, q, unknown)
                 })))
+}
+
+/// Compare dependent member signatures without erasing a known template head
+/// or pointer suffix when only a nested argument is unresolved.
+pub(crate) fn member_template_names_alike(types: &crate::TypeTable, a: &str, b: &str) -> bool {
+    let strip = |s: &str| {
+        let (mut name, suffix) = crate::split_pointer_suffix(s);
+        while let Some(rest) = name
+            .strip_prefix("const ")
+            .or_else(|| name.strip_prefix("volatile "))
+        {
+            name = rest.trim_start();
+        }
+        (name.to_owned(), suffix)
+    };
+    let ((a, ap), (b, bp)) = (strip(a), strip(b));
+    if ap.is_empty() && bp.is_empty() {
+        if let (Some(a), Some(b)) = (
+            crate::integral_template_value(&a),
+            crate::integral_template_value(&b),
+        ) {
+            return a == b;
+        }
+    }
+
+    let unresolved = |name: &str| {
+        !name.contains('<')
+            && !crate::is_fundamental_type_name(name)
+            && name.parse::<i128>().is_err()
+            && !matches!(name, "true" | "false" | "nullptr")
+            && !name.starts_with(['\'', '"'])
+            && !types.declares_class(name)
+    };
+    // An unresolved leaf may itself be a pointer/reference type. Known
+    // enclosing heads still have to match recursively.
+    if (unresolved(&a) && bp.ends_with(&ap)) || (unresolved(&b) && ap.ends_with(&bp)) {
+        return true;
+    }
+    if ap != bp {
+        return false;
+    }
+    if crate::is_fundamental_type_name(&a) && crate::is_fundamental_type_name(&b) {
+        fn scalar(name: &str) -> (&str, bool, bool, usize, bool) {
+            let (mut base, mut unsigned, mut signed, mut longs, mut short) =
+                ("int", false, false, 0, false);
+            for word in name.split_whitespace() {
+                match word {
+                    "unsigned" => unsigned = true,
+                    "signed" => signed = true,
+                    "long" => longs += 1,
+                    "short" => short = true,
+                    "int" => {}
+                    word => base = word,
+                }
+            }
+            // Plain char is distinct from both signed and unsigned char;
+            // other signed integer types use the default signed spelling.
+            (base, unsigned, signed && base == "char", longs, short)
+        }
+        return scalar(&a) == scalar(&b);
+    }
+    let (ah, aa) = crate::split_instance(&a).unwrap_or((&a, Vec::new()));
+    let (bh, ba) = crate::split_instance(&b).unwrap_or((&b, Vec::new()));
+    class_names_alike_with(types, ah, bh, &|_| false)
+        && (aa.is_empty()
+            || ba.is_empty()
+            || (aa.len() == ba.len()
+                && aa
+                    .iter()
+                    .zip(&ba)
+                    .all(|(a, b)| member_template_names_alike(types, a, b))))
 }
 
 /// Whether merging `a` and `b` joins a member's in-class prototype with a
@@ -1954,6 +2040,122 @@ impl SymbolTable {
                 tolerance,
             )
         }))
+    }
+
+    /// Whether a member-pointer signature can designate `callee`. Its first
+    /// parameter is the implicit owner slot; an Unknown tail leaves arity open. Unknown types, including dependent class-template arguments
+    /// and types beneath pointers, stay conservative without changing identity.
+    /// Shared by explicit cast selection and indirect member invocation.
+    /// `returns_reference` comes from the current phase's reference-return metadata.
+    pub fn member_pointer_signature_admits(
+        &self,
+        callee: FnId,
+        signature: &crate::TypeDesc,
+        types: &crate::TypeTable,
+        returns_reference: bool,
+    ) -> bool {
+        self.callable_signature_admits(callee, signature, types, true, returns_reference)
+    }
+
+    /// An ordinary function pointer compares every parameter as explicit.
+    /// Share dependent-type tolerance and parameter adjustment with members.
+    /// `returns_reference` comes from the current phase's reference-return metadata.
+    pub fn function_pointer_signature_admits(
+        &self,
+        callee: FnId,
+        signature: &crate::TypeDesc,
+        types: &crate::TypeTable,
+        returns_reference: bool,
+    ) -> bool {
+        self.callable_signature_admits(callee, signature, types, false, returns_reference)
+    }
+
+    fn callable_signature_admits(
+        &self,
+        callee: FnId,
+        signature: &crate::TypeDesc,
+        types: &crate::TypeTable,
+        member: bool,
+        returns_reference: bool,
+    ) -> bool {
+        use crate::TypeDesc;
+        let TypeDesc::FnPtr { ret, params } = signature.innermost().0 else {
+            return true;
+        };
+        let explicit = if member {
+            // Known member signatures include their owner slot. Legacy
+            // coarse member signatures may have no owner information.
+            let Some(explicit) = params.get(1..) else {
+                return true;
+            };
+            explicit
+        } else {
+            params.as_slice()
+        };
+        let alike = |a: &TypeDesc, b: &TypeDesc| {
+            let (a, b) = TypeDesc::strip_common_pointers(a, b);
+            let integral = |t: &TypeDesc| {
+                matches!(
+                    t,
+                    TypeDesc::Int
+                        | TypeDesc::Short
+                        | TypeDesc::Long
+                        | TypeDesc::LongLong
+                        | TypeDesc::Char
+                        | TypeDesc::SizeT
+                )
+            };
+            ((matches!(a, TypeDesc::SizeT) || matches!(b, TypeDesc::SizeT))
+                && integral(a)
+                && integral(b))
+                || matches!(a, TypeDesc::Unknown)
+                || matches!(b, TypeDesc::Unknown)
+                || spelled_alike(types, a, b, SpellingTolerance::Redeclaration)
+                || match (a, b) {
+                    (
+                        TypeDesc::Struct { name: a, .. } | TypeDesc::Union { name: a, .. },
+                        TypeDesc::Struct { name: b, .. } | TypeDesc::Union { name: b, .. },
+                    ) => member_template_names_alike(types, a, b),
+                    _ => false,
+                }
+        };
+        let f = self.function(callee);
+        let result = types.get(f.return_type).desc.as_ref();
+        let result_admitted = if returns_reference {
+            // Callable descriptors represent a reference with a pointer layer;
+            // function return_type stores the referent and separate metadata.
+            match ret.as_ref() {
+                TypeDesc::Ptr(referent) => alike(referent, result),
+                TypeDesc::Unknown => true,
+                _ => false,
+            }
+        } else {
+            alike(ret, result)
+        };
+        result_admitted
+            && self.explicit_params(f).is_none_or(|formals| {
+                (explicit.last() == Some(&TypeDesc::Unknown) || formals.len() == explicit.len())
+                    && explicit
+                        .iter()
+                        .take_while(|p| **p != TypeDesc::Unknown)
+                        .enumerate()
+                        .all(|(i, actual)| {
+                            formals.get(i).is_none_or(|ty| {
+                                // Function parameters undergo pointer adjustment.
+                                fn adjust(t: &TypeDesc) -> &TypeDesc {
+                                    match t {
+                                        TypeDesc::Ptr(inner)
+                                            if matches!(inner.as_ref(), TypeDesc::FnPtr { .. }) =>
+                                        {
+                                            inner
+                                        }
+                                        _ => t,
+                                    }
+                                }
+                                alike(adjust(actual), adjust(types.get(ty).desc.as_ref()))
+                            })
+                        })
+            })
     }
 
     /// Whether `a` and `b` bind their explicit parameters alike by reference
@@ -3367,6 +3569,51 @@ fn push_unique(out: &mut Vec<FnId>, ids: impl IntoIterator<Item = FnId>) {
 mod tests {
     use super::*;
     use crate::{Program, TypeDesc};
+
+    #[test]
+    fn member_template_arguments_preserve_dependencies_and_concrete_differences() {
+        let mut types = crate::TypeTable::default();
+        for name in ["Box", "Pair", "Outer", "Foo", "Bar"] {
+            types.declare_struct(name);
+        }
+        for (a, b, expected) in [
+            ("Box<T>", "Box<int>", true),
+            ("Box<Outer<T>>", "Box<Outer<int>>", true),
+            ("Pair<T, int>", "Pair<double, int>", true),
+            ("Box<T *const>", "Box<int *>", true),
+            ("Box<const Outer<T>>", "Box<const Outer<int>>", true),
+            ("Box<-N>", "Box<-1>", true),
+            ("Box<int>", "Box<double>", false),
+            ("Box<Foo>", "Box<Bar>", false),
+            ("Box<1>", "Box<2>", false),
+            ("Box<2>", "Box<02>", true),
+            ("Box<2>", "Box<0x2u>", true),
+            ("Box<1>", "Box<true>", true),
+            ("Box<0>", "Box<false>", true),
+            ("Box<02>", "Box<3>", false),
+            ("Box<false>", "Box<true>", false),
+            ("Pair<T, int>", "Pair<int, double>", false),
+            ("Box<T>", "Outer<int>", false),
+            ("Box<Outer<T>*>", "Box<Outer<int>*>", true),
+            ("Box<Outer<T>*>", "Box<int>", false),
+            ("Box<Outer<T>*>", "Box<Foo*>", false),
+            ("Box<T*>", "Box<int>", false),
+            ("Box<T>", "Box<int*>", true),
+            ("Box<T*>", "Box<int**>", true),
+            ("Box<T&>", "Box<int*&>", true),
+            ("Box<Outer<T>*>", "Box<int**>", false),
+            ("Box<unsigned>", "Box<unsigned int>", true),
+            ("Box<signed>", "Box<int>", true),
+            ("Box<long unsigned int>", "Box<unsigned long>", true),
+            ("Box<long long>", "Box<long>", false),
+            ("Box<unsigned>", "Box<int>", false),
+            ("Box<char>", "Box<signed char>", false),
+        ] {
+            let alike = |a, b| member_template_names_alike(&types, a, b);
+            assert_eq!(alike(a, b), expected, "{a} against {b}");
+            assert_eq!(alike(b, a), expected, "{b} against {a}");
+        }
+    }
 
     #[test]
     fn overload_sites_preserve_sibling_order_and_exact_occurrences() {

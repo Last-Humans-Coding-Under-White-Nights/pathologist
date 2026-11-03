@@ -206,7 +206,7 @@ fn export_types(conn: &Connection, program: &Program) -> Result<()> {
             TypeDesc::Double => "double",
             TypeDesc::SizeT => "size_t",
             TypeDesc::Unknown => "unknown",
-            TypeDesc::Ptr(_) => "ptr",
+            TypeDesc::Ptr(_) | TypeDesc::MemberPointer { .. } => "ptr",
             TypeDesc::Array { .. } => "array",
             TypeDesc::Struct { .. } => "struct",
             TypeDesc::Union { .. } => "union",
@@ -229,6 +229,9 @@ fn type_name(desc: &TypeDesc) -> String {
                 type_name(elem),
                 size.map(|s| s.to_string()).unwrap_or_default()
             )
+        }
+        TypeDesc::MemberPointer { owner, member, .. } => {
+            format!("{} {}::*", type_name(member), owner)
         }
         TypeDesc::FnPtr { .. } => "fn_ptr".into(),
         TypeDesc::Void => "void".into(),

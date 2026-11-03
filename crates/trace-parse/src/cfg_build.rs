@@ -85,6 +85,11 @@ pub(super) fn build_function_cfg(
             ctx.is_cpp,
             ctx.is_cpp && ctx.cpp_standard >= 201703,
         );
+        builder.original_source = if ctx.parse_spelling.is_empty() {
+            source
+        } else {
+            &ctx.parse_spelling
+        };
         // A lambda's body nests in the walk that lowered it.
         builder.depth = ctx.ast_depth;
         builder.run(body, prologue, function_try);
@@ -160,6 +165,8 @@ struct Label {
 struct Builder<'s, 'a> {
     sites: &'s [CallSite],
     source: &'a str,
+    /// Operators normalized in parser input retain their source semantics.
+    original_source: &'a str,
     cpp: bool,
     /// C++17 sequencing rules for callees, assignments, shifts and
     /// subscripts.
@@ -297,6 +304,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         let mut builder = Self {
             sites,
             source,
+            original_source: source,
             cpp,
             cpp17,
             owned,
@@ -1035,6 +1043,17 @@ impl<'a> Builder<'_, 'a> {
                         self.short_circuit(node, matches!(op, "&&" | "and"));
                     }
                     Some("<<" | ">>") if self.cpp17 => self.sequence(node),
+                    _ if self.cpp17
+                        && node.cached_field("operator").is_some_and(|op| {
+                            crate::parse::member_pointer_operator_at(
+                                self.original_source,
+                                op.start_byte(),
+                            )
+                            .is_some()
+                        }) =>
+                    {
+                        self.sequence(node)
+                    }
                     _ => self.unordered(node.named_children(&mut node.walk()), node),
                 }
                 self.own(node);
@@ -2170,6 +2189,28 @@ mod tests {
             assert!(g.unordered(g.ev("make"), g.ev("arg")));
             let g = graph(unit, "assign");
             assert!(g.unordered(g.ev("lhs"), g.ev("rhs")));
+        }
+    }
+
+    #[test]
+    fn normalized_member_pointer_operands_keep_language_version_order() {
+        for modern in [true, false] {
+            let opts = PreprocessOptions::new()
+                .with_call_sequencing(true)
+                .with_define("__cplusplus", if modern { "201703L" } else { "201402L" });
+            let unit = lower_with("member_pointer.cpp", opts);
+            for (function, receiver) in [("arrow", "object"), ("dot", "reference")] {
+                let g = graph(&unit, function);
+                let (receiver, index, invoke) =
+                    (g.ev(receiver), g.ev("index"), g.ev("callbacks[...]"));
+                if modern {
+                    assert!(g.sequenced(receiver, index), "{}", g.dump());
+                } else {
+                    assert!(g.unordered(receiver, index), "{}", g.dump());
+                }
+                assert!(g.sequenced(receiver, invoke), "{}", g.dump());
+                assert!(g.sequenced(index, invoke), "{}", g.dump());
+            }
         }
     }
 

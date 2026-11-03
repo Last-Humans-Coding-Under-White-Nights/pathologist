@@ -6,7 +6,7 @@
 
 Typical uses:
 
-- Find **direct and indirect** call targets (function pointers, vtables, struct op tables).
+- Find **direct and indirect** call targets (function pointers, C++ member pointers, vtables, struct op tables). Member-pointer parsing and value-flow support are described in [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization).
 - Trace **argument flow** from call-site actuals to callee formals.
 - Query results with **`trace inspect`**, ad-hoc SQL, or programmatic C API (**`trace-capi`**).
 

@@ -85,8 +85,8 @@ void store_offset(struct Holder *h, int **out) { *(out + 1) = *h->pp; }
 struct Holder *get_h(void) { return &g_h; }
 void store_call_root(struct Holder *h) { *get_h()->pp = *h->pp; }
 
-// A value position whose operand has no value to compute (an array element,
-// a cast) emits nothing, never a load one level short through the root.
+// Array elements retain their element type through a dereference; casts
+// without a computable operand still emit nothing.
 int **g_earr[1];
 int *return_elem(void) { return *g_earr[0]; }
 void store_elem(int **out) { *out = *g_earr[0]; }

@@ -586,11 +586,12 @@ pointers (`void (*get_handler(int))(int);`) by examining the declarator binding 
 the declared identifier. A pointer to member function (`void (S::*cb)(int);`)
 never reaches this classification as such: the parse input blanks its owner
 (see [C++ parse-input normalization](#c-parse-input-normalization)), so it is
-an ordinary function-pointer declarator and the variable is named `cb`. A
-project data-member pointer (`int S::* dm;`) is not rewritten; declarator
-classification still traverses its pointer-bearing qualified name
-(`pointer_type_declarator`) and indexes it as a variable binding, `S::*dm`,
-while retaining ordinary qualified function names as terminals.
+an ordinary function-pointer declarator and the variable is named `cb`. Its
+callable signature and invocation semantics are retained as described in
+[C++ parse-input normalization](#c-parse-input-normalization). Data-member pointer declarations (`int S::* dm;`) likewise adapt their owner
+for parsing and restore an explicit member-pointer descriptor during lowering;
+the variable keeps its declared identifier (`dm`). See the same normalization
+section for data-member value flow.
 
 A member declared in-class and defined out-of-class (`int *Holder::member;`
 or `int *Holder::member = &object;` at namespace scope) share one `VarId`:
@@ -1260,6 +1261,11 @@ through and passes. `*x` goes through the value `x` holds, computed as a value
   `Array { elem }`); an element of a member table (`h->t[i]`) is loaded from
   the table's cell.
 - An inner `*` is loaded: `**pp` loads twice.
+- An ordinary array element uses the array summary's value with the element's
+  type, so `*table[i]` loads through the pointer stored in the table. Callable
+  elements use the ordinary table load, which preserves initializer functions
+  without copying the array's storage address into the callable value. An
+  element reached through a pointer instead loads through that pointer.
 - A call's result, for a direct call by plain name (`*f()`) or a call through
   a function-pointer data member (`*h->cb()`). A method's result is not
   modeled, so `*obj->Get()` has no value.
@@ -1627,7 +1633,19 @@ other store.
 
 Wrong-type pointer casts put unrelated objects into a pointer's points-to; a store through such a pointer would otherwise write callback addresses into alien layouts, where later field loads surface them as bogus indirect-call targets. The solver therefore filters **function values only** (all non-function flow stays unfiltered, preserving soundness):
 
-- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — require the same parameter count; an array takes its element's guard, a multi-dimensional one its leaf element's: a table of fn pointers keeps their arity, a table of untyped pointers (`void *ops[]`) or of scalars (`long v[4]`) stays writable as its element does, and an array of structs or scalar pointers rejects fn values; other concrete non-fn-pointer cells (`struct`, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
+- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — with a recorded fixed signature require the same known parameter count.
+  C++ callable declarators record their parameters; C callable descriptors
+  remain coarse, even when their source spells a parameter list, and therefore
+  impose no fixed-arity guard. A leading class-pointer parameter in an ordinary callback does not exempt the
+  slot. A trailing `Unknown` parameter denotes an open variadic/pack signature,
+  so it imposes no fixed-arity storage guard, including through pointer and
+  array slots. Explicit `MemberPointer` descriptors retain their values through
+  storage and check their signature at invocation. Reinterpreting casts carry
+  function values through separate abstract locations with the same `FnId`
+  and link target, exempting only those values from storage arity checks;
+  invoking such a value checks the cast's callable signature. Restoring the
+  original signature therefore recovers a round trip through differently typed
+  storage without weakening ordinary function locations' guards. An array takes its element's guard, a multi-dimensional one its leaf element's: a table of fn pointers keeps their arity, a table of untyped pointers (`void *ops[]`) or of scalars (`long v[4]`) stays writable as its element does, and an array of structs or scalar pointers rejects fn values; other concrete non-fn-pointer cells (`struct`, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
 - The same guard applies when `merge_memory_into` lifts cell contents into points-to sets — to **function values only**, exactly as on the store path: a load through a `NotFnPtr` cell (declared pointer, `struct`, `union`, an array of those) returns every non-function value stored there. (Before #127 the load applied the guard to every value, so such cells yielded nothing — e.g. `viaload = *pp` with `int **pp` lost `&g`.) The guard also applies when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
 
 Consequence: callbacks stored through correctly-typed ops assignments resolve exactly as before, while cross-signature leaks (e.g. a 2-param `AddService` callback surfacing at 4-param `Dispatch` sites) are cut. Documented imprecision: old-style casts that stash fn pointers in `void *`-typed cells then call them through typed loads still work (unknown cells accept everything), but calls through cells whose declared type is structurally wrong for the stored fn are no longer reported.
@@ -2058,6 +2076,11 @@ occupants of the "no target" indirect bucket.
 When a call edge is created (direct or indirect), actuals are connected to callee formals:
 
 - **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types)
+- **Opaque pointer arguments** (`void *`) keep persistent function-location
+  propagation when their values arrive after initial call wiring. Buffer/object
+  pointees retain the existing snapshot policy, so forwarding a callback through
+  a `void *` local does not enable full buffer propagation. Member-pointer slot
+  pointees (`M *out`) use the same persistent copies as ordinary callback slots.
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
 - **Dereferenced arguments** (`f(*x)`) pass what [Dereferenced operands](#dereferenced-operands) gives the parameter kind
 - **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` preserves the member’s own field address using the same GEP path as a stored address; unresolved paths and `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument follows the same field path), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
@@ -3063,8 +3086,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
   namespaces (innermost to outermost), plus every namespace brought in by
   `using namespace X;`. **ADL** (argument-dependent / Koenig lookup):
   namespaces are derived from the qualified tag of each argument's
-  `Struct`/`Union` type (pointer/array layers peeled) and merged into the
-  candidate set, so `swap(a, b)` where `a` is `kit::Widget*` finds
+  `Struct`/`Union` type (pointer/array layers peeled), including its recorded
+  transitive base classes, and merged into the candidate set, so `swap(a, b)` where `a` is `kit::Widget*` finds
   `kit::swap`. **`using X::f;`** imports the exact qualified function name
   into the candidate set of the bare base name. Relative `using`
   targets are expanded against the enclosing namespace stack:
@@ -4052,14 +4075,12 @@ Known C++ imprecision (in addition to the general list below):
   `static void *p = f();`) is lowered for the header's own unit only; the
   copies the including units see carry no initializer flow, so a call
   through that pointer from a file including the header has no target.
-- **ADL namespace derivation is spelling-based**: only arguments whose
-  `Struct`/`Union` tag carries an explicit `::` in the source contribute
-  their namespace; enum-typed arguments and types referenced by a *bare*
-  spelling (`using kit::Widget;` then `Widget a`) contribute nothing, so a
-  call that relies purely on such types' ADL can degrade to an external
-  stub (sound — never a wrong binding). A leading global-scope `::` in a
-  tag (`::kit::Widget`) is stripped before deriving the namespace, matching
-  how `functions_in_namespace` treats `kit` and `::kit` as interchangeable.
+- **ADL namespace derivation requires recovered aggregate names** (see
+  [C++ lookup](#c-support-first-step)): enum-typed arguments and class spellings
+  the index cannot qualify contribute no namespace of their own. Missing base
+  facts also limit inherited associations. A leading global-scope `::` in a
+  recovered tag (`::kit::Widget`) is stripped before deriving its namespace,
+  matching how `functions_in_namespace` treats `kit` and `::kit` as interchangeable.
 - Relative `using`/`using namespace` targets expand to every enclosing
   namespace the spelling could denote (over-approximation); genuine C++
   picks the innermost *declared* namespace only.
@@ -4658,16 +4679,17 @@ standard or GNU spellings. Rather than fork the grammar, the parse input of a
 C++ translation unit is rewritten in place before parsing
 (`normalize_cpp_parse_syntax` in `trace-parse/src/parse.rs`), after the
 dependency-only pass (`normalize_dependency_cpp_syntax`, see
-[Compilation databases](#compilation-databases-62)). Every rewrite replaces
-bytes with ASCII spaces, preserving CR/LF, so node offsets, LineMap lookups and
-exported line/column positions still name the original source. The rewrite is
+[Compilation databases](#compilation-databases-62)). Adaptations preserve byte
+lengths and CR/LF (usually by blanking bytes; virtual insertions described
+below are removed from tree coordinates before lowering), so node offsets, LineMap
+lookups and exported line/column positions still name the original source. The rewrite is
 a parse adaptation only: it changes what the grammar sees, never what lowering
 records as semantics beyond what is stated below. Spellings the recognizers do
 not fully match stay unchanged and keep their parse diagnostic.
 
 The function first checks cheap substring triggers (`friend` with `[[`; `::`
-with `*` and `(`; `decltype`; `__typeof`; `__attribute__` with `extern`) and scans
-the unit once, outside string/character literals, raw strings and comments. A
+with `*` and `(`; `decltype`; `__typeof`; `__attribute__` with `extern`;
+`template`; `->*`) and scans the unit once, outside string/character literals, raw strings and comments. A
 standard-library-heavy unit satisfies the triggers without needing any edit, so
 the cost is one linear scan plus scratch validation parses for type candidates.
 
@@ -4691,17 +4713,25 @@ Recognized spellings:
   and `[[nodiscard]] constexpr friend ...`: the attribute specifiers are
   blanked (see "Friend declarations and operator attributes" above).
 - **Parenthesized member-function pointers (#170)** — the complete shape
-  `( owner :: * [cv] [name] ) ( params ) [suffix]` with a simple,
-  identifier-qualified or globally qualified owner (`C::`, `ns::C::`,
-  `::ns::C::`) and comments or newlines
+  `( owner :: * [cv] [name] [array-bounds] ) ( params ) [suffix]` with a simple,
+  identifier-qualified, template-qualified or globally qualified owner (`C::`,
+  `ns::C::`, `Box<int>::`, `::ns::C::`) and comments or newlines
   between tokens, in every declaration context: `using` aliases, named
   typedefs, template specialization arguments (`traits<R (C::*)(Args...)
   const>`), function parameters, fields and variables. The owner is blanked,
   turning the type into the ordinary function pointer the grammar accepts;
   `*`, the name, the parameter list and the trailing qualifiers stay. Lowering
-  therefore records the coarse ordinary function-pointer shape and no
-  owner, cv, ref or `noexcept` semantics; this matches the dependency-only
-  data-member approximation. A variable or field declared this way is named
+  restores `MemberPointer { owner, is_function, member }`, distinguishing
+  member functions from data members even when a data member itself holds a
+  function pointer. The member function's inner `FnPtr` keeps parameter zero
+  as a pointer to its owner, followed by its explicit parameter types. This
+  preserves the callable signature for member-pointer invocation (#246),
+  including aliases, parameters, variables and fields. Unresolved template
+  parameter types stay unknown. Function cv, ref and `noexcept` qualifiers
+  remain approximated; they do not select distinct callable values. Variadic
+  tails and parameter packs keep the owner and an unknown tail sentinel,
+  since their eventual explicit arity is unknown. A variable or field
+  declared this way is named
   by its identifier (`cb` for `void (S::*cb)(int)`), not by the recovered
   declarator text. A **named typedef declarator** is the exception
   for the suffix: the grammar accepts `using M = R (*)(Args...) const;` but
@@ -4721,9 +4751,22 @@ Recognized spellings:
   `default:`, `public:`), `__extension__` and attributes; colons in conditional
   expressions and template arguments do not change typedef detection. An
   unterminated `noexcept(` is recognized as part of the shape precisely so no
-  pass degrades it to owner-only blanking. Template-qualified owners
-  (`W<int>::C::*`), bare project data-member pointers (`int C::* p`),
-  `.*` / `->*` expressions, literals and comments are untouched. In dependency
+  pass degrades it to owner-only blanking. Data-member pointer owners
+  (`F S::*`, in variables, `using` aliases and typedefs) are also blanked for
+  parsing and restored in their corresponding pointer layer during lowering.
+  The reversed declarator chain maps each pointer, array and function to its
+  own type layer, even when the data member's type contains a callable:
+  `void (*S::*pm)()` retains a data-member pointer to a callback, while
+  `F S::**p` retains an ordinary pointer around the data-member pointer.
+  Function-member stars are identified separately, so callback layers do not
+  acquire an implicit owner or hide a surrounding data-member pointer.
+  Named member-pointer parameters containing bare aliases get virtual parameter
+  identifiers to remove expression/declaration ambiguity. These identifiers
+  become zero-width tree nodes and never become IR names. Already parsed
+  parameter declarations, named or unnamed, retain their initial tree; only
+  ambiguous declarations need this additional full-source parse. Empty-parameter
+  pointer arrays use the ordinary callback-declaration recovery. Literals and
+  comments are untouched. Invocation is handled separately below. In dependency
   headers the dependency pass recognizes this shape at its opening `(`,
   skipping comments (including line comments) and whitespace forward. It
   leaves the owner to the general pass, before its legacy data-member rule
@@ -4733,6 +4776,180 @@ Recognized spellings:
   like any other text, so a specialization such as
   `struct traits<R (C::*)(A...) const &> : base<...>` is rewritten whatever
   else the unit contains.
+
+- **Explicit instantiations (#246)** — `extern template ...;` blanks only
+  `extern`; class/struct instantiations also blank the class key, allowing
+  the pinned grammar to retain its native `template_instantiation` node
+  without a missing declarator. Validated GNU and standard attributes following
+  that class key are blanked too, including attributes expanded from macros. Qualified names, template arguments, return
+  types and function parameter lists stay in place. Both declarations and
+  definitions are skipped by lowering: they request instantiation of the
+  existing representative template, without inventing a body, a specialization
+  identity or a second function. Ordinary template declarations and explicit
+  specializations keep their existing handling. Malformed instantiations and
+  neighboring syntax errors retain diagnostics.
+- **Unnamed pointer defaults in template heads (#246)** — a validated
+  pointer-shaped unnamed parameter (`** = nullptr`, `* const = nullptr`,
+  nested template arguments included) gets a virtual identifier before its
+  default. The fresh parser tree is edited back to original offsets, leaving
+  the identifier zero-width; lowering excludes it from template names. The
+  returned source keeps every original pointer token, without substituting a
+  reference. Pointer defaults in following type parameters (`class U = T *`)
+  use a virtual `decltype(static_cast<T *>(nullptr))` wrapper denoting the same
+  type, with all inserted bytes removed from tree coordinates. Named pointers
+  need no adaptation. Unvalidated types and neighboring malformed syntax keep
+  diagnostics; no error nodes are suppressed.
+- **Member-pointer invocation (#246)** — expression operators `->*` and `.*`
+  use a binary `+` placeholder in parser input, padded to preserve byte offsets
+  and CR/LF positions. This keeps postfix operations in the callable operand:
+  `(p->*callbacks[i])(args)` has `callbacks[i]` as its RHS, including parentheses,
+  field chains and macro substitutions. A multiplication placeholder would
+  introduce a cast/declarator ambiguity for a parenthesized RHS. Lowering and
+  sequencing read the original operator; the placeholder adds no arithmetic
+  flow. Where surrounding binary arithmetic would change grouping, parsing
+  temporarily parenthesizes member-pointer bindings at their original C++
+  precedence (above multiplication, below unary operators). The parser tree
+  is edited back to original offsets before lowering; the returned parse
+  source retains its original length and line positions. The grouping walk
+  carries its enclosing binary-expression state on an iterative stack instead
+  of repeatedly asking tree-sitter to find each node's parent. Nested bindings
+  retain every inserted parenthesis, including repeated openings or closings
+  at the same original byte offset. Number tokens (including `3.*p`) and ellipses (`...*xs` in a
+  fold expression) are consumed whole before recognizing these operators.
+  Number scanning starts only at token boundaries, so a digit in an identifier
+  such as `obj1e` cannot absorb the minus sign of a following `->*`.
+  C++17 still sequences the receiver before the callable operand; earlier
+  versions leave their evaluations unordered. Array operands use the ordinary
+  table/field-summary loads, retaining every candidate for an unknown index.
+  Operator-function names (`operator->*`), including declarations, addresses
+  and explicit calls with intervening comments, retain their spelling and
+  identity. Lowering reads
+  the original preprocessed spelling, resolves `f` as a function value, and
+  binds the object's address (or `p`'s value) as implicit argument zero.
+  Explicit arguments, including callbacks, start at one. Assignments and
+  cross-TU parameters propagate ordinary function addresses. An instance-field
+  operand (`this->*cb`) uses the same cached implicit-field load as an ordinary
+  callback call, retaining its callable type, inherited-field summaries and
+  local/parameter shadowing. Inline member addresses (`(b->*&B::f)()`) become
+  callable temporaries through ordinary `AddrOfFn` flows, so they use the same
+  receiver binding and virtual-dispatch policy as a local member pointer.
+  Call-result operands and inline casts likewise materialize a cached value,
+  preserving return flow and the outer cast's invocation type. Object-valued
+  `.*` receivers can be temporaries. Data-member pointers carry the existing
+  instance-insensitive field-summary address. Reads, returns, arguments and
+  invocation load the selected value; assignment stores through that address.
+  Calling a callback-valued data member binds no `this`. Object-valued members
+  retain their receiver type. `auto`, `decltype`, aliases and array operands
+  retain the data-member category; a dependent template parameter keeps both
+  member-function and data-member call alternatives until its value resolves.
+  An inherited address such as `&D::a` uses the shared upward member lookup.
+  Calls recovered while resolving operands retain loop and unevaluated context. Class-valued receivers with a declared
+  `operator->*` resolve member operators and non-member operators in the
+  operands' associated namespaces (including friends), even when the class
+  declares a member operator. A raw pointer with a class-valued RHS also
+  considers free operators; its pointee's member operators do not participate.
+  A non-class RHS on a raw pointer retains built-in member-pointer binding.
+  Ordinary enclosing scopes and `using` imports participate alongside ADL;
+  enum-shaped selectors also admit free-operator lookup. A lone candidate
+  still checks known class compatibility, retaining applicable recorded
+  conversion operators and constructors rather than unrelated class bindings.
+  Free receiver parameters use the shared class-conversion policy, admitting
+  a `Derived` value or reference where a base value or reference is taken.
+  Both sets participate in the shared overload ranking with
+  the free operator's receiver parameter aligned to the member's implicit
+  receiver. Ties and unknown argument types retain compatible alternatives
+  in one operator event; each alternative keeps its own argument binding.
+  Overload resolution precedes built-in data-member cell selection for reads
+  and arguments. The operator's return value flows through initializers,
+  assignments, returns and immediate callback invocations; a returned functor
+  invokes its ordinary `operator()` using the materialized receiver. Implicit
+  operator calls inside `sizeof` remain unevaluated, as explicit calls do.
+  Its agreed return type also supplies the receiver type for a chained
+  `->*` operator, retaining each separate invocation.
+  The operator owns a separate CFG event, sequenced before the callback,
+  with distinct macro occurrences for the two executions.
+  Call lowering and return-flow capture share the cached value; explicit casts
+  select overloads before addresses are published. Overloaded member addresses
+  retain their candidates
+  until the pointer's signature can select them. A typed destination also
+  selects an uncast member address before it
+  becomes a local value, assignment, array member or return value
+  (`M f = &C::hit` and a function returning `M` keep
+  the overload declared by `M`). Mixed static/instance overload sets are
+  inspected before classifying the address: a member-pointer signature selects
+  the instance method even when initial name lookup chose its static sibling;
+  an ordinary function-pointer destination selects static siblings by its
+  return and explicit parameter signature, including aliases, bare qualified
+  names, typed stores, formal callback arguments and inline casts.
+  Ordinary and member-pointer signatures share the same compatibility rules;
+  only a member pointer contributes an implicit owner parameter. A known empty
+  C++ parameter list selects zero-argument functions and still checks the return
+  type. Signature comparison restores the reference layer recorded separately
+  in reference-return metadata before comparing the result, for both ordinary
+  and member-function pointers. Callable signatures inferred from function
+  addresses restore that same reference layer. Static member addresses infer
+  ordinary function pointers using explicit parameters only; an instance
+  member address also carries its owner slot. Definitions and prototypes use
+  the shared explicit-parameter metadata. Coarse signatures use an `Unknown` tail instead of an empty list; a
+  callable wrapper with an unknown return type preserves that uncertainty too. Nested
+  declarators refine their corresponding callable layers: in
+  `typedef void (*(*S)(int))(double)`, the outer callable takes `int` and
+  returns a callback taking `double`. A parameter's own callable declarator
+  is refined independently of that return chain. Function return declarators
+  retain callback and pointer-to-array shapes. The explicit member marker
+  separates ordinary callbacks with a leading class pointer from owner slots.
+  This contextual selection never crosses an
+  explicit cast or reinterpretation barrier. An overload-selecting `static_cast`
+  filters compatible candidates before they become callback arguments, local
+  values or array members.
+  A C-style cast selects a matching overload when one exists; otherwise it
+  can reinterpret an already identified function and preserves its value.
+  `reinterpret_cast` preserves function values across signature changes and
+  round trips, including returned addresses and values stored through pointer slots.
+  Callable casts in return statements copy a temporary carrying the cast-qualified
+  function location rather than publishing an ordinary function address. Member callable
+  signatures filter invocation, not storage. Its destination type supplies no selection of the original
+  function, while an inner `static_cast` still selects its own operand through
+  surrounding reinterpretations. Inline cast types and typedef/using aliases
+  use the same signature comparison as indirect invocation, so callback models
+  and execution contexts retain overload selection without erasing reinterpreted
+  values. Signature comparison admits unresolved template arguments on either
+  side (`Box<T>` against `Box<int>`), including nested instances, without
+  rewriting their stored types. A nested dependent argument does not erase
+  its enclosing template head or required pointer suffix; an unresolved leaf
+  can absorb additional pointer/reference layers (`T*` against `int**`).
+  Equivalent fundamental template arguments (`unsigned` and `unsigned int`)
+  compare equally. Supported integral non-type arguments compare by value
+  (`2`, `02`, `0x2u`; `true` and `1`), while distinct known values stay distinct. Function parameters admit
+  function-to-pointer adjustment, and unresolved standard integer typedefs
+  (`size_t`, `int64_t`, `std::uint64_t`, etc.) admit integral spellings. Known concrete arguments (`Box<int>`,
+  `Box<double>`) remain distinguishable. This comparison is local to callable
+  selection and does not change declaration identity. Indirect-call handling
+  excludes known unrelated receiver owners and incompatible return/parameter
+  types. Receiver and declaring owner may be related in either inheritance
+  direction: an explicitly converted `D::*` value can have type `B::*` and run
+  through `B*` pointing to a `D`. A defined points-to target retains the
+  definition selected where its address was taken, even when the invocation
+  TU defines another same-signature body. Declarations use the shared scope,
+  signature, TU and link-target resolver to reach definitions. Virtual
+  alternatives use the same `Program::virtual_call_targets` policy as spelled
+  member calls. Conversion-operator scope splitting stops before the conversion
+  type (`B::operator ns::S` belongs to `B`); conversion addresses adapt to
+  identifier placeholders and resolve using their original spelling. The
+  adaptation stops at an unmatched template closing bracket, preserving a
+  following declarator such as `Probe<&C::operator bool> probe`. Receiver
+  type lookup also consults active using-directives, preserving imported class
+  ownership and concrete base-member edges. Final boundaries and overload
+  separation remain intact. An
+  unresolved template receiver (`T`) dispatches from the bound member's owner;
+  a declared receiver keeps its own hierarchy and final boundaries.
+  Return values use ordinary `CallReturnIndirect` flows. This is still a
+  may-analysis, without C++ ABI
+  member-pointer adjustments or complete template specialization. Original
+  operators stay in displayed expressions. Header and macro spans use LineMap;
+  a macro-body member-pointer operator anchors the spelling position and keeps
+  the outer invocation as the expansion position. Expansion occurrence IDs
+  keep repeated calls from nested macro expansions distinct.
 
 - **Computed base classes (#167)** — `template<class T> struct D :
   decltype(make<T>()) { ... }`. `base_class_clause` admits only class names,

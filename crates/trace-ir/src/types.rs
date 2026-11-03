@@ -32,21 +32,52 @@ pub enum TypeDesc {
         name: String,
         fields: Vec<(String, TypeDesc)>,
     },
+    /// Pointer to a non-static class member. The member type distinguishes
+    /// a function (FnPtr, including its owner slot) from a data member,
+    /// including data members whose values are themselves function pointers.
+    MemberPointer {
+        owner: String,
+        is_function: bool,
+        member: Box<TypeDesc>,
+    },
     FnPtr {
         ret: Box<TypeDesc>,
+        /// Empty is a known zero-argument signature. A trailing Unknown
+        /// leaves arity open; [Unknown] also represents a coarse signature.
         params: Vec<TypeDesc>,
     },
 }
 
 impl TypeDesc {
     pub fn is_pointer_like(&self) -> bool {
-        matches!(self, TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. })
+        matches!(
+            self,
+            TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. } | TypeDesc::MemberPointer { .. }
+        )
     }
 
     pub fn pointee(&self) -> Option<&TypeDesc> {
         match self {
-            TypeDesc::Ptr(inner) => Some(inner),
+            TypeDesc::Ptr(inner) | TypeDesc::MemberPointer { member: inner, .. } => Some(inner),
             _ => None,
+        }
+    }
+
+    pub fn member_pointer(&self) -> Option<(&str, &TypeDesc)> {
+        match self {
+            Self::MemberPointer { owner, member, .. } => Some((owner, member)),
+            Self::Ptr(inner) | Self::Array { elem: inner, .. } => inner.member_pointer(),
+            _ => None,
+        }
+    }
+
+    pub fn is_member_function_pointer(&self) -> bool {
+        match self {
+            Self::MemberPointer { is_function, .. } => *is_function,
+            Self::Ptr(inner) | Self::Array { elem: inner, .. } => {
+                inner.is_member_function_pointer()
+            }
+            _ => false,
         }
     }
 
@@ -1563,6 +1594,7 @@ fn desc_has_named_tag(desc: &TypeDesc) -> bool {
     match desc {
         TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => !name.is_empty(),
         TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => desc_has_named_tag(inner),
+        TypeDesc::MemberPointer { member, .. } => desc_has_named_tag(member),
         TypeDesc::FnPtr { ret, params } => {
             desc_has_named_tag(ret) || params.iter().any(desc_has_named_tag)
         }
@@ -1581,6 +1613,7 @@ fn compute_layout(desc: &TypeDesc, table: &mut TypeTable) -> (u64, u64, TypeLayo
         | TypeDesc::Double
         | TypeDesc::SizeT
         | TypeDesc::Unknown => (8, 8, TypeLayout::default()),
+        TypeDesc::MemberPointer { .. } => (8, 8, TypeLayout::default()),
         TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. } => (8, 8, TypeLayout::default()),
         TypeDesc::Array { elem, size } => {
             let (elem_size, elem_align, _) = compute_layout(elem, table);
@@ -1693,6 +1726,18 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
         | (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => {
             may_name_same_type(x, y)
         }
+        (
+            TypeDesc::MemberPointer {
+                owner: x,
+                is_function: fx,
+                member: mx,
+            },
+            TypeDesc::MemberPointer {
+                owner: y,
+                is_function: fy,
+                member: my,
+            },
+        ) => same_or_requalified(x, y) && fx == fy && may_name_same_type(mx, my),
         // Units number an anonymous tag each their own way (`anon_4`,
         // `anon_9`): its fields say whether two are one type.
         (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
@@ -1873,6 +1918,22 @@ fn same_type_shape(a: &TypeDesc, b: &TypeDesc, unresolved_matches: bool) -> bool
     match (a, b) {
         (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) if unresolved_matches => true,
         (TypeDesc::Ptr(x), TypeDesc::Ptr(y)) => same_type_shape(x, y, unresolved_matches),
+        (
+            TypeDesc::MemberPointer {
+                owner: x,
+                is_function: fx,
+                member: mx,
+            },
+            TypeDesc::MemberPointer {
+                owner: y,
+                is_function: fy,
+                member: my,
+            },
+        ) => {
+            x.trim_start_matches("::") == y.trim_start_matches("::")
+                && fx == fy
+                && same_type_shape(mx, my, unresolved_matches)
+        }
         (TypeDesc::Array { elem: x, size: sx }, TypeDesc::Array { elem: y, size: sy }) => {
             same_array_extent(*sx, *sy) && same_type_shape(x, y, unresolved_matches)
         }
@@ -2834,5 +2895,29 @@ mod tests {
     fn type_info_and_layout_sizes() {
         assert_eq!(std::mem::size_of::<TypeLayout>(), 8);
         assert_eq!(std::mem::size_of::<TypeInfo>(), 40);
+    }
+}
+
+#[cfg(test)]
+mod member_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn member_pointer_identity_keeps_owner_category_and_member_type() {
+        let member = |owner: &str, is_function, ty| TypeDesc::MemberPointer {
+            owner: owner.into(),
+            is_function,
+            member: Box::new(ty),
+        };
+        let a = member("A", false, TypeDesc::Int);
+        for other in [
+            member("B", false, TypeDesc::Int),
+            member("A", true, TypeDesc::Int),
+            member("A", false, TypeDesc::Double),
+        ] {
+            assert!(!may_name_same_type(&a, &other));
+            assert!(!same_type_shape(&a, &other, false));
+        }
+        assert!(may_name_same_type(&a, &member("::A", false, TypeDesc::Int)));
     }
 }

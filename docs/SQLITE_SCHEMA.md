@@ -720,7 +720,7 @@ Exported with `--full-export` only.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Type id |
-| `kind` | TEXT | `void`, `int`, `short`, `long`, `long long`, `bool`, `float`, `double`, `struct`, `ptr`, `fnptr`, `array`, `func`, `unknown`, … |
+| `kind` | TEXT | `void`, `int`, `short`, `long`, `long long`, `bool`, `float`, `double`, `struct`, `ptr`, `fnptr`, `array`, `func`, `unknown`, …; `ptr` includes C++ member pointers, whose names retain their owner (`T C::*`) |
 | `name` | TEXT | Display name |
 | `size` | INTEGER | Layout size |
 | `layout_json` | TEXT | JSON field layout |
