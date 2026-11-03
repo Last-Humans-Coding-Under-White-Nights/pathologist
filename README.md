@@ -10,6 +10,13 @@ Typical uses:
 - Trace **argument flow** from call-site actuals to callee formals.
 - Query results with **`trace inspect`**, ad-hoc SQL, or programmatic C API (**`trace-capi`**).
 
+Conditional expressions such as `flag ? alpha : beta` preserve both
+alternatives in pointer and callback flow, including across function
+boundaries. See [conditional values](docs/ANALYSIS.md#conditional-values)
+for supported forms and type inference, and
+[implementation limitations](docs/ANALYSIS.md#conditional-value-limitations)
+for precision, model dependencies and coverage boundaries.
+
 ## Build
 
 ```bash

@@ -45,6 +45,7 @@ pub struct UnitIndex {
     /// Initializer constraints, including temporaries and deferred references.
     pub global_initializer_ranges: FxHashMap<VarId, Vec<std::ops::Range<usize>>>,
     pub fn_returns: FxHashMap<FnId, Vec<ReturnFlow>>,
+    pub default_arguments: FxHashMap<FnId, Vec<(u32, Arc<trace_ir::MemberInitializer>)>>,
     pub diagnostics: Vec<trace_ir::Diagnostic>,
     pub anon_type_counter: u32,
     /// Per-unit `(derived, base)` class edges (C++).
@@ -1000,11 +1001,16 @@ fn merge_unit(
             continue;
         }
         let span_file = map_file(var.span.file);
-        if var.storage == trace_ir::StorageClass::Local && program.is_dep_file(span_file) {
+        let mapped_fn_id = var.fn_id.and_then(|id| fn_map.get(&id).copied());
+        // Defaults may be spelled in dependency declarations but evaluated
+        // by project functions. Their locals belong to that executing body.
+        if var.storage == trace_ir::StorageClass::Local
+            && program.is_dep_file(span_file)
+            && mapped_fn_id.is_none_or(|id| program.is_dep_file(program.symbols.function(id).file))
+        {
             continue;
         }
 
-        let mapped_fn_id = var.fn_id.and_then(|id| fn_map.get(&id).copied());
         let dependency_global = var.fn_id.is_none()
             && var.storage == trace_ir::StorageClass::Global
             && !var.is_synthetic
@@ -1210,6 +1216,17 @@ fn merge_unit(
         }
     }
 
+    for (old, defaults) in &unit.default_arguments {
+        if let Some(&new) = fn_map.get(old) {
+            let target = program.default_arguments.entry(new).or_default();
+            for value in defaults {
+                if !target.contains(value) {
+                    target.push(value.clone());
+                }
+            }
+        }
+    }
+
     // Declaration metadata must survive symbols-only imports and dependency
     // units too. The maps include reused globals and declaration parameters.
     program.reference_bindings.extend(
@@ -1280,6 +1297,7 @@ fn merge_unit(
         let key = SiteKey {
             occurrence,
             callee_fn_id: cs.callee_fn_id.and_then(|f| fn_map.get(&f).copied()),
+            default_owner: cs.source_key().default_owner.map(|_| mapped_caller),
             ..cs.source_key()
         };
         let source = if remerge || !is_internal_caller {
@@ -1305,6 +1323,9 @@ fn merge_unit(
             .filter_map(|(i, v)| var_map.get(v).map(|nv| (*i, *nv)))
             .collect();
         if let Some(details) = &mut site.details {
+            details.address_return_dst = details
+                .address_return_dst
+                .and_then(|v| var_map.get(&v).copied());
             details.fn_args.retain_mut(|(_, id)| {
                 if let Some(&mapped) = fn_map.get(id) {
                     *id = mapped;
@@ -1322,6 +1343,9 @@ fn merge_unit(
             span
         });
         if let Some(details) = &mut site.details {
+            if let Some(span) = &mut details.default_origin {
+                span.file = map_file(span.file);
+            }
             if let Some((span, expression)) = details.return_operation.as_deref_mut() {
                 span.file = map_file(span.file);
                 *expression = program.source_expressions.intern_shared(expression);
@@ -1487,11 +1511,31 @@ fn merge_unit(
             .filter(|v| v.fn_id.is_none())
             .map(|v| v.id)
             .collect();
+        // Header file-statics receive TU-local storage during this import.
+        // Their initializers must populate that storage even when their only
+        // consumer is a default argument of an external inline getter.
+        internal_init_vars.extend(
+            unit.variables
+                .iter()
+                .filter(|v| v.storage == trace_ir::StorageClass::FileStatic)
+                .map(|v| v.id),
+        );
         for flow in &unit.flow {
-            if references_this_tus_internal_function(flow) {
+            if references_this_tus_internal_function(flow) || is_internal_flow(flow) {
                 for v in flow.vars() {
                     if file_scope_vars.contains(&v) {
                         internal_init_vars.insert(v);
+                    }
+                }
+            }
+        }
+        // A direct reference return can name a file-static cell without a
+        // body constraint. Its initializer belongs to each replayed TU too.
+        for (owner, returns) in &unit.fn_returns {
+            if fn_map.get(owner).copied().is_some_and(is_internal_fn) {
+                for value in returns.iter().filter_map(ReturnFlow::var) {
+                    if file_scope_vars.contains(&value) {
+                        internal_init_vars.insert(value);
                     }
                 }
             }
@@ -1500,56 +1544,17 @@ fn merge_unit(
         while changed {
             changed = false;
             for flow in &unit.flow {
-                match flow {
-                    FlowConstraint::Store { dst, src }
-                    | FlowConstraint::Copy { dst, src }
-                    | FlowConstraint::Load { dst, src }
-                    | FlowConstraint::AddrOfVar { dst, src }
-                    | FlowConstraint::UnwrapPointer { dst, src }
-                        if file_scope_vars.contains(dst) && file_scope_vars.contains(src) =>
-                    {
-                        let has_dst = internal_init_vars.contains(dst);
-                        let has_src = internal_init_vars.contains(src);
-                        if (has_dst || has_src) && (!has_dst || !has_src) {
-                            internal_init_vars.insert(*dst);
-                            internal_init_vars.insert(*src);
-                            changed = true;
-                        }
+                if flow.vars().any(|v| internal_init_vars.contains(&v)) {
+                    for var in flow.vars().filter(|v| file_scope_vars.contains(v)) {
+                        changed |= internal_init_vars.insert(var);
                     }
-                    FlowConstraint::GepField { dst, base, .. }
-                        if file_scope_vars.contains(dst) && file_scope_vars.contains(base) =>
-                    {
-                        let has_dst = internal_init_vars.contains(dst);
-                        let has_base = internal_init_vars.contains(base);
-                        if (has_dst || has_base) && (!has_dst || !has_base) {
-                            internal_init_vars.insert(*dst);
-                            internal_init_vars.insert(*base);
-                            changed = true;
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
     }
 
     let is_supporting_flow = |flow: &FlowConstraint| {
-        if internal_init_vars.is_empty() {
-            return false;
-        }
-        match flow {
-            FlowConstraint::Store { dst, src }
-            | FlowConstraint::Copy { dst, src }
-            | FlowConstraint::Load { dst, src }
-            | FlowConstraint::AddrOfVar { dst, src }
-            | FlowConstraint::UnwrapPointer { dst, src } => {
-                internal_init_vars.contains(dst) && internal_init_vars.contains(src)
-            }
-            FlowConstraint::GepField { dst, base, .. } => {
-                internal_init_vars.contains(dst) && internal_init_vars.contains(base)
-            }
-            _ => false,
-        }
+        !internal_init_vars.is_empty() && flow.vars().all(|v| internal_init_vars.contains(&v))
     };
 
     let replay_in_tu = |flow: &FlowConstraint| {
@@ -1650,7 +1655,8 @@ fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
     match flow {
         FlowConstraint::AddrOfFn { callee, .. }
         | FlowConstraint::ArrayFnMember { callee, .. }
-        | FlowConstraint::CallReturnResolved { callee, .. } => Some(*callee),
+        | FlowConstraint::CallReturnResolved { callee, .. }
+        | FlowConstraint::CallReferenceReturnDeclared { callee, .. } => Some(*callee),
         // A call follows the function it is written in: dropped with it in
         // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
         FlowConstraint::CallReturn { caller, .. } => *caller,
@@ -1660,6 +1666,10 @@ fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
 }
 
 fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
+    let mut flow = flow;
+    while let ReturnFlow::LvalueAddress(inner) = flow {
+        flow = inner;
+    }
     match flow {
         ReturnFlow::AddrOfFn { callee } => Some(*callee),
         _ => None,
@@ -1755,6 +1765,11 @@ fn merge_types(
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
             dst.register_alias_ref_with_reference(alias, desc, src.alias_is_reference(alias));
+        }
+        // The callable return category is independent of alias registration.
+        // Merge it monotonically even when an earlier unit supplied the name.
+        if src.alias_callable_returns_reference(alias) {
+            dst.set_alias_callable_reference(alias, true);
         }
     }
     map
@@ -1930,6 +1945,19 @@ fn remap_flow(
             dst: rv(*dst),
             callee: rf(*callee),
         },
+        FlowConstraint::CallReferenceReturn { dst, callee_name } => {
+            FlowConstraint::CallReferenceReturn {
+                dst: rv(*dst),
+                callee_name: callee_name.clone(),
+            }
+        }
+        FlowConstraint::CallReferenceReturnDeclared { dst, callee, args } => {
+            FlowConstraint::CallReferenceReturnDeclared {
+                dst: rv(*dst),
+                callee: rf(*callee),
+                args: args.iter().map(|(index, var)| (*index, rv(*var))).collect(),
+            }
+        }
         FlowConstraint::CallReturnIndirect { dst, callee_var } => {
             FlowConstraint::CallReturnIndirect {
                 dst: rv(*dst),
@@ -1962,6 +1990,9 @@ fn remap_return_flow(
             callee: rf(*callee),
         },
         ReturnFlow::Copy { src } => ReturnFlow::Copy { src: rv(*src) },
+        ReturnFlow::LvalueAddress(inner) => {
+            ReturnFlow::LvalueAddress(Box::new(remap_return_flow(inner, fn_map, var_map)))
+        }
         ReturnFlow::Call { callee_name } => ReturnFlow::Call {
             callee_name: callee_name.clone(),
         },
@@ -2213,6 +2244,29 @@ mod tests {
             beyond,
             "an id outside the map is its own"
         );
+    }
+
+    #[test]
+    fn merge_types_unions_callable_reference_flags_for_existing_aliases() {
+        let shape = TypeDesc::Ptr(Box::new(TypeDesc::FnPtr {
+            ret: Box::new(TypeDesc::Int),
+            params: Vec::new(),
+        }));
+        let mut dst = trace_ir::TypeTable::new();
+        dst.register_alias_ref_with_reference("Getter", &shape, false);
+        let mut src = trace_ir::TypeTable::new();
+        src.register_alias_ref_with_reference("Getter", &shape, false);
+        src.set_alias_callable_reference("Getter", true);
+        merge_types(&mut dst, &src, false, None);
+        assert!(dst.alias_callable_returns_reference("Getter"));
+        assert!(!dst.alias_is_reference("Getter"));
+        assert_eq!(dst.resolve_alias("Getter"), Some(&shape));
+
+        // A later unit lacking the independent flag must not clear it.
+        let mut without_flag = trace_ir::TypeTable::new();
+        without_flag.register_alias_ref_with_reference("Getter", &shape, false);
+        merge_types(&mut dst, &without_flag, false, None);
+        assert!(dst.alias_callable_returns_reference("Getter"));
     }
 
     fn int_field(name: &str) -> (String, TypeDesc) {

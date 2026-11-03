@@ -4,6 +4,152 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Preserve pointer and callback values through conditionals (#244)
+
+Both arms of `condition ? left : right` now contribute values through
+initializers, assignments, returns, arguments and indirect callees, including
+across translation units. Nested calls retain their source sites and return
+destinations, and link-image resolution and pointee compatibility remain in
+effect. Conditional `auto` inference compares type shapes independently of
+class layout fields. Default-member initializer caches remain isolated, and
+unknown nested types no longer trigger exponential probing.
+GNU omitted-middle conditionals retain their condition's value. Assignment
+and comma arms preserve their result values and side effects, and addresses
+of conditional lvalues retain the selected original cells.
+Conditional field receivers and dereference operands preserve reads and
+writes. Function addresses, standalone compound lvalue addresses, assignments
+to conditional lvalues and reference-returning call arms use the shared
+lvalue lowering. Reference addresses preserve their original cells across
+translation units and indirect or virtual calls; comma operands retain
+source provenance.
+Compound assignments to conditional, comma and assignment lvalues no longer
+recurse into themselves. Conditional subscripts preserve values and stores,
+including addresses of callback-array elements. C++ Base/Derived pointer
+arms retain the base receiver type, and `decltype(auto)` lvalue returns
+preserve reference addresses.
+Addresses of subscript arms (`&(c ? p[i] : q[j])`) use the tables' pointer
+values and retain the selected element cells through arguments and returns.
+Lvalue reference casts retain referent addresses and cast provenance in
+conditional arms, stores and reference-returning getters.
+Explicit function-reference cast targets and functional casts through known
+reference aliases retain addresses without inventing calls to the alias.
+Functional reference casts retain argument and callee values. Complete
+function-reference aliases and deduced function-reference selectors preserve
+addresses, and file-scope direct reference-getter initializers retain return
+flow through post-merge file and link-target resolution.
+Callback-array initializer elements also use the shared compound value and
+array element summary, including nested lists and call arms. Reference
+binding detection follows pointer layers for `F*&` while distinguishing
+pointers to functions returning references. Functional reference casts retain
+their alias's referent type as receivers and preserve original array cells
+when used as subscript tables.
+Reference-alias lookup stops at nearer class declarations. Reference casts
+also preserve assignment targets and C-style cast addresses in arguments;
+complete pointer-reference and trailing-alias return declarations retain
+address facts. Value casts around array elements preserve their compound
+values, and positional struct-array members use field-specific aggregate
+flow. File-scope comma operands and conditional conditions retain evaluated
+assignment effects through the shared cache.
+Reference-return prototypes retain aliased return types before wrapper bodies
+are lowered. Cast subscript tables preserve their pointer values, and aggregate
+elements retain object addresses for member projection. Compound designated
+struct-array fields use their declared field paths. Null-or-array selectors
+decay to pointers, and Base/Derived object lvalues retain their base receiver
+type. Casts to rvalue references to functions preserve function lvalues.
+The file-scope initializer effects walk covers addresses, array decay, indices
+and lambda init-captures while excluding the lambda body.
+Range-for loops consume selected array elements. Compound callable objects
+resolve `operator()`, and comma/assignment method receivers retain their class.
+Dereferenced built-in pointer offsets preserve element-summary addresses
+through reference returns. File-scope member reference getters retain their selected declaration
+across merge, with signature filtering before visibility and local-definition
+preference; overloads and link images stay separate.
+Typed aggregate-array initialization covers anonymous/C structs, unions,
+mixed and nested designators, and converting constructors. Array decay keeps
+multidimensional storage, string values for `dlsym`, and struct object addresses
+through pointer casts. Functional pointer aliases and parenthesized alias
+casts preserve values without phantom calls. Indirect reference-returning
+callables retain deduced reference addresses. File-scope constructor/default
+initializers retain evaluated effects, `_Generic` controls stay unevaluated,
+and deep initializer walks warn at the AST limit instead of overflowing.
+Designated cursors retain all positional array elements and complete omitted
+member defaults, including partially initialized globals and nested lists.
+Indexed member paths load pointer values, nested known offsets retain values,
+and selected-pointer dereferences retain callable-object edges. Callable
+selectors and fields preserve reference-return category. File-scope free/member
+reference getters retain selected signatures and actual argument bindings,
+with address/provenance flow through the original reference cells.
+Reference-return forwarding retains the selected call and its arguments for
+address and value consumers. Deduced callable variables and indexed callable
+tables retain reference-return binding. C tag names no longer hide typedefs
+in parenthesized alias casts, and comma operands inside those casts retain
+their value and evaluated effects. Pointer offsets flow through ordinary
+values, arguments, conditional arms and dereferenced callees, including
+known unscoped enum offsets; probing deep arithmetic uses a bounded stack.
+Global defaults cover anonymous aggregates, the active union member and
+C++20 parenthesized aggregate initialization. Explicit union designators
+suppress all inactive members' defaults.
+HDF argument-row checks are centered on the measured 72255 rows with their
+existing tolerances. The negative SPI IRQ-target check has a companion guard
+requiring its eight indirect member sites; the evaluation report distinguishes
+the callback member spellings from their enclosing caller names.
+The 60 known-imprecise HDF audio edges have a separate source/definition identity
+probe, so same-total target swaps and duplicate replacements fail validation.
+Selected reference getters participate in merge dependency filtering and TU
+replay, including their file-static initialization support. Mixed return
+categories retain every viable value. Nested pointer indices, dereferenced
+compound callees, offset tables/returns and reference-cast comma addresses
+preserve the required loads and original cells. Callable binding survives
+deferred initialization, offsets and casted tables; defined unscoped enumerators
+are integral offsets. Global array defaults use written extents. Omitted
+file-scope getter arguments retain scoped declaration defaults through header
+imports and merge, and explicit arguments suppress their evaluation.
+Callable objects' selected operators and explicit reference-returning lambdas
+retain their return category in deduced wrappers. Compatible union views share
+storage cells, and known aggregate-to-first-member casts project the first
+member without joining later fields. Nested member lookup uses the field's
+declared type and shared forward-tag resolver. Conditional type results cache
+suffix probes, including misses, and materialization honors the AST depth bound.
+Earlier pinned comparisons remove 22 wrong-type tester edges and add three USB
+callback targets plus two separately guarded instance-summary extras; HDF's
+indirect pin is 5139.
+The configured-indexing regression waits for all admitted callbacks to start,
+avoiding a scheduler-dependent false assertion about their entry order.
+Omitted array bounds use initialized designator coverage when completing
+defaults, avoiding a spurious extra default for dense lists while preserving
+gaps and conservative handling of uncomputed written bounds. Type merges
+monotonically retain callable-reference alias flags even for existing aliases.
+Regressions also pin explicit reference arguments of file-scope member getters.
+Class-scoped and imported unscoped enums, built-in integer arithmetic, casts
+and `sizeof` expressions retain validated pointer-offset values. Ordinary
+free/member calls and constructors bind retained omitted defaults in declaration
+scope, including reference arguments and statically selected virtual defaults.
+Explicit arguments keep their positions and suppress their defaults. Nested
+default calls retain each executing caller and declaration source provenance
+through header merges, including project evaluations of dependency declarations.
+Unknown overload candidates can still contribute extra defaults; the analysis
+documentation states this and the remaining evaluation boundaries explicitly.
+Fresh exports retain all existing call targets and match across job counts;
+six HDF service arguments now use projected member addresses. Argument bands
+now center on HDF 72232, HiView 32461 and
+Camera 58546 with unchanged tolerances; new probes separately guard six
+conservative `std::any` default calls and one cross-header constructor candidate.
+First-member pointer projections now survive return, argument and dereference
+consumers. Reference defaults bound to values materialize temporary cells;
+cached default calls retain loop evidence from every invoking host. Sequencing
+marks an explicit coverage gap for late default calls until their argument
+order is represented. Address/array-decay expansion shares the AST budget,
+and function-designator/lvalue category probes cache hits and misses with
+isolated initializer-tree lifetimes.
+
+Rules and remaining modeling dependencies:
+[conditional values](docs/ANALYSIS.md#conditional-values).
+The explicit [implementation limitations](docs/ANALYSIS.md#conditional-value-limitations)
+define the coverage boundary; this feature does not imply complete C/C++
+expression, conversion or library modeling.
+Regression coverage, pinned-corpus changes and timing measurements:
+[evaluation report](docs/EVAL_REPORT.md#conditional-pointer-and-callback-values--2026-11-03).
+
 ### Preserve pointee aliases through owning-pointer `get()` (#247)
 
 Bodyless `std::shared_ptr<T>::get()` and `std::unique_ptr<T>::get()` retain

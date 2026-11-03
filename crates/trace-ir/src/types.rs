@@ -504,9 +504,13 @@ pub struct TypeTable {
     /// Aliases whose outer pointer layer represents a C++ reference.
     /// Kept with alias descriptors through header caching and merging.
     reference_aliases: FxHashSet<String>,
+    reference_callable_aliases: FxHashSet<String>,
     /// Reference members by declaring class. Field descriptors otherwise
     /// describe the referent; preserve this distinction through header merges.
     reference_fields: FxHashMap<String, FxHashSet<String>>,
+    reference_callable_fields: FxHashMap<String, FxHashSet<String>>,
+    integer_enums: FxHashSet<String>,
+    integer_enumerators: FxHashSet<String>,
     /// Each class's own constructor declaration metadata needed by types-only
     /// header imports, before constructor symbols merge into a translation unit.
     user_provided_ctors: FxHashSet<String>,
@@ -554,7 +558,11 @@ impl TypeTable {
             union_epoch: 0,
             aliases: IndexMap::default(),
             reference_aliases: FxHashSet::default(),
+            reference_callable_aliases: FxHashSet::default(),
             reference_fields: FxHashMap::default(),
+            reference_callable_fields: FxHashMap::default(),
+            integer_enums: FxHashSet::default(),
+            integer_enumerators: FxHashSet::default(),
             user_provided_ctors: FxHashSet::default(),
             declared_ctors: FxHashSet::default(),
             default_ctors: FxHashMap::default(),
@@ -921,12 +929,57 @@ impl TypeTable {
         }
     }
 
+    /// Whether a callable alias returns a reference, independently of the
+    /// alias's own binding (a function pointer is still a value).
+    pub fn set_alias_callable_reference(&mut self, alias: &str, reference: bool) {
+        if reference {
+            self.reference_callable_aliases.insert(alias.to_owned());
+        } else {
+            self.reference_callable_aliases.remove(alias);
+        }
+    }
+
+    pub fn alias_callable_returns_reference(&self, alias: &str) -> bool {
+        self.reference_callable_aliases.contains(alias)
+    }
+
     pub fn alias_is_reference(&self, alias: &str) -> bool {
         self.reference_aliases.contains(alias)
     }
 
     pub fn has_reference_aliases(&self) -> bool {
         !self.reference_aliases.is_empty()
+    }
+
+    /// Unscoped enum tags admit built-in integer offsets; scoped enums and
+    /// unknown/class spellings do not. This does not change their type shape.
+    pub fn note_integer_enumerator(&mut self, name: String) {
+        self.integer_enumerators.insert(name);
+    }
+
+    pub fn is_integer_enumerator(&self, name: &str) -> bool {
+        self.integer_enumerators.contains(name)
+    }
+
+    pub fn note_integer_enum(&mut self, name: String) {
+        self.integer_enums.insert(name);
+    }
+
+    pub fn is_integer_enum(&self, name: &str) -> bool {
+        self.integer_enums.contains(name)
+    }
+
+    pub fn note_reference_callable_field(&mut self, class: &str, field: &str) {
+        self.reference_callable_fields
+            .entry(class.to_owned())
+            .or_default()
+            .insert(field.to_owned());
+    }
+
+    pub fn field_callable_returns_reference(&self, class: &str, field: &str) -> bool {
+        self.reference_callable_fields
+            .get(class)
+            .is_some_and(|fields| fields.contains(field))
     }
 
     pub fn note_reference_field(&mut self, class: &str, field: &str) {
@@ -1092,7 +1145,11 @@ impl TypeTable {
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
         self.reference_aliases.shrink_to_fit();
+        self.reference_callable_aliases.shrink_to_fit();
         self.reference_fields.shrink_to_fit();
+        self.reference_callable_fields.shrink_to_fit();
+        self.integer_enums.shrink_to_fit();
+        self.integer_enumerators.shrink_to_fit();
         self.user_provided_ctors.shrink_to_fit();
         self.declared_ctors.shrink_to_fit();
         self.default_ctors.shrink_to_fit();
@@ -1459,6 +1516,16 @@ impl TypeTable {
         }
         // Membership metadata only: iteration order cannot affect type IDs
         // or output, just as for the declaration sets above.
+        self.integer_enums
+            .extend(other.integer_enums.iter().cloned());
+        self.integer_enumerators
+            .extend(other.integer_enumerators.iter().cloned());
+        for (class, fields) in &other.reference_callable_fields {
+            self.reference_callable_fields
+                .entry(class.clone())
+                .or_default()
+                .extend(fields.iter().cloned());
+        }
         for (class, fields) in &other.reference_fields {
             self.reference_fields
                 .entry(class.clone())
@@ -1699,7 +1766,7 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
         | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. })
             if is_anonymous_tag(x) || is_anonymous_tag(y) =>
         {
-            same_type_shape(a, b, true)
+            same_type_shape_inner(a, b, true)
         }
         (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
         | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. }) => {
@@ -1712,7 +1779,7 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
                 || y.is_empty()
                 || (x.len() == y.len() && x.iter().zip(y).all(|(x, y)| may_name_same_type(x, y)))
         }
-        _ => same_type_shape(a, b, true),
+        _ => same_type_shape_inner(a, b, true),
     }
 }
 
@@ -1814,9 +1881,9 @@ fn same_decayed_param(da: &TypeDesc, db: &TypeDesc, unresolved_matches: bool) ->
         (TypeDesc::Ptr(x), TypeDesc::Array { elem: y, .. })
         | (TypeDesc::Array { elem: x, .. }, TypeDesc::Ptr(y))
         | (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => {
-            same_type_shape(x, y, unresolved_matches)
+            same_type_shape_inner(x, y, unresolved_matches)
         }
-        _ => same_type_shape(da, db, unresolved_matches),
+        _ => same_type_shape_inner(da, db, unresolved_matches),
     }
 }
 
@@ -1865,16 +1932,25 @@ pub fn is_anonymous_tag(name: &str) -> bool {
     }
 }
 
+/// Whether two value types have the same shape, without parameter array
+/// decay at the outermost level. Named class and union tags compare by name,
+/// independently of the layout fields available at either occurrence.
+/// Unknown matches only Unknown; it never stands for a resolved type.
+/// Function-pointer parameter lists use the ordinary parameter decay rules.
+pub fn same_type_shape(a: &TypeDesc, b: &TypeDesc) -> bool {
+    same_type_shape_inner(a, b, false)
+}
+
 /// Structural comparison behind [`same_param_type`].
 ///
 /// `Unknown` against anything else answers `unresolved_matches`; against
 /// another `Unknown` it falls to the discriminant arm and matches either way.
-fn same_type_shape(a: &TypeDesc, b: &TypeDesc, unresolved_matches: bool) -> bool {
+fn same_type_shape_inner(a: &TypeDesc, b: &TypeDesc, unresolved_matches: bool) -> bool {
     match (a, b) {
         (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) if unresolved_matches => true,
-        (TypeDesc::Ptr(x), TypeDesc::Ptr(y)) => same_type_shape(x, y, unresolved_matches),
+        (TypeDesc::Ptr(x), TypeDesc::Ptr(y)) => same_type_shape_inner(x, y, unresolved_matches),
         (TypeDesc::Array { elem: x, size: sx }, TypeDesc::Array { elem: y, size: sy }) => {
-            same_array_extent(*sx, *sy) && same_type_shape(x, y, unresolved_matches)
+            same_array_extent(*sx, *sy) && same_type_shape_inner(x, y, unresolved_matches)
         }
         (
             TypeDesc::Struct {
@@ -1908,7 +1984,7 @@ fn same_type_shape(a: &TypeDesc, b: &TypeDesc, unresolved_matches: bool) -> bool
                     && is_anonymous_tag(y)
                     && fx.len() == fy.len()
                     && fx.iter().zip(fy).all(|((n1, t1), (n2, t2))| {
-                        n1 == n2 && same_type_shape(t1, t2, unresolved_matches)
+                        n1 == n2 && same_type_shape_inner(t1, t2, unresolved_matches)
                     })
             } else {
                 x == y
@@ -1925,7 +2001,7 @@ fn same_type_shape(a: &TypeDesc, b: &TypeDesc, unresolved_matches: bool) -> bool
             },
         ) => {
             p1.len() == p2.len()
-                && same_type_shape(r1, r2, unresolved_matches)
+                && same_type_shape_inner(r1, r2, unresolved_matches)
                 // The parameters of the pointed-to function are parameters,
                 // so they decay like any other; the RETURN type does not.
                 && p1
@@ -2466,6 +2542,42 @@ mod tests {
         });
         assert!(same_param_type(&t, arr10, arr20));
         assert!(same_param_type(&t, arr10, ptr));
+    }
+
+    #[test]
+    fn value_type_shapes_ignore_named_layouts_without_wildcards_or_outer_decay() {
+        let complete = TypeDesc::Struct {
+            name: "ns::S".into(),
+            fields: vec![("n".into(), TypeDesc::Int)],
+        };
+        let declared = TypeDesc::Struct {
+            name: "::ns::S".into(),
+            fields: Vec::new(),
+        };
+        let other = TypeDesc::Struct {
+            name: "other::S".into(),
+            fields: vec![("n".into(), TypeDesc::Int)],
+        };
+        let pointer = |desc| TypeDesc::Ptr(Box::new(desc));
+        assert!(same_type_shape(
+            &pointer(complete.clone()),
+            &pointer(declared)
+        ));
+        assert!(!same_type_shape(
+            &pointer(complete.clone()),
+            &pointer(other)
+        ));
+        assert!(!same_type_shape(
+            &pointer(complete),
+            &pointer(TypeDesc::Unknown)
+        ));
+        assert!(!same_type_shape(
+            &TypeDesc::Array {
+                elem: Box::new(TypeDesc::Int),
+                size: Some(4)
+            },
+            &pointer(TypeDesc::Int),
+        ));
     }
 
     /// Tags compare by name, and an anonymous tag has none -- so every

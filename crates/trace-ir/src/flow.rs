@@ -16,6 +16,9 @@ pub enum ReturnFlow {
     Call {
         callee_name: String,
     },
+    /// Address of a returned reference's original lvalue. Expanded only by
+    /// address consumers; value consumers keep the ordinary return facts.
+    LvalueAddress(Box<ReturnFlow>),
 }
 
 /// Statement-level flow facts extracted during IR lowering.
@@ -54,6 +57,17 @@ pub enum FlowConstraint {
     /// Return from an exact, already-resolved function (not name-only lookup).
     /// Used after merge when a file-scope initializer has no CallSite.
     CallReturnResolved { dst: VarId, callee: FnId },
+    /// Address of a reference returned by a direct file-scope getter.
+    /// Resolved after merge in the destination's file and link target.
+    CallReferenceReturn { dst: VarId, callee_name: String },
+    /// Address returned by a selected free/member declaration at file scope.
+    /// Match definitions by signature and destination scope after merge,
+    /// then bind the retained explicit arguments to their parameters.
+    CallReferenceReturnDeclared {
+        dst: VarId,
+        callee: FnId,
+        args: Vec<(u32, VarId)>,
+    },
     /// `dst = callee_var()` — callee resolved at analysis time from the
     /// function-pointer variable's points-to set (indirect / virtual calls).
     CallReturnIndirect { dst: VarId, callee_var: VarId },
@@ -73,7 +87,7 @@ pub enum FlowConstraint {
 
 impl FlowConstraint {
     /// Every variable the constraint names, destination first.
-    pub fn vars(&self) -> impl Iterator<Item = VarId> {
+    pub fn vars(&self) -> impl Iterator<Item = VarId> + '_ {
         let (first, second) = match *self {
             FlowConstraint::Copy { dst, src }
             | FlowConstraint::Load { dst, src }
@@ -86,11 +100,19 @@ impl FlowConstraint {
             FlowConstraint::AddrOfFn { dst, .. }
             | FlowConstraint::CallReturn { dst, .. }
             | FlowConstraint::CallReturnResolved { dst, .. }
+            | FlowConstraint::CallReferenceReturn { dst, .. }
+            | FlowConstraint::CallReferenceReturnDeclared { dst, .. }
             | FlowConstraint::NewHeap { dst }
             | FlowConstraint::StringConst { dst, .. }
             | FlowConstraint::NullPointer { dst } => (dst, None),
         };
-        std::iter::once(first).chain(second)
+        let arguments = match self {
+            FlowConstraint::CallReferenceReturnDeclared { args, .. } => args.as_slice(),
+            _ => &[],
+        };
+        std::iter::once(first)
+            .chain(second)
+            .chain(arguments.iter().map(|(_, var)| *var))
     }
 }
 
@@ -99,6 +121,7 @@ impl ReturnFlow {
     pub fn var(&self) -> Option<VarId> {
         match *self {
             ReturnFlow::AddrOfVar { src } | ReturnFlow::Copy { src } => Some(src),
+            ReturnFlow::LvalueAddress(ref flow) => flow.var(),
             ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => None,
         }
     }

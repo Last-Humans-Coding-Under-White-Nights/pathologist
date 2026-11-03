@@ -79,9 +79,10 @@ void read_fn_ptr_ptr(void (**pfp)(void)) { void (*fnp_got)(void) = *pfp; }
 void take_fnp(void (*fnp_passed)(void)) {}
 void pass_fn_ptr_ptr(void (**pfp)(void)) { take_fnp(*pfp); }
 
-// A store through no pointer the lhs resolves evaluates no rhs either; C
-// has no call root to decompose `get_h()->pp` from.
+// Built-in pointer offsets retain the index-insensitive destination summary.
 void store_offset(struct Holder *h, int **out) { *(out + 1) = *h->pp; }
+// A store through an unresolved lhs evaluates no rhs either; C has no call
+// root to decompose `get_h()->pp` from.
 struct Holder *get_h(void) { return &g_h; }
 void store_call_root(struct Holder *h) { *get_h()->pp = *h->pp; }
 

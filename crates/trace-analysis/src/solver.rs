@@ -276,7 +276,8 @@ struct SolverState {
     /// (docs/ANALYSIS.md, "Variable cells"). Filled when the cell's address is
     /// first taken ([`register_synced_cell`]), so the per-pop hooks are one
     /// lookup each.
-    synced_cell: FxHashMap<PagNodeId, LocId>,
+    /// The flag excludes an array's own storage from its element contents.
+    synced_cell: FxHashMap<PagNodeId, (LocId, bool)>,
     cell_owner: FxHashMap<LocId, PagNodeId>,
     /// What [`wire_callback`] wired, for the arg-flow rows.
     forwarded_arg_flow: ForwardedArgFlow,
@@ -1533,6 +1534,25 @@ fn solve(
                                 }
                             }
                         }
+                        if let Some(dst) = cs.address_return_dst() {
+                            let dst = pag.var_node_id(dst);
+                            let before = pag.constraints.len();
+                            pag.expand_reference_returns(
+                                program,
+                                dst,
+                                callee,
+                                models,
+                                &mut FxHashSet::default(),
+                            );
+                            if pag.constraints.len() > before {
+                                for c in &pag.constraints[before..] {
+                                    seed_addr_of(pag, program, &mut st, &mut scratch, c);
+                                }
+                                for src in pag.index_new_constraints(before) {
+                                    st.push(src);
+                                }
+                            }
+                        }
                         apply_fn_model(
                             pag,
                             program,
@@ -2266,8 +2286,8 @@ fn var_is_pointer_like(program: &Program, var: VarId) -> bool {
     })
 }
 
-/// Start keeping `cell` in step with its variable's node, if it is a pointer
-/// variable's own cell. Whatever each side already holds reaches the other:
+/// Keep a pointer variable or pointer-array element summary in step with
+/// its own cell. Whatever each side already holds reaches the other:
 /// the address may be taken long after the variable got its value.
 fn register_synced_cell(
     pag: &Pag,
@@ -2281,13 +2301,31 @@ fn register_synced_cell(
     };
     // Field cells and summaries also carry `var`: only the variable's own
     // cell is synced.
-    if pag.var_location.get(&v) != Some(&cell) || !var_is_pointer_like(program, v) {
+    if pag.var_location.get(&v) != Some(&cell) {
+        return;
+    }
+    let desc = program
+        .types
+        .get(program.symbols.variable(v).type_id)
+        .desc
+        .as_ref();
+    let array = matches!(desc, trace_ir::TypeDesc::Array { .. }) && {
+        let mut element = desc;
+        while let trace_ir::TypeDesc::Array { elem, .. } = element {
+            element = elem;
+        }
+        matches!(
+            element,
+            trace_ir::TypeDesc::Ptr(_) | trace_ir::TypeDesc::FnPtr { .. }
+        )
+    };
+    if !array && !var_is_pointer_like(program, v) {
         return;
     }
     let Some(&node) = pag.var_node.get(&v) else {
         return;
     };
-    st.synced_cell.insert(node, cell);
+    st.synced_cell.insert(node, (cell, array));
     st.cell_owner.insert(cell, node);
     scratch.held.clear();
     if let Some(held) = st.pts.get(&node) {
@@ -2295,7 +2333,17 @@ fn register_synced_cell(
     }
     // Into the ordered cell in a fixed order, not the hash set's.
     scratch.held.sort_unstable();
-    write_to_cell(pag, st, &mut scratch.holders, cell, &scratch.held);
+    write_to_cell(
+        pag,
+        st,
+        &mut scratch.holders,
+        cell,
+        scratch
+            .held
+            .iter()
+            .copied()
+            .filter(|&loc| !array || loc != cell),
+    );
     st.merge_memory_into_if_grown(pag, &mut scratch.fresh, node, cell);
 }
 
@@ -2306,7 +2354,7 @@ fn write_to_cell(
     st: &mut SolverState,
     holders: &mut Vec<PagNodeId>,
     cell: LocId,
-    locs: &[LocId],
+    locs: impl IntoIterator<Item = LocId>,
 ) {
     let filter = FnFilter::of(st.slot_guard.get(&cell));
     let grew = {
@@ -2322,8 +2370,7 @@ fn write_to_cell(
             memory_bits,
             loc_bits,
             cell,
-            locs.iter()
-                .copied()
+            locs.into_iter()
                 .filter(|&l| filter.admits(fn_arity, pag, l)),
         )
     };
@@ -2341,8 +2388,14 @@ fn sync_var_to_cell(
     node: PagNodeId,
     delta: &[LocId],
 ) {
-    if let Some(&cell) = st.synced_cell.get(&node) {
-        write_to_cell(pag, st, holders, cell, delta);
+    if let Some(&(cell, array)) = st.synced_cell.get(&node) {
+        write_to_cell(
+            pag,
+            st,
+            holders,
+            cell,
+            delta.iter().copied().filter(|&loc| !array || loc != cell),
+        );
     }
 }
 
@@ -2373,7 +2426,10 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
         // callbacks through its pointee just as a struct pointer does.
         TD::Ptr(inner) => match inner.as_ref() {
             TD::FnPtr { .. } | TD::Unknown | TD::Struct { .. } | TD::Union { .. } => true,
-            TD::Ptr(slot) => matches!(slot.as_ref(), TD::FnPtr { .. }),
+            // Reference addresses can add further pointer layers before the
+            // callback cell. Their values may arrive through a return copy
+            // after initial argument wiring, so retain the persistent edge.
+            TD::Ptr(_) => matches!(inner.innermost().0, TD::FnPtr { .. }),
             _ => false,
         },
         // Pointer-flagged variable whose recorded shape is not a pointer: a

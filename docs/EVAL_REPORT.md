@@ -1,5 +1,1388 @@
 # Evaluation Report
 
+## Conditional pointer and callback values — 2026-11-03
+
+Issue #244: conditional arms parsed successfully but did not contribute their
+pointer or callback values to the result. Both arms now contribute to one
+shared expression value. Semantics, type inference and remaining modeling
+dependencies are defined in
+[Conditional values](ANALYSIS.md#conditional-values).
+
+These measurements validate the configured corpora and focused fixtures.
+They do not establish complete C/C++ expression coverage. The authoritative
+[implementation limitations](ANALYSIS.md#conditional-value-limitations) state
+the remaining type/conversion, storage-summary, library-model and traversal
+boundaries. Known extra targets below are precision debt, not recovered calls.
+
+### Fresh pinned-corpus comparison
+
+Compare release builds of parent `89d34c2` and this change, using clean pinned
+checkouts from `scripts/eval_expected.json`, default minimal exports, eight
+jobs and `TRACE_SOLVE_BUDGET_POPS=800000`. HDF is `cdc75a20bb8f`, HiView is
+`92408e2072bd`, and camera is `8ffd69dcd47f`. File counts,
+diagnostics, IPC edges and dlsym edges are unchanged. The final ordinary-default
+follow-up adds external evaluation sites and one separately identified
+cross-header constructor candidate, as audited below. Callable alias
+casts remove phantom external functions/calls; typed array fields exclude
+wrong-member IRQ targets and recover listener callbacks, as detailed below.
+Indexed pointer members recover another 14 HDF callback edges and expose
+18 additional opaque-member fallback edges. The subsequent offset-value fix
+exposes 60 further HDF callback-summary extras. The final nested-field resolver
+removes 22 cross-type tester targets and adds three direction-matching USB
+callbacks plus two instance-summary extras. The comparisons below separate
+those precision limits from recovered targets.
+Every pre-existing dispatch and calibration probe passes. The HDF exact indirect-edge
+expectation is updated, and focused production probes cover the recovered
+handler targets and Camera value-arm flow. Existing tolerance bands are retained.
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | indirect call edges | 5088 | 5139 |
+| HDF | argument-flow rows | 72125 | 72232 |
+| HDF | flow nodes / edges | 180785 / 160938 | 185571 / 164550 |
+| HiView | argument-flow rows | 32049 | 32461 |
+| HiView | flow nodes / edges | 84193 / 63681 | 85646 / 65849 |
+| camera | external call edges | 46067 | 46073 |
+| camera | indirect call edges | 442 | 443 |
+| camera | argument-flow rows | 57894 | 58546 |
+| camera | flow nodes / edges | 220480 / 156568 | 233407 / 170759 |
+
+Matching call edges by caller/target definition, request and expansion source
+positions, and resolution identifies the original two HDF handler targets
+and three Camera metadata getter targets. The latest review additionally
+recovers six HDF listener lambdas and one Camera listener lambda, removes
+32 wrong-field HDF IRQ edges, and removes eight HDF/three Camera phantom
+alias-cast calls. HiView's named call edges remain identical until the
+ordinary-default follow-up below. The original
+value correction adds 12/9/5 argument bindings; the latest substitutions and
+callback argument changes are audited in the aggregate follow-up below.
+
+- HDF `framework/model/input/driver/hdf_touch.c:297` assigns
+  `enable ? HandleResetEvent : HandlePowerEvent` to `eventHandler`. Its value
+  crosses the argument to `HandleSeqArray`, whose indirect call at line 254
+  now reaches both handlers. Four of the original twelve new argument-flow rows bind
+  the existing `chipDev` and timing arguments to those two handlers; eight
+  other rows pass conditional values to existing callees.
+- HiView's eight new argument-flow rows pass conditional scalar/string values
+  to existing `ExecuteHilog`, `SetEventValue` and `SetKeyValue` targets.
+  A ninth row passes a reference getter's address to `SetHiviewContext`,
+  as detailed in the final review comparison below.
+- Camera `profession_session.cpp:178`, `:597` and `:619` now resolve
+  `metadata->get()` to the external `OHOS::Camera::CameraMetadata::get`.
+  The preceding conditional initializer supplies the agreed metadata type
+  to `auto`. These are external method edges, not recovered callbacks.
+  Three new argument-flow rows feed conditional values to `EnableDeferredType`
+  and the two existing `CreateDisplayName` candidates.
+  Two further rows retain `&cameras_[index]` arguments to existing NDK camera
+  APIs, as detailed in the November 4 subscript-address comparison below.
+  The latest review adds the listener callback's argument and replaces its
+  constructor's phantom cast-result argument with the actual lambda value.
+
+Flow-edge changes are the materialized arm values, their copies and loads,
+new stores/return copies, and propagation through existing constraints:
+
+| Corpus | addr_of | copy | GEP | load | store | call_arg | points_to | unwrap |
+|--------|--------:|-----:|----:|-----:|------:|---------:|----------:|-------:|
+| HDF | +106 | +763 | +1785 | +575 | +218 | +89 | -37 | 0 |
+| HiView | +206 | +783 | +163 | +38 | +72 | +11 | +134 | +5 |
+| camera | +5873 | +782 | +137 | +78 | +33 | +7 | +5739 | +2 |
+
+Source flow-origin rows increase by a net 3330/1135/6664 respectively. The
+per-review comparisons below explain additions and changes in origin kind.
+Unused HDF GEP origins for nested assignments of zero or arithmetic constants
+disappear when there is no modeled RHS value.
+These totals include scalar/string arms as well as pointer and callback arms.
+
+### Camera production forms and validation
+
+`HStreamOperator::GetStreamByStreamID` at line 1008 and
+`GetHdiStreamByStreamID` at line 1018 each retain three distinct getter sites:
+the condition's call still has no return destination, while the two value-arm
+calls now share one. `HCameraSessionManager::GetGroupDefaultSession:115`
+now records a destination for `list.front()` and a null-arm flow.
+`HStreamRepeat::SetStreamInfo:182` now connects the new object's heap value
+through the conditional to `metaProducerSequenceable`, retaining the original
+constructor site. No downstream named call edge changes at these four forms;
+container return models and smart-pointer type visibility remain separate
+dependencies. Regression probes pin their value-arm destinations and the
+null-or-new allocation provenance.
+
+The reduced C/C++ fixture independently covers exact callback sets,
+assignments and stores, nested/parenthesized expressions, pointer/field/address
+arms, nullptr/zero arms, unknown type information, literal conditions, calls
+in the condition and arms, receiver extraction, indirect callees returning
+callbacks and cross-TU returns. Link-image regressions exclude wrong targets
+and incompatible fields remain negative controls. `cargo test --workspace`
+passes all 2717 tests. Full regression exports match at jobs 1 and 4; all
+logical analysis rows of fresh pinned-corpus minimal exports match at jobs 1
+and 8, using `scripts/compare_analysis_databases.py` (run metadata excluded).
+
+### Review follow-up — 2026-11-03
+
+The default-member initializer reproducer constructs an aggregate containing
+ten distinct callback selectors through a constructor's member-initializer
+list, then invokes every member on two objects. The pre-review binary
+reuses callbacks from other members after temporary parse-tree node IDs are
+recycled; the corrected cache isolation keeps exactly each member's two
+callbacks at all twenty sites. Its full exports match at jobs 1 and 4.
+
+Equivalent named pointer shapes now preserve method edges when one arm is
+`&object` (a complete class descriptor) and the other is `new S` or a declared
+getter result (an empty-field descriptor). Both arm orders are covered.
+The shared IR shape comparator preserves distinctions between different
+classes, unknown pointees and pointer/array shapes; it adds no wildcard
+matching to conditional inference.
+
+Unknown nested conditional types are no longer probed again through argument
+typing after a receiver-type miss. A 32-level regression exercises both plain
+and pointer-operand nesting without a wall-clock assertion. A second test
+indexes a parenthesized 32-level callback selector and verifies exactly both
+targets. Separate one-job release CLI measurements, including startup and
+SQLite export, use a generated `c ? alpha : ... : beta` chain:
+
+| Depth | Pre-review | Corrected |
+|------:|-----------:|----------:|
+| 20 | 1.522 s | 0.031 s |
+| 24 | timed out at 20 s | 0.043 s |
+| 32 | timed out at 20 s | 0.024 s |
+
+These single-run timings demonstrate removal of the exponential retry; their
+small corrected differences include normal scheduling and startup variance.
+Fresh pinned analyses before and after these review fixes pass all 119
+checks. Named targets, argument-flow rows, flow edges and source origins are
+unchanged in every corpus, so no expectation changes are needed. HiView and
+camera match in all 49 logical relations. HDF differs only in two conditional
+result temporaries in `hcs_tree_if.c:377` and `:420`, which now carry the
+agreed `DeviceResourceNode` pointer type instead of unknown, and the derived
+database identity digest. Both arms there select the node's child or
+`TraverseTreeNode`'s result. Final fresh exports match in all 49 logical
+relations at jobs 1 and 8 for all three corpora.
+
+The link-image regression compares canonical source paths, so temporary roots
+reached through symlinks (including macOS `/var` to `/private/var`) agree with
+the exported paths. The original failure reproduces with a symlinked `TMPDIR`;
+the corrected assertion passes with both ordinary and symlinked temporary
+roots, retaining the target-isolation and jobs 1/4 export checks.
+
+### Shorthand, compound arms and conditional addresses — 2026-11-03
+
+GNU `p ?: fallback` retains both `p` and `fallback`. Assignment arms supply
+the assigned RHS, with separate copies/stores to their destinations, so an
+unrelated callback previously held by `p` cannot enter the expression result.
+Comma arms preserve the right operand's value and the left operand's calls
+and writes. Their shared value cache keeps nested call return destinations
+and prevents a second assignment lowering in the later body walk.
+
+`&(c ? a : b)` retains the two original cells through pointer arguments,
+initializers and returns. Tests cover names, fields, dereferences and nested
+selectors, and verify writes through the selected address reach both source
+variables. Each argument variant has its own pointer-taking helper, so a
+successful case cannot mask a missing argument in another case. Exact
+callback sets exclude unrelated values, and operation origins retain each
+assignment's own source site. The expanded full fixture remains identical
+at jobs 1 and 4.
+
+Fresh pinned comparisons against the production behavior at `f589071`, with
+the same options and solver budget as above, preserve every named call
+target, argument-flow row and global correctness metric. All 119 checks pass
+at jobs 1 and 8; no further expectation changes are needed. The additional
+flow changes are:
+
+| Corpus | Nodes | Edges | copy | GEP | store | Origin rows |
+|--------|------:|------:|-----:|----:|------:|------------:|
+| HDF | -22 | +8 | +4 | -12 | +16 | +8 |
+| HiView | 0 | +2 | +1 | 0 | +1 | +2 |
+| camera | +10 | +10 | +10 | 0 | 0 | +20 |
+
+HDF gains RHS-result copies for chained `DmacGetDummyBuf` assignments in
+`dmac_core.c:327` and `:330`, and stores into both sides of chained thread
+priority assignments. Twelve unused GEPs from nested zero/arithmetic
+assignments disappear when those side effects are no longer lowered twice.
+Return provenance at the two DMA sites now attaches to the call expression;
+the assignments retain their own operation origins. HiView gains the missing
+outer write in `video_play_latency_monitor.cpp:186`
+(`attachTime = attachLastUpTime = currTime`). Camera's ten self-chained
+assignments retain their call returns through a result temporary and gain
+outgoing copies and assignment provenance. The cumulative tables above
+include these changes. Final fresh corpus exports agree in all 49 logical
+relations across jobs 1 and 8, and all 2668 workspace tests at that stage pass.
+
+### Compound receivers and reference-call addresses — 2026-11-03
+
+The expanded regression fixture checks conditional field roots and pointer
+dereferences against named-pointer controls. Exact callback sets cover reads,
+stores and arguments, reject an incompatible struct's callback, and retain
+one return destination for each call arm. Function-designator addresses,
+standalone comma/assignment addresses and direct assignments to conditional
+lvalues are covered too. Standalone comma operands retain their own operation
+provenance.
+
+Reference-returning call arms now preserve the original lvalue cells. Tests
+cover named, field and dereferenced reference returns; transitive forwarding;
+member, virtual and indirect getters; cross-TU definitions; ordinary value
+consumers; and writes through the returned addresses. Independent helpers
+prevent a working argument from masking another case. Both call arms retain
+their return destinations and exported return wiring. Separate link-image
+tests check image-local static callback targets and deterministic exports at
+jobs 1 and 4. The full fixture also matches across those job counts, and all
+2673 workspace tests pass.
+
+Fresh release analyses compare the reviewed `e34472b` with these follow-ups,
+using the pinned revisions, minimal export and solver budget above. All 119
+checks pass at jobs 1 and 8, and the exports agree in all 49 logical relations
+across job counts. Named call targets and diagnostics are unchanged; no
+expectations need adjustment. Additional flow compared with `e34472b`:
+
+| Corpus | Nodes | Edges | address | copy | GEP | load | points-to | Origins |
+|--------|------:|------:|--------:|-----:|----:|-----:|----------:|--------:|
+| HDF | +16 | +15 | +3 | +5 | +6 | +1 | 0 | +15 |
+| HiView | +96 | +108 | +6 | +68 | +34 | 0 | 0 | +107 |
+| camera | +70 | +70 | +2 | +33 | +33 | 0 | +2 | +68 |
+
+The new GEP/copy pairs retain field addresses for reference-returning getters,
+such as HDF `AstObject::Name` and Camera's `VideoInfo` path getters.
+HDF's three address facts retain subscript-return base summaries;
+`AutoPtr<T>::operator*` also reads its pointer field for the reference address.
+HiView adds address-return wiring for six monitor singleton getters at
+`xperf_monitor_manager.cpp:62–107` and for reference-call forwarding in
+`RawDataBuilder`. Its only new argument-flow row is
+`SetHiviewContext(&GetHiviewContext())` in
+`faultlogger_unittest.cpp:92`, where the reference's address is now passed to
+`context`. HDF and camera argument rows are unchanged after normalizing
+temporary ordinals. Camera also gains two derived points-to facts. No source
+origin is removed. The cumulative tables above include these additions.
+
+At this stage, array-element addresses emitted the same base-array address
+facts as ordinary `&array[i]`, while callbacks loaded through those addresses
+still had an array-storage gap. The following review resolves that gap for
+tracked pointer/callback element summaries.
+
+### Compound assignments, subscripts and deduced references — 2026-11-03
+
+The compound-assignment reproducers (`(c ? p : q) += 1`, `(touch(), p) += 1`,
+`(p = q) += 1` and an address of the first result) no longer re-enter their
+own uncached value lowering. Fixture coverage includes subtraction and scalar
+multiplication, pointer-valued results, and addresses of updated pointer cells.
+
+Conditional subscripts now retain exact callback sets in RHS reads, callees,
+pointer arguments, returns and stores into both selected arrays. Additional
+cases cover pointer arms, comma tables, differing array bounds and arm calls.
+The condition and index calls retain distinct source sites without return
+destinations; the two pointer-returning arms each occur once and share the
+selected address destination. The earlier plain-array and conditional-array
+address controls now reach their callbacks too. A typed IR regression keeps
+the existing signature guard authoritative and verifies that array storage
+addresses never become callback values. Source callback aliases still omit
+parameter descriptors, so that guard test supplies a known IR signature.
+
+Base/Derived pointer receivers match the explicit `Base*` control in both arm
+orders, with transitive inheritance and named/C-style casts. `decltype(auto)`
+tests distinguish parenthesized lvalue returns from unparenthesized value
+returns and scalar expressions, cover trailing return syntax and selected or
+dereferenced references, and verify writes to the original returned cell.
+Rules and remaining dependencies are in
+[Conditional values](ANALYSIS.md#conditional-values) and
+[Return-value flow](ANALYSIS.md#return-value-flow).
+
+Fresh pinned release comparisons against reviewed `eec1a45`, using the same
+options above, preserve every named call target, normalized argument-flow row,
+diagnostic and global correctness metric. All 119 checks pass at jobs 1 and 8;
+no expectations change. All 2676 workspace tests pass, and the full fixture
+exports remain identical at jobs 1 and 4. All 49 logical relations match
+between fresh jobs 1 and 8 exports in every corpus. Additional flow:
+
+| Corpus | Nodes | Edges | address | copy | points-to | Origins |
+|--------|------:|------:|--------:|-----:|----------:|--------:|
+| HDF | +67 | +39 | +5 | +27 | +7 | +32 |
+| HiView | +56 | +116 | 0 | +116 | 0 | +116 |
+| camera | 0 | 0 | 0 | 0 | 0 | 0 |
+
+HDF materializes array-element address returns before copying them to their
+callers. This replaces 27 `addr_of` return-origin rows with `copy` return
+origins and records the body-side address operations, including the creator
+tables in `devsmall_object_config.c` and `devhost_object_config.c`, HDMI tables
+and pin handles. In total, source-origin comparison finds 59 additions and 27
+removals. HiView adds reference-address forwarding and return provenance for
+the `decltype(auto)` handlers in `raw_data_builder.h:261–316`; their ordinary
+call targets and argument rows are unchanged. Camera flow and origin rows are
+unchanged. The cumulative tables above include these changes.
+
+### Addresses of pointer-subscript arms — 2026-11-04
+
+The new fixture reproduces `invoke(&(c ? p[0] : q[0]))` with `p` and `q`
+pointing to separate callback cells. The reviewed `79857a3` records the direct
+call but reaches neither callback; routing every subscript address through
+the table's element-address path restores exactly `alpha` and `beta`.
+The equivalent `invoke(&(c ? p : q)[0])` has its own helper so that its
+working argument cannot mask missing flow in the reproducer.
+
+Further cases cover an ordinary `&p[0]`, stores through the selected address
+to both original cells, a function returning the selected element address,
+and pointer-returning calls used as subscript arms. Each call arm retains one
+site and the shared address destination; its two index calls retain separate
+source sites without pointer return destinations. The expanded fixture
+exports remain deterministic at jobs 1 and 4. All 23 focused conditional
+tests and all 2677 workspace tests pass. Semantics remain in
+[Conditional values](ANALYSIS.md#conditional-values).
+
+Fresh release comparisons against `79857a3` use the same clean pinned
+checkouts, minimal exports and solver budget above. All 119 checks pass at
+jobs 1 and 8 with no expectation changes. Named call targets and diagnostics
+are unchanged. All 49 logical relations match across job counts for every
+corpus. Camera gains exactly two argument rows at
+`camera_ndk_demo/entry/src/main/cpp/camera_manager.cpp:322` and `:381`:
+`&cameras_[cameraDeviceIndex_]` now reaches the `camera` parameter of
+`OH_CameraManager_CreateCameraInput` and
+`OH_CameraManager_GetSupportedCameraOutputCapability`. HDF and HiView argument
+rows are unchanged after normalizing temporary ordinals. Additional flow:
+
+| Corpus | Nodes | Edges | address | copy | GEP | load | store | points-to | Origins |
+|--------|------:|------:|--------:|-----:|----:|-----:|------:|----------:|--------:|
+| HDF | +12 | -25 | -67 | +40 | +40 | +14 | -1 | -51 | +23 |
+| HiView | +24 | +6 | 0 | +2 | +4 | 0 | 0 | 0 | +6 |
+| camera | 0 | -1 | -2 | +3 | 0 | 0 | 0 | -2 | -2 |
+
+HDF replaces root-variable addresses with pointer copies, field GEPs and
+pointer-field loads, including I2C/SPI message tables, camera buffer planes
+and GPIO/DMA tables. HiView retains field paths for `&entry_->datas[current_]`
+in `process_cpu_data.cpp:58` and `thread_cpu_data.cpp:61`. Where the field value
+cannot be resolved, the old fallback address of the root pointer variable is
+removed: this also removes one HDF store at
+`audio_usb_parse_interface.c:834` and two Camera address origins for opaque
+`reserve` fields in `photo_process_result.cpp:1018–1019`. Such field layouts
+remain a dependency; an unrelated pointer variable's cell is not an element
+address. Origin comparison finds 92 additions/69 removals in HDF, 6/0 in
+HiView and 0/2 in Camera. The cumulative tables above include these changes.
+
+### Reference casts in selected addresses — 2026-11-05
+
+The new regression reproduces `use(&(c ? static_cast<F&>(a) : b))` at
+`a6a4d9a`: only `beta` is reached. Reference-cast recognition now preserves
+the operand's original cell and both targets. Independent helpers cover
+named casts, C-style casts, a reference alias and nested const/static casts;
+stores through a selected cast address update both original cells. Explicit
+and `decltype(auto)` reference getters retain their address-return facts,
+and a store through a getter's returned address updates its original cell.
+A value-cast control records no reference-address return fact. The cast arm's
+address fact retains `static_cast<Callback&>(a)` as its operation provenance.
+
+All 24 focused conditional tests and all 2678 workspace tests pass, including
+the expanded full-fixture export comparison at jobs 1 and 4. Semantics are defined in
+[Conditional values](ANALYSIS.md#conditional-values).
+
+Fresh pinned release comparisons against `a6a4d9a`, with the options and
+solver budget above, preserve named call targets, global metrics, flow-node
+and edge counts, and source-origin rows in every corpus. All 119 checks pass
+at jobs 1 and 8, and all 49 logical relations match across job counts. No
+expectations need adjustment. Logical before/after exports differ only in
+the derived `database_identity` digest.
+
+### Function-reference and functional alias casts — 2026-11-05
+
+The release binary at `c66daff` reaches only `beta` for both the explicit
+`static_cast<void(&)()>(alpha)` arm and the functional reference-alias arm
+`R(a)`. Both now reach exactly `alpha` and `beta`. The explicit function-type
+cast matches its function-alias control. Functional casts through ordinary
+and qualified reference aliases retain original-cell stores and reference
+returns, and record no call to the alias. Calls inside cast operands retain
+their own site and return destination. Scope controls keep calls through a
+shadowing variable and a nearer namespace function intact.
+
+All 2679 workspace tests pass; the expanded full-fixture exports match at
+jobs 1 and 4. Rules are in [Conditional values](ANALYSIS.md#conditional-values).
+
+Fresh pinned release analyses against `c66daff`, with the same options and
+solver budget above, preserve every named target, global metric, flow count
+and source-origin row. All 119 checks pass at jobs 1 and 8; all 49 logical
+relations match across job counts in every corpus. No expectation changes
+are needed. Logical before/after exports differ only in the derived
+`database_identity` digest.
+
+### Functional cast values and file-scope reference returns — 2026-11-05
+
+The four additional reproductions now preserve callbacks: functional
+reference casts used as arguments and callees, direct file-scope reference
+getter addresses, deduced function-reference selectors, and complete
+function-reference aliases registered with `using` or `typedef`. Grouped
+functional-cast initializers/returns and nested function selectors have
+controls too. File-scope cases cover a single getter, two selected getters,
+a cross-TU getter and an independent store through the returned address.
+The link-image regression also checks file-scope selections against each
+image's own static callbacks. No file-scope call site is invented.
+
+All 26 focused conditional tests and all 2680 workspace tests pass. The
+expanded full-fixture and link-image exports match at jobs 1 and 4. A release
+probe with a depth-1024 deduced function-reference selector completes without
+aborting and reaches exactly `alpha` and `beta`. The release export also
+checks the expected targets for all four reported forms.
+
+Fresh pinned release comparisons against `d07887c`, with the options and
+solver budget above, preserve named targets, global metrics, flow-node/edge
+counts and source-origin rows. All 119 checks pass at jobs 1 and 8, and all
+49 logical relations match across job counts. No expectations are updated.
+Logical before/after exports differ only in the derived `database_identity`
+digest. Exported file-scope return wiring retains both arms' operation origins.
+Rules and the new file-scope `CallReferenceReturn` fact are documented in
+[Return-value flow](ANALYSIS.md#return-value-flow) and
+[Conditional values](ANALYSIS.md#conditional-values).
+
+### Configured-window test synchronization — 2026-11-05
+
+`configured_families_hold_count_slots_through_merge` could observe 15 starts
+against a cap of 16: the worker reserving the last item could enter its
+callback before a worker that had reserved an earlier item. The test now
+signals when the actual started count reaches the cap, keeping both assertions
+that all slots stay occupied until the first ordered merge completes.
+Production admission and merge behavior are unchanged.
+
+The corrected test passes 100 repeated runs with normal scheduling and 100
+with the process restricted to one CPU. Pinned-corpus analyses are not
+repeated for this test-only correction; existing evaluation expectations
+remain unchanged. All 2680 workspace tests pass.
+
+### Array initializer values and reference-cast shapes — 2026-11-05
+
+The four new review reproductions were checked against the preceding release
+production code (`d56bf12`). A conditional callback-array initializer and a
+functional array-reference cast used as a subscript table had no callback
+targets. The pointer-reference cast in a selected address retained only
+`beta`, and both functional reference-cast receiver forms lost their method
+edge. The corrected release retains exactly `alpha` and `beta` in each
+callback reproducer and the expected `FunctionalReceiver::run` edge in both
+receiver forms.
+
+The regression also checks nested array lists, null and call arms, reference
+alias declarations using `using` and `typedef`, stores through pointer
+references, and reads, calls, writes and addresses through cast array tables.
+Each initializer arm call retains one site and the shared conditional return
+destination, separate from the array variable; the array's type is preserved.
+Pointer-to-function aliases returning references remain distinct from
+reference aliases. No synthetic alias calls are introduced. The existing
+smart-pointer test verifies that pointer-reference parameters retain their
+collapsed value representation. All fixture additions pass a C++17 syntax
+check, all 27 focused conditional tests pass, and all 2681 workspace tests
+pass. The release fixture's 49 logical export relations match at jobs 1 and 4.
+
+Fresh pinned HDF, HiView and Camera release analyses use the revisions,
+options and solver budget above. All 119 checks pass at jobs 1 and 8, with
+all 49 logical relations identical across those job counts. Against the
+preceding production code, named targets, argument flows, global metrics,
+flow nodes/edges and source origins are unchanged in all three corpora.
+Before/after logical exports differ only in the derived `database_identity`
+digest. No expectations are updated. Modeling rules and remaining container,
+field-layout and index-summary dependencies are documented in
+[Conditional values](ANALYSIS.md#conditional-values).
+
+### Scoped cast lookup, complete returns and initializer effects — 2026-11-05
+
+The seven additional review forms were reproduced against the preceding
+production code (`c0d767a`) and checked with the corrected release analyzer:
+
+| Reduced form | Preceding release | Corrected release |
+|--------------|-------------------|-------------------|
+| Nearer class hides an outer reference alias | Constructor and its callback targets absent | Constructor plus `alpha` and `beta`; class receiver retains `run` |
+| Reference-cast assignment target | Each selected callback retains only `beta` | Each reaches `alpha` and `beta` |
+| C-style reference cast around an addressed selector argument | Consumer has no callback targets | Consumer reaches `alpha` and `beta` |
+| Pointer-reference return declarator or trailing reference alias | Address consumer has no callback target | Consumer reaches `alpha` |
+| Value cast around a callback-array initializer element | No callback targets | `alpha` and `beta` |
+| Conditional callback member of an isolated struct array | No callback targets | `alpha` and `beta` |
+| File-scope comma/conditional assignment effects | Original `unrelated` callback only | `alpha` joins the original callback under may-analysis |
+
+The new fixture also checks assignment results, compound assignment through
+reference casts, nested arrays, brace elision, global aggregate arrays,
+GNU shorthand conditions, and unevaluated `sizeof`/`noexcept` operands.
+An unrelated callback field stays separate. Each global side-effect assignment
+is lowered once and retains its source operation provenance. Pointer-reference
+getters have separate value and address consumers: ordinary dereferenced
+pointer returns retain their loads, and callback-pointer arguments keep
+persistent wiring at every depth when an address arrives through a return
+copy after initial argument wiring.
+
+All 30 focused conditional tests and all 2684 workspace tests pass, including
+the existing pointer-reference return/prototype control. The added source
+passes a C++17 syntax check. The release fixture's 49 logical export relations
+match at jobs 1 and 4. Semantics and remaining modeling dependencies are in
+[Conditional values](ANALYSIS.md#conditional-values),
+[Return-value flow](ANALYSIS.md#return-value-flow) and
+[Argument flow](ANALYSIS.md#argument-flow).
+
+Fresh pinned HDF, HiView and Camera analyses use the revisions, options and
+solver budget above. All 119 checks pass at jobs 1 and 8. Named call targets,
+argument flows, global metrics, flow nodes/edges and source origins match
+`c0d767a` in all three corpora; the before/after logical exports differ only
+in the derived `database_identity` digest. All 49 logical relations match
+across job counts. No expectations are updated.
+
+### Conversion shapes and complete file-scope effects — 2026-11-05
+
+The ten additional review forms have focused regressions in
+`review_conversions.cpp`. Reference-alias prototypes establish reference
+identity before a `decltype(auto)` wrapper is lowered. Pointer-cast tables
+retain callback reads, calls, addresses and stores; aggregate subscript
+results retain object addresses for field projection. Designated callback
+fields in struct arrays reach exactly `alpha` and `beta`, while an unrelated
+field stays separate. Null-or-array receivers retain their pointer type,
+including `auto` and reversed arms, and Base/Derived object selectors retain
+the known base receiver. Explicit and aliased function `&&` casts retain
+function lvalues; object xvalues remain a negative control.
+
+File-scope effects are now walked at the shared initializer boundary before
+value, address or aggregate lowering. Address-producing comma/conditional
+forms, array-decay operands, both compound and named-table indices, and
+nested lambda init-captures preserve their evaluated assignments. Every
+tested assignment is emitted once with its own operation provenance. The
+closure's unexecuted body and unevaluated operands stay excluded. A class
+value cast with its own `operator[]` is a negative control: its constructor's
+input callbacks never leak through the built-in table path.
+
+All 34 focused conditional tests and all 2688 workspace tests pass. The new
+fixture passes a C++20 syntax check, including the C++20 designated fields;
+its other reported forms also apply to C++17. Full release fixture exports
+match across all 49 logical relations at jobs 1 and 4.
+
+The deep common-class regression selects a Base/Derived object through 64
+nested selectors and retains `B::run`, guarding against type/category probe
+re-entry. Fresh one-job release probes at depths 20, 64 and 256 complete
+without diagnostics. Depth 1024 also completes and retains `B::run`, with the
+existing 512-level body-walk warning. Type and category are checked separately
+to avoid repeated nested type probes. Rules and remaining modeling dependencies are in
+[Conditional values](ANALYSIS.md#conditional-values) and
+[Return-value flow](ANALYSIS.md#return-value-flow).
+
+Fresh pinned release comparisons against rebuilt `1e4f78d`, using the
+revisions, options and solver budget above, preserve named targets, argument
+bindings and global metrics in all three corpora. All 119 checks pass at jobs
+1 and 8, and all 49 logical relations match across those job counts. HiView
+and Camera before/after data are identical across all 49 relations.
+
+HDF has two additional flow nodes, one copy and one load (181367/161821
+nodes/edges become 181369/161823), two additional operation origins (87623
+become 87625), and one additional memory-read row. They come from the
+pointer-cast table value `((uint32_t *)dataBuf)[0]` in
+`framework/model/sensor/driver/ppg/sensor_ppg_driver.c:58`, passed to
+`HDF_LOGD`. The shared built-in subscript path now reads through the buffer
+value. There are no removed source origins or named targets, and canonical
+argument-flow rows are unchanged after normalizing temporary ordinals.
+These flow additions and their numeric ID shifts explain HDF's export
+differences. No expectations are updated.
+
+### Range, callable and member-return consumers — 2026-11-05
+
+Fresh review regressions in `review_consumers.cpp` cover the remaining
+consumer paths. Array range-for loops preserve the selected element summary
+for explicit, `auto` and `auto &` variables, with comma ranges and a named
+array as controls. Compound callable objects retain `operator()` edges,
+including reference parameters, comma and assignment callees. Comma and
+assignment receivers retain method edges for both pointer and object forms.
+The reported array/pointer receiver case already resolves in the fresh
+`de55aec` baseline here; both arm orders and callback fields now have permanent
+checks.
+
+Dereferenced built-in pointer offsets with known integer indices retain
+their index-insensitive array/pointer summary, so `return *(table + index)`
+and the reversed addition preserve reference addresses like `return table[index]`. The existing dereference-store test
+formerly expected no flow for `*(out + 1) = *h->pp`; it now checks that the
+loaded RHS reaches the summarized offset destination. The unknown-type arm
+fixture now uses a class operator with unavailable return typing rather than
+`&object + 0`, whose pointer type is now recognized by the operand probe.
+
+File-scope member getter addresses persist the selected declaration through
+merge with `CallReferenceReturnDeclared`. PAG expansion and provenance export
+use one shared resolver, filtering signatures before declaration visibility
+and TU-local definition precedence. Local and cross-TU same-arity overloads
+remain separate; the unrelated overload never enters the callback result.
+Two link images also retain only their own getter callback definitions. Global
+member-address flows have return-operation provenance without synthetic call
+sites. Rules and modeling limits are in
+[Conditional values](ANALYSIS.md#conditional-values) and
+[Return-value flow](ANALYSIS.md#return-value-flow).
+
+All 36 focused conditional tests and all 2690 workspace tests pass. The new
+fixtures pass `g++ -std=c++20 -fsyntax-only`; full release fixture exports
+match across all 49 logical relations at jobs 1 and 4, without diagnostics.
+
+Fresh pinned release comparisons against `de55aec`, using the revisions,
+options and solver budget above, preserve every named call target, canonical
+argument binding and global metric in all three corpora. HDF and Camera flow
+nodes, edges and source origins are unchanged. HiView gains one flow node,
+one copy and one load (84714/64692 nodes/edges become 84715/64694) and two
+operation origins (29898 become 29900). They preserve `p + i` and its
+`*(p + i)` read in `plugins/event_validator/event_verify_util.cpp:35`, inside
+`GenerateHash`. This is a byte read for hashing, not a recovered callback.
+No existing flow origin is removed. HDF also refines two existing conditional
+temporary types in `OsalRegisterCdev`: `name : lastSlash + 1` at
+`adapter/khdf/hongmeng/osal/src/osal_cdev.c:408` and the Linux counterpart at
+line 235. Their flow facts and all named bindings are unchanged. Camera data
+match in all 49 relations except the derived `database_identity` digest.
+HiView's extra temporary shifts numeric IDs; normalized named argument flows
+remain identical and the byte read adds one memory-access row.
+
+All 119 pinned checks pass at jobs 1 and 8, and all 49 logical relations match
+across those job counts. Expectations remain unchanged.
+
+
+### Aggregate layouts, cast values and initializer effects — 2026-11-05
+
+The next review probes are captured in `review_aggregates.cpp` and
+`review_aggregates.c`. Anonymous structs, anonymous typedefs, C structs and
+constructor-free unions initialize their available layouts without requiring
+C++ construction metadata. Positional, designated and mixed lists retain
+field paths through nested arrays. Following a C array designator, positional
+clauses continue within that array before advancing to the next field;
+regressions exclude unrelated callbacks from that next field.
+
+Constant aggregate arrays with distinct callback members or nested fields
+also use typed field stores. This prevents the former whole-array callback
+summary from leaking another member's callback through a `void *` cast.
+Constant single-callback tables retain their existing per-array function
+summary. Recovered opaque/enum spellings consume one scalar clause rather
+than shifting following members; a tagged-table regression covers this case. The cast probes include constant and unknown
+indices, const-qualified targets and a separate callback field as a negative
+control. Known smart-pointer array summaries retain their existing convention.
+Converting class-array elements bind conditional constructor arguments in
+both implicit and explicitly braced forms.
+
+Functional pointer aliases and parenthesized C/C++ alias casts retain their
+operand values without phantom calls; a nearer class still invokes its
+constructor. Multidimensional array arguments decay to original storage.
+Multidimensional struct elements and nested array-member paths retain their
+object types and field projections. A 32-level member-array regression checks
+that the field path collects indices once and validates them in one forward
+type traversal, without recursively re-probing every prefix.
+
+Reference-return category metadata is separate from a callable alias's own
+binding and pointer shape. Indirect reference getters therefore support
+`decltype(auto)` wrappers, including through a shared header and cross-TU
+merge. A pointer-returning callable with the same lowered type shape remains
+a value return. Character-array decay retains interned strings for both
+null-or-array and array-or-literal `dlsym` selectors.
+
+The effects walk skips `_Generic` controls and retains parenthesized global
+constructor arguments and instantiated default-member expressions. Globals
+with no evaluated default initializer allocate no additional address value.
+An explicit walk stack enforces the existing 512-level AST limit: the
+40,000-term file initializer completes with one depth warning. The fixtures
+pass C++20 and C11 syntax checks. Rules and remaining modeling dependencies are
+in [Conditional values](ANALYSIS.md#conditional-values) and
+[Return-value flow](ANALYSIS.md#return-value-flow).
+
+All 43 focused conditional tests and all 2697 workspace tests pass. The final
+release fixture has no diagnostics and matches across all 49 logical relations
+at jobs 1 and 4. The release 40,000-term probe also exits successfully with one
+recorded AST-depth warning.
+
+Fresh pinned release comparisons against `464ce12`, using the revisions,
+options and budget above, were inspected before changing expectations:
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | indirect / external edges | 5090 / 23894 | 5064 / 23886 |
+| HDF | argument rows | 72137 | 72111 |
+| HDF | flow nodes / edges / origins | 181369 / 161823 / 87625 | 182946 / 163063 / 88825 |
+| HiView | flow nodes / edges / origins | 84715 / 64694 / 29900 | 84800 / 64797 / 29999 |
+| Camera | indirect / external edges | 442 / 46070 | 443 / 46067 |
+| Camera | argument rows | 57899 | 57900 |
+| Camera | flow nodes / edges / origins | 220893 / 157436 / 77830 | 220894 / 157444 / 77836 |
+
+HDF has six new lambda targets at `ServStatListener::OnReceive:299` in
+`service_manager_hdi_test.cpp`. Functional `StatusCallback(lambda)` alias
+conversions now pass the lambda value through the existing listener
+constructor. Six phantom external `ServStatListener::StatusCallback` calls
+and two phantom `DevHandle` calls in `clock_if.c` disappear. These casts do
+not call functions. Two external alias stand-ins disappear from the function
+count; defined functions and direct/IPC/dlsym edges are unchanged.
+
+The other 32 removed HDF edges are `Spi0DmaIrq`/`Spi1DmaIrq` targets formerly
+attached to calls through the `SpiOpen`, `SpiClose`, `SpiSend`, `SpiDmaSend`,
+`SpiRecv` and `SpiDmaRecv` members in `adapter/platform/spi/spi_bes.c`.
+The enclosing callers are `SpiDevOpen`, `SpiDevClose`, `HalSpiSend`,
+`HalSpiRecv` and `HalSpiSendRecv`, which are the names used by the negative
+probe. The table declares those callbacks in
+`SpiDmaIrq`; typed initializer fields exclude them from the other members.
+Two candidates per IRQ name at eight source sites account for 32 rows.
+The callback-summary convention for constant single-callback tables is retained,
+and the existing 13-target `PlatformDumperDump` calibration still passes.
+
+Matching HDF argument rows by source site, argument index and formal yields
+155 replacements, six additions and 32 removals. Of the replacements, six
+constructor arguments change from a phantom call result to a cast operand;
+149 retain the projected member address/value instead of its enclosing root.
+The six additions wire the recovered listener lambdas; the 32 removals belong
+to the wrong IRQ edges. HiView argument bindings are identical. Camera replaces
+one constructor argument and adds its recovered listener argument.
+
+Camera recovers `RegisterServStatListener::OnReceive:1462` reaching the lambda
+created at `hcamera_host_manager.cpp:891`. Three phantom external alias calls
+(`MotionSubscribeCallbackPtr`, `MotionUnsubscribeCallbackPtr` and
+`RegisterServStatListener::StatusCallback`) disappear. Those three external
+stand-ins leave the function count; all defined targets remain. HiView's named
+call edges and global metrics are unchanged.
+
+Source origins change by +1404/-204 in HDF, +99/0 in HiView and +6/0 in
+Camera. These are typed field/array stores and projections, scalar/cast value
+flows, and instantiated default-member expressions. HiView adds five address,
+55 GEP, 39 store and four points-to edges. Camera adds two address, one copy
+and five GEP edges. HDF adds 31 address, 12 copy, 959 GEP, 129 load, 76 store,
+31 call-argument and two points-to edges. Numeric IDs shift with these facts.
+Only the two exact indirect totals are recaptured (HDF 5064, Camera 443);
+existing tolerance bands and dispatch expectations remain unchanged.
+
+The recaptured totals and four new positive/negative probes pass all 123
+checks against the fresh exports at both jobs 1 and 8, including clean pinned
+revision checks. All 49 logical relations match across those job counts.
+The added probes retain the listener callbacks, exclude wrong-member IRQs
+and reject phantom alias-call targets.
+
+### Selected calls, indexed pointers and omitted defaults — 2026-11-05
+
+The nine follow-up cases are reduced in `review_nine.cpp`,
+`review_nine_return.cpp` and `review_nine.c`. Positional array clauses before
+an explicit designator all reach the array summary. Omitted members, including
+nested designated members and partially initialized globals, run their default
+initializers; explicit overrides suppress those defaults. Private traversal
+bounds distinguish fully initialized arrays without changing exported types.
+Indexed pointer members load each pointer layer before projecting the next
+field. Both pointer-member regressions exclude a separate `unrelated` callback
+field. Nested known-integer offsets and callable objects reached through a
+selected pointer retain their values and method edges.
+
+Conditional callees and callable fields retain reference-return category
+metadata for `decltype(auto)` deduction. Selected file-scope free/member
+getters retain explicit arguments as well as their declarations. After merge,
+the shared signature/scope/image resolver selects definitions, then the PAG
+binds their actuals to parameters and expands address returns. Reference
+arguments use original cell addresses, so stores through the returned pointer
+also update the supplied cell. Argument-copy provenance identifies the
+initializer's source line without a synthetic call site. A cross-TU free getter
+regression excludes the same-TU overload with a different signature.
+
+All 46 focused conditional tests and all 2700 workspace tests pass. C++20 and
+C11 syntax checks pass. Full fixture exports have no diagnostics and all 49
+logical relations match at jobs 1 and 4.
+
+Fresh release comparisons against `fb0c793`, with the same clean pinned
+revisions, eight jobs, minimal exports and solve budget stated above, were
+inspected before updating expectations:
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | indirect edges | 5064 | 5096 |
+| HDF | argument rows | 72111 | 72161 |
+| HDF | flow nodes / edges / origins | 182946 / 163063 / 88825 | 184016 / 164197 / 89895 |
+| HiView | flow nodes / edges / origins | 84800 / 64797 / 29999 | 84823 / 64816 / 30020 |
+| Camera | flow nodes / edges / origins | 220894 / 157444 / 77836 | 221000 / 157567 / 77959 |
+
+No named call edge is removed. File, function and diagnostic counts, direct,
+external, IPC and dlsym edges remain unchanged. HiView and Camera call edges
+and argument rows are identical. HDF adds eight Wi-Fi feature edges at
+`wifi_module.c:47` and `:65`: `InitFeatures`/`DeInitFeatures` now reach the
+STA, AP and both production/test P2P definitions through their selected
+pointer-array members. Six audio edges at `audio_control_dispatch.c:320` and
+`:386` reach the Codec, CodecEnum and CpuDai get/set callbacks. Their stores
+through `codeData->controls[index]` and `data->controls[index]` now project
+the callback member after loading the controls pointer.
+
+The remaining 18 added edges are **precision limits, not recovered real
+calls**. The existing unresolved-member fallback calls through the receiver
+variable when no field path can be resolved. Newly available audio callback
+values consequently also reach `fp->f_op->unlocked_ioctl` at
+`watchdog_adapter.c:47` and the two unresolved parcel method calls at
+`hdf_sbuf_impl_hipc.cpp:55` and `:58` (six targets per site). That fallback and
+opaque pointer propagation are unchanged by this review. Typed indexed-field
+fixtures exclude other fields; resolving opaque member calls without using
+their receiver as the callback remains a separate precision dependency.
+The exact HDF total includes these 18 conservative extra edges explicitly.
+
+Normalizing argument rows by source site, index, formal identity and actual
+source identity yields 62 replacements and 50 additions in HDF, with no
+unmatched removals. Replacements retain indexed member values/addresses in
+place of enclosing roots. Twenty additions bind arguments to the 14 recovered
+callback edges; 30 belong to the 18 opaque fallback edges. HiView and Camera
+argument bindings are unchanged.
+
+HDF adds seven address, 53 copy, 644 GEP, 314 load, 78 store and 38 call-argument
+edges. Camera adds 69 GEP, 46 load and eight store edges. HiView adds three
+address and 21 GEP edges, removes three store and two points-to edges while
+finishing omitted designated members through their declared subobjects.
+Origin changes are +1072/-2, +36/-15 and +123/0 respectively, retaining original
+initializer and indexed-member source positions.
+
+Only the HDF exact indirect total is recaptured (5096). The duplicated
+`arg_flow_rows_per_call_edge` probe counts the same argument rows as the main
+metric; its stale center 72005 is aligned with the main metric's existing
+72106 center, retaining the 150-row tolerance in both checks. No tolerance is
+widened. Two focused production probes pin the eight Wi-Fi and six audio
+targets. All 125 updated checks, including clean revision checks and existing
+dispatch/calibration probes, pass against fresh exports at jobs 1 and 8.
+All 49 logical relations match across those job counts for each corpus.
+
+### Forwarded references, alias casts and aggregate defaults — 2026-11-06
+
+The ten new review cases are captured in `review_ten.cpp`, `review_ten.c`,
+`review_ten_return.cpp` and `review_ten_parenthesized.cpp`. Reference forwarding
+uses the actual inner call's address destination, preserving its selected
+overload and parameter bindings across merge. Both address and value consumers
+exclude the unrelated same-TU overload in the cross-TU regression. `auto`
+variables retain known callable return bindings from cast targets or function
+addresses, and built-in array indexing retains its callable element's binding.
+A value-returning callable remains a value in the negative control.
+
+Explicit union designators suppress inactive members' defaults. Default
+initialization covers anonymous global layouts and a union's declared default
+member, including a member after the first. The parenthesized aggregate probe
+uses a scratch compilation database with `-std=c++20`; its omitted default runs,
+while the explicitly overridden default does not. C tag names do not hide
+ordinary typedefs during alias-cast lookup. `(Alias)(call(), value)` retains the
+last comma value and the first operand's call without inventing an alias call;
+a global assignment operand also retains its evaluated effect.
+
+Pointer-offset values now reach ordinary initializers, arguments, selector arms
+and dereferenced callees, including known unscoped enum offsets. The type probe
+uses an explicit stack with the ordinary AST bound: broadening the value path
+does not reintroduce recursive overflow on deep constant arithmetic. The existing
+40,000-term initializer regression still completes with its depth warning.
+
+All 50 focused conditional tests and all 2704 workspace tests pass. GCC C11
+and G++ C++20 syntax checks pass. The optimized release analyzer passes 23 new
+exact callback-set checks, including the configured C++20 cases, with no
+diagnostics or phantom alias functions. Its full fixture exports match across
+all 49 logical relations at jobs 1 and 4.
+
+Fresh release comparisons against `9bb8bb3`, using the clean revisions and
+options above, were inspected before updating expectations:
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | indirect edges | 5096 | 5156 |
+| HDF | argument rows | 72161 | 72255 |
+| HDF | flow nodes / edges / origins | 184016 / 164197 / 89895 | 184157 / 164480 / 90070 |
+| HiView | argument rows | 32058 | 32063 |
+| HiView | flow nodes / edges / origins | 84823 / 64816 / 30020 | 84946 / 64930 / 30094 |
+| Camera | argument rows | 57900 | 57906 |
+| Camera | flow nodes / edges / origins | 221000 / 157567 / 77959 | 221056 / 157662 / 78015 |
+
+No named edge is removed. HiView and Camera named edges are identical. File,
+function and diagnostic counts and direct, external, IPC and dlsym edges are
+unchanged in all three corpora. The 60 added HDF edges are **imprecise extra
+targets, not recovered real calls**: twelve audio callback definitions reach
+each of `HdmiEventHotPlugHandleComm:133`, `HdmiEventHotUnplugHandle:164` in
+`hdmi_event.c`, and `UartHostDevSetBaud:332`, `UartHostDevSetAttribute:381`,
+`UartHostDevInit:482` in `uart_asr.c`. These are the Codec/CpuDai get/set, enum
+get/set, SAPM get/set and info callbacks. Newly retained pointer values feed
+existing opaque-parameter and instance-insensitive callback summaries.
+
+A separate debug-points-to run confirms that the HDMI sites load the shared
+`HdmiHpdCallbackInfo.callbackFunc` cells. The UART `config` call GEPs also
+admit the positional `UartDriverData.attr` summary, which receives a load from
+`attribute` through `udd->attr = *attribute` in `uart_gr5xx.c:324`. The existing
+positional summary fallback and opaque pointer propagation are unchanged here;
+these extra targets remain a field-summary precision dependency. They are
+included explicitly in the exact total, without being credited as recall gains.
+
+Normalized argument rows have only additions: HDF +94, HiView +5 and Camera +6.
+Sixty HDF rows bind the extra callback targets above. The other 34 retain pointer
+offsets at existing callees, including `GetArrayElem`, HCS getters/decompilation,
+I2C/I3C/SPI transfers and `AudioGetPortInfoConfig`. HiView supplies four offset
+arguments in `GetShaStr:47` and one in `ContentReader::AppendContentData:117`.
+Camera supplies six offsets in `CameraManager::ParsingCameraConcurrentLimted`
+at lines 1968, 1975, 1993, 2000, 2007 and 2014. None replaces an existing binding.
+
+HDF adds nine address, 178 copy, 28 GEP, 25 load, six store, 32 call-argument
+and five points-to edges. HiView adds four address, 66 copy, six GEP, six load,
+three call-argument and 29 points-to edges. Camera adds 89 copy and six
+call-argument edges. Original source-origin rows increase by 175/74/56; none
+is removed. These identify arithmetic operands and their surrounding stores,
+calls and return-value copies.
+
+Only the exact HDF indirect count is recaptured (5156). All tolerance bands
+and existing target/calibration probes are retained. New production probes
+pin the five HiView and six Camera offset argument bindings. All 127 updated
+checks, including clean pinned revision checks, pass against fresh exports at
+jobs 1 and 8. All 49 logical relations match across those job counts for each
+corpus. The baseline passed all 125 pre-existing checks.
+
+### Expectation centers and SPI probe coverage — 2026-11-06
+
+Both HDF argument-row bands now use the measured 72255 center, retaining their
+150-row tolerances. The preceding center of 72106 passed at a distance of 149,
+leaving only one row of upward headroom. This is a re-centering of the same
+measured behavior; no analysis result or tolerance width changes.
+
+The SPI probe's caller spellings are verified against the clean pinned HDF
+source and exported symbols. `SpiDevOpen` and `SpiDevClose` contain one table
+call each; `HalSpiSend`, `HalSpiRecv` and `HalSpiSendRecv` contain two each.
+The member calls occur at lines 246, 252, 313, 319, 361, 367, 713 and 739 in
+`adapter/platform/spi/spi_bes.c`. `SpiOpen`/`SpiClose` and send/receive variants
+are callback members, not the enclosing caller names; the earlier prose is
+clarified accordingly. A companion exact probe requires all eight indirect
+member sites to exist, while the negative IRQ-target probe remains zero.
+
+An isolated in-memory SQL mutation reattaches the four IRQ definition candidates
+to the eight sites and makes the negative probe return 32. Removing those sites
+makes the companion coverage probe return zero instead of eight. These checks
+establish that both target contamination and missing coverage fail validation.
+Fresh pinned exports pass all 128 checks at jobs 1 and 8, and all 49 logical
+relations match across job counts in each corpus. Production code is unchanged from
+`bd22114`; the existing workspace and export-determinism results above apply.
+
+The submitted commit contains ordinary modification hunks for `lower.rs`
+(3090 additions, 433 removals against `89d34c2`), alongside the IR, analysis,
+documentation and fixture changes. The file has 27215 lines. A review showing
+the entire 24558-line parent file deleted was clipped input, not the committed
+patch or working tree.
+
+### Named identities for known-imprecise targets — 2026-11-06
+
+The 5156 HDF indirect-edge total is now accompanied by a separate precision-debt
+probe for the 60 audio targets listed above. It joins five explicit source
+sites (caller name, file suffix and line) to twelve explicit audio definitions
+(callee name, definition file suffix and line). The five sites and twelve
+definitions form exactly 60 expected pairs. Matching pairs are deduplicated
+before counting, so duplicate edges cannot replace a missing pair. Absent
+sites or definitions also reduce the result rather than passing vacuously.
+
+This pins the current imprecision, not desired call behavior. A future summary
+precision fix should audit and update this probe alongside the aggregate
+expectation. Keeping 5156 edges while replacing one of these targets with a
+different target now fails the identity check. An isolated SQL mutation verifies
+that such a same-total replacement leaves 5156 indirect rows but reduces the
+identity count to 59. Replacing an edge with a duplicate expected pair also
+reduces the distinct count to 59. Restoring the original edge returns 60.
+Replacing all sixty with other targets leaves the aggregate unchanged and
+reduces the identity count to zero, detecting the full swap raised in review.
+
+All 129 checks pass against the pinned jobs-1 and jobs-8 exports. Production
+code and exported data remain unchanged from the preceding review. The
+implementation is present in eleven changed files under `crates/`, including
+`trace-ir/src/flow.rs`, `trace-parse/src/lower.rs` and `merge.rs`, and
+`trace-analysis/src/pag.rs` and `solver.rs`. The callback integration tests and
+eval script changes are part of the same commit. A review input containing
+only docs and fixtures omits those committed hunks; it is not the complete
+patch. A fresh `cargo build --workspace` succeeds. The complete ordinary diff
+also passes `git apply --check --reverse` against the working tree; separate
+core, lowering and integration-test patches preserve all implementation hunks
+for review without relying on a clipped combined display.
+
+### Getter dependencies, pointer layers and default arguments — 2026-11-06
+
+The thirteen follow-up cases are reduced in `review_thirteen.cpp` and
+`review_thirteen_static.h`/`review_thirteen_header.cpp`, with additional
+scratch shared-header projects in the integration tests. The reported
+one-TU static-header getter previously panicked with an unmapped function ID.
+`CallReferenceReturnDeclared` now participates in the shared function-dependency
+traversal, so missing-ID filtering and TU replay both see its callee. Replay
+also retains initializers of returned file-static cells and their connected
+temporaries. Imported file-static storage receives its initializer even when
+only an external inline getter's default argument uses it. The crash regression
+reaches exactly `alpha`, including through the assembled preamble path.
+
+Mixed value/reference overload sets contribute ordinary return values from all
+selected candidates alongside reference-cell reads. The unknown-arithmetic
+argument regression retains both viable callbacks, including the value-returning
+candidate that was previously lost. Nested pointer indices load each intermediate
+pointer before the final read/store; arrays retain storage. Compound callees keep
+their original dereference chain. Validated offsets work as subscript tables,
+returned values and callable-category carriers. Bare uninitialized callable
+declarations and pointer-table cast targets retain reference-return binding.
+Defined unscoped enumerators establish integral compatibility for offsets without
+changing general overload argument typing to `int`.
+
+Reference alias casts with argument-list-shaped comma operands retain the last
+operand's original cell. Global array default completion first recovers written
+extents; omitted elements run their defaults and fully supplied arrays do not gain
+extra evaluations. File-scope free/member reference getters instantiate omitted
+parameter defaults in their recorded declaration scope. Expressions and original
+source mappings survive function remapping and shared-header imports. Explicit
+arguments suppress those defaults and their effects; reference defaults bind
+original cells. Member and parameter defaults reuse the same temporary-tree
+context/cache isolation.
+
+All 56 focused conditional tests and all 2710 workspace tests pass. G++ accepts
+the new sources in C++20 mode. The fresh optimized analyzer passes 20 new exact
+callback cases at 21 individual sites, without diagnostics. Full fixture exports
+match across all 49 logical relations at jobs 1 and 4. Shared-header getter and
+default-expression regressions also run at both job counts.
+
+Fresh release comparisons against `429b8aa`, at the clean revisions and options
+above, were inspected before adding the new production probe:
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | flow nodes / edges / origins | 184157 / 164480 / 90070 | 184159 / 164487 / 90077 |
+| HiView | flow nodes / edges / origins | 84946 / 64930 / 30094 | 85096 / 65093 / 30181 |
+| Camera | flow nodes / edges / origins | 221056 / 157662 / 78015 | 232470 / 169219 / 83865 |
+
+Named call edges and normalized argument bindings are identical in all three
+corpora. File, function, diagnostic, edge-resolution and argument-row totals are
+unchanged. The exact HDF total remains 5156; the separate 60-edge precision-debt
+identity guard and every previous dispatch/calibration probe still pass. No
+expectation center or tolerance width is changed.
+
+HDF adds one GEP and one load at `hcs_tree_if.c:129`, retaining the
+`attr->value + offset` return from `GetArrayElem`. Five return copies reach its
+existing consumers at lines 139, 160, 181, 202 and 302. HiView adds a GEP/load for
+the `data_ + offset_` return in `fuzz_data_source.h:82`, two copy edges, and 85
+address/74 points-to edges from header constants: 50 new initializer origins in
+`hiretrieval_base_def.h` and 35 in `hiretrieval_common_util.h`.
+
+Camera adds 5850 address and 5707 points-to edges, with no other flow-kind
+changes. All 5850 new origins initialize header file-static strings in their
+TU-local copies. The largest groups are `preview_output.h` (2586),
+`camera_util.h` (1206), `camera_report_uitls.h` (812) and
+`camera_datashare_helper.h` (270). For example, frame-event strings and settings
+keys now populate the imported variables that consumers actually read, rather
+than only the header-unit's original storage. These additional value locations
+do not change a named call target or argument binding. Origins increase by
+7/87/5850 respectively; no origin is removed.
+
+A new HDF probe pins the five HCS return-value copies (zero on the fresh
+baseline, five after the fix). All 130 checks pass against the fresh jobs-1
+and jobs-8 exports, including clean revision checks. All 49 logical relations
+match across job counts for every corpus. The fresh baseline passed all 129
+pre-existing checks.
+
+### Callable deduction, overlapping storage and selector cost — 2026-11-06
+
+Fresh release builds compare `217d200` with this follow-up, using the same
+clean pinned revisions, configuration and solve budget as above. The baseline
+passes all 130 previous checks. All 2714 workspace tests and 60 focused
+conditional tests pass after the fix, as does the CI Clippy command with
+`--workspace --all-targets --all-features -- -D warnings`. G++ C++20 and GCC C11
+accept the new reduced fixture sources.
+
+Callable objects retain their selected `operator()` return binding, and
+explicit reference-returning lambdas retain their initialized callable binding.
+Both now supply address facts to `decltype(auto)` wrappers. Compatible union
+views share their original cells, including writes, while incompatible suffixes
+remain separate. Recognized aggregate-to-first-member casts project only that
+member. Nested GEP lookup now uses the subobject's declared type and the shared
+forward-tag resolver, rather than its root storage owner's type. No IR kind or
+SQLite schema changes are needed. The exact boundary of the structural alias
+model is documented in [Field sensitivity](ANALYSIS.md#field-sensitivity) and
+[Conditional value limitations](ANALYSIS.md#conditional-value-limitations).
+
+Conditional type results, including misses, are cached per syntax node and
+isolated across reparsed initializers. Materialization and type probes obey the
+AST depth bound. A release probe of the reviewer's known-variable selector
+chain produced the following single-run elapsed times on this host; GCC/G++
+accepted every generated input. Times include indexing, solving and export.
+
+| Selector depth | `217d200` | After | After diagnostics / callback targets |
+|---------------:|----------:|------:|--------------------------------------|
+| 256 | 0.082 s | 0.063 s | none / `alpha`, `beta` |
+| 512 | 0.245 s | 0.118 s | one depth warning / `alpha` |
+| 1024 | 1.003 s | 0.283 s | one depth warning / `alpha` |
+| 4096 | exceeded 15 s cutoff | 1.379 s | one depth warning / `alpha` |
+
+The skipped deep suffix is intentionally incomplete: its `beta` value is beyond
+the traversal bound. This is bounded-work behavior with a diagnostic, not a
+claim to recover every target from arbitrarily deep generated expressions.
+The integration regression verifies both targets below the bound and limits
+allocated variables after truncation; it has no timing assertion.
+
+| Corpus | Measurement | `217d200` | After |
+|--------|-------------|----------:|------:|
+| HDF | indirect edges | 5156 | 5139 |
+| HDF | argument rows | 72255 | 72221 |
+| HDF | flow nodes / edges | 184159 / 164487 | 185496 / 164437 |
+| HDF | source flow origins | 90077 | 90061 |
+| HiView | flow nodes / edges | 85096 / 65093 | 85099 / 65093 |
+| Camera | flow nodes / edges | 232470 / 169219 | 232471 / 169219 |
+
+The HDF identity comparison removes 22 wrong-type test-adapter edges: 20
+cross-targets among the SDIO, regulator, I²S, HDMI and eMMC entries, plus the two
+MIPI CSI/DSI cross-targets. Each of the seven sites still reaches its own tester.
+Their 44 argument rows disappear. Five USB endpoint edges add ten argument
+rows. Three match the written direction: outbound prepare/playback, outbound
+retire/playback and inbound retire/capture. The other two retirement edges
+cross playback/capture directions through the existing instance-insensitive
+`AudioUsbEndpoint` field summary. Those two are **precision debt**, not recovered
+runtime calls. New probes pin the three direction-matching identities and the
+two summary extras separately; the previous 60-edge HDMI/UART precision-debt
+probe remains unchanged. Positive and negative tester probes pin all seven own
+targets and exclude cross-type targets without relying on an empty caller set.
+
+HDF flow-edge deltas are copy -30, GEP +2 and call-argument -22. Six return-copy
+origin identities at tester entry sites lose 18 rows as their indirect candidate
+sets narrow. Two first-member cast GEP origins appear in `devhost_test.cpp:423`
+and `vdi_sample2_driver.cpp:70`, giving a net loss of 16 origin rows. HiView and Camera have no
+named call-edge, argument-binding or source-origin changes. Their node-only
+changes are typed field cells; every flow-edge kind count stays unchanged.
+Files, functions, diagnostics and direct/external/IPC/dlsym totals are unchanged
+in all three corpora.
+
+Only the exact HDF indirect total is recaptured, to 5139. Both argument-row band
+centers use the measured 72221; their tolerance remains 150. Four new production
+probes bring the check count to 134. All updated checks pass on fresh jobs-1
+and jobs-8 exports, and all 49 logical relations match across job counts for
+each corpus. Full conditional fixture exports also match at jobs 1 and 4.
+These configured comparisons do not extend the implementation's documented
+language/model coverage boundary.
+
+### Designated extents and defensive alias merging — 2026-11-06
+
+The low-severity review of `12d28bb` identified one confirmed source-level
+false positive and one defensive metadata merge issue. Dense designated lists
+with an omitted `[]` bound no longer evaluate an extra whole-element default:
+the traversal infers the extent from the highest initialized index plus one.
+Reordered dense lists behave the same; gaps still retain default effects.
+The private traversal shape distinguishes an omitted bound from an explicitly
+written bound the analyzer cannot compute. The latter stays conservative,
+including the regression using `sizeof(char[2])`. Exported array types are
+unchanged. These rules and the remaining unknown-bound imprecision are in
+[Conditional values](ANALYSIS.md#conditional-values).
+
+A unit regression confirms that merging a callable-reference flag into an
+already registered alias retains the independent flag, and a later unit without
+it does not clear it. This is a defensive monotonicity guarantee; no realistic
+cross-TU source with legitimately differing flags was established. It does not
+change alias name/descriptor precedence. The misplaced address-return comment
+now documents `reference_address_return`, while `getter_default_arguments`
+describes its own explicit-argument indices.
+
+The fixture also covers file-scope member getters with explicit reference
+arguments in the first and second written positions, pinning the implicit-`this`
+offset. All six new callback checks pass with a release analyzer. All 2717
+workspace tests, 62 focused conditional tests, formatting, whitespace and the
+warnings-as-errors CI Clippy command pass. The source is accepted by Clang in
+C++20 mode with its C99 array-designator extension; it does not claim that array
+designators are standard C++20 syntax.
+
+Fresh pinned HDF, HiView and Camera runs pass all 134 checks at jobs 1 and 8.
+Compared with the previous validated `12d28bb` exports, all 48 analysis
+relations match after excluding producer/run metadata and `database_identity`.
+Only the identity digest changes because its inputs include producer-version
+metadata. All 49 logical relations, including that identity, match between job
+counts for each corpus. The full conditional fixture matches at jobs 1 and 4.
+No corpus expectations are changed.
+
+### Scoped integral offsets and ordinary omitted arguments — 2026-11-06
+
+The follow-up to `74250a6` registers defined unscoped enums in class bodies and
+uses the shared scope/import resolver for enum types and enumerators. Built-in
+integer multiplication, remainder, shifts, bitwise and unary operations, scalar
+comparisons, integral casts and `sizeof`/`alignof` expressions can establish an
+integer offset. This category probe stays separate from overload argument typing;
+unknown types and overloaded class operators do not become built-in offsets.
+
+Ordinary free/member calls and constructor sites now share the retained-default
+lowering previously used by file-scope reference getters. Defaults retain their
+declaration scope and original source spans. Written scalar argument counts
+suppress the right defaults even when those arguments have no pointer variable.
+Member bindings follow the call site's implicit-`this` convention, including
+header prototypes with no parameter variables. Virtual calls use the static
+visible declaration's defaults, not those written on an override.
+
+Within one caller repeated uses of one retained default share a value and nested
+source call; different executing callers keep distinct nested sites and return
+destinations through merge. Evaluation ownership is separate from declaration
+spelling, so project calls can evaluate dependency-header defaults without
+including dependency bodies. Deferred default expansion is bounded and consumes
+all transient requests before publishing the unit index. Declaration-only member
+metadata remains unchanged; no new parameter-type reads split existing symbols.
+
+Coverage includes explicit suppression, reference/value defaults, declaration
+scope shadowing, virtual and pure-virtual defaults, nested calls, shared-header
+free/member/constructor defaults, and separate caller/dependency ownership.
+The source-dataflow presentation regression now checks the actual defaulted
+`dispatch()` binding instead of expecting missing flow. All 67 focused tests and
+all 2722 workspace tests pass, as do formatting, whitespace checks, GCC C11/G++
+C++20 syntax checks for the new sources and warnings-as-errors workspace Clippy.
+The fresh release fixture checks 31 indirect sites in 23 new caller cases.
+
+This is retained expression/value propagation, not complete C++ default evaluation.
+The [authoritative limitations](ANALYSIS.md#return-value-flow) cover dependent and
+block-local environments, unknown callees, late CFG ordering and conservative
+overload candidate defaults. Scalar/class alias-call parsing outside the covered
+pointer/reference forms remains documented separately; these measurements do
+not establish language-wide expression coverage.
+
+Fresh release runs compare clean pinned exports of `74250a6` with this change,
+using the same minimal-export configuration and 800,000-pop budget above.
+All existing semantic call-target and argument-binding identities are retained.
+Unresolved external functions with line zero are compared by canonical name:
+14 existing HiView `std::time` targets change only their synthetic file anchor
+from `decorator_util.cpp` to `time_util.h`, not their name or resolution.
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | call edges | 78795 | 78796 |
+| HDF | argument-flow rows | 72221 | 72232 |
+| HDF | flow nodes / edges | 185496 / 164437 | 185557 / 164532 |
+| HDF | source-origin rows | 90061 | 90141 |
+| HiView | call edges | 39299 | 39318 |
+| HiView | argument-flow rows | 32063 | 32328 |
+| HiView | flow nodes / edges | 85099 / 65093 | 85402 / 65525 |
+| HiView | source-origin rows | 30181 | 30368 |
+| camera | call edges | 116138 | 116145 |
+| camera | argument-flow rows | 57906 | 58400 |
+| camera | flow nodes / edges | 232471 / 169219 | 232980 / 170191 |
+| camera | source-origin rows | 83865 | 84345 |
+
+HDF gains one external `std::string` construction at the default spelled in
+`framework/tools/hc-gen/src/ast.h:431`, executed by `Decompile::RebuildAst`.
+The eleven new argument rows comprise five integer-offset expressions at
+`MmapWriteData:463`, `MmapReadData:619/626` and `AudioUsbParseFeatureUnit:1601`,
+four `ASTAttr` constructor defaults, one `Ast::Dump` prefix and one
+`SetBufferHandle` destructor default. Flow-edge deltas are copy +43, GEP +25,
+load +13, store +5, call-argument +8 and points-to +1. These are argument/value
+and external construction changes, not new indirect callback targets.
+
+HiView gains twelve external `std::make_pair` default evaluations spelled in
+`base/event_store/include/sys_event_query.h:299` and seven `std::time` default
+evaluations at `base/utility/include/time_util.h:57`, each with its executing
+caller retained. The 265 new argument rows include `FileUtil` mode defaults,
+`Vendor`'s null helper, `SysEventQuery` caller/callback defaults and `TimeUtil`
+timestamps. Flow-edge deltas are address-of +37, copy +216, call-argument +128
+and points-to +51. Named probes retain all nineteen new caller/source/target
+identities rather than relying only on a bulk external count.
+
+Camera gains 494 argument rows, including NDK photo/preview/video dimensions,
+`CameraXCollie` optional arguments, stream-test dimensions and fourteen
+`TaskManager::SubmitTask` `param` defaults. The latter expose existing overload
+imprecision: an unknown lambda retains both callback overloads and the
+`SubmitTask(TaskGroupHandle, std::any = std::any())` candidate. Its six executing
+caller contexts now retain external `std::any` defaults at
+`common/include/task_manager/task_manager.h:36`. These six edges and fourteen
+bindings are **precision debt**, not recovered runtime calls. Named probes guard
+all six caller identities and require the default in argument position two,
+without replacing explicit lambda/handle bindings in position one.
+
+One additional Camera direct edge is also conservative: the service
+`createPhotoAssetIntf` at `services/camera_service/src/media_library/photo_asset_adapter.cpp:79`
+retains the six-parameter constructor defined in
+`dynamic_libs/media_library/src/photo_asset_adapter.cpp:29`, whose last three
+parameters have defaults, alongside the service's three-parameter constructor.
+These are conflicting same-named class/header views in this configured corpus;
+the extra cross-header candidate is separately probed as **precision debt**,
+not described as a recovered implementation. The sole new function symbol is
+the external `std::any`. Camera flow-edge deltas are address-of +21, copy +479,
+call-argument +463 and points-to +9. Its 480 extra source-origin rows retain
+the declaration expressions supplying those values.
+
+Indirect totals remain HDF 5139, HiView 246 and Camera 443. Files, diagnostics,
+IPC/dlsym counts and the existing dispatch, linkage and declaration-split probes
+are unchanged. After auditing these identities, only the argument-row band
+centers are refreshed: HDF 72232 (both entries), HiView 32328 and Camera 58400;
+tolerances remain 150, 120 and 250. Eight focused production probes bring the
+check count to 142, all passing on both fresh jobs-1 and jobs-8 exports.
+All 49 logical relations, including `database_identity`, match across job
+counts in each corpus; the full conditional fixture matches at jobs 1 and 4.
+Producer metadata differs between baseline and changed builds and is excluded
+from the semantic comparison.
+
+### Shared projections, temporary defaults and bounded category walks — 2026-11-06
+
+The six findings against `acdb1cc` are covered by `review_six.cpp` and generated
+scratch projects. A recognized first-member pointer cast now materializes its
+field projection before value-cast normalization. Initializers, returns,
+arguments, reads and indirect callees consume that cached address. The fixture
+reaches exactly `alpha` through each first-member consumer and only `beta`
+through the second member. This retains the structural alias boundary defined
+in [Field sensitivity](ANALYSIS.md#field-sensitivity); it does not establish
+arbitrary reinterpret-cast or ABI layout semantics.
+
+A value-returning default bound to a reference now initializes a temporary cell
+and passes its address. It no longer requests reference-address facts from a
+value-returning `make()`. Free/member/constructor probes with `const F &` all
+reach `alpha`. Lvalue defaults retain their original cells. Temporary destruction
+and general implicit conversions remain outside this value-flow model.
+
+Cached defaults retain their evaluated call-site ranges. After the bounded
+expansion queue settles, loop evidence propagates monotonically through host
+and nested-default dependencies, including a later loop use of a value first
+cached outside a loop. The release export reports `loop`/`self_concurrent=1`
+for `six_default_loop` and `six_default_chain_loop`; the straight-line control
+remains `unknown`/0. This is may-analysis evidence, not a proof that the control
+executes only once. Separate lambda bodies do not inherit the creating host's
+loop flag through this mechanism.
+
+Sequencing currently records an explicit `unsupported_construct` gap at the
+host event for evaluated defaults lowered after CFG construction. The reduced
+`before(); take(); after();` example retains its default `make()` call edge and
+exports **partial** coverage with a gap at `take()`. Default calls do not yet
+have their own argument-order events. The regression checks that limitation
+explicitly instead of claiming complete sequencing; see
+[Return-value flow](ANALYSIS.md#return-value-flow).
+
+Address and array-decay expansion now share the value walk's AST depth budget.
+Function-designator representatives and lvalue categories memoize results,
+including misses, and bound category recursion. These caches are isolated with
+scratch initializer trees and retired with the live syntax tree. Generated
+selectors at depths 128/256 retain both callbacks; depth 4096 warns once and
+skips the suffix. Address/decay probes keep fewer than 600 IR constraints, and
+function-category probes keep fewer than 600 variables. Truncated inputs do
+not establish complete value or reference-return coverage.
+
+Single fresh release CLI runs, including SQLite export, on this host gave:
+
+| Generated form, depth 4096 | `acdb1cc` | After |
+|----------------------------|----------:|------:|
+| Address of callback selector | 4.950 s | 1.210 s |
+| Address of selected-array element | 4.881 s | 1.157 s |
+| `decltype(auto)` function-designator selector | 11.115 s | 1.329 s |
+
+At depths 256/1024, the function-category probe measured 0.089/0.738 s before
+and 0.069/0.288 s after. These are single-run wall-time observations, not
+portable performance guarantees or a claim that source parsing/export cost is
+bounded independently of input length. All extreme probes complete with the
+ordinary depth warning; their deeper suffixes are intentionally incomplete.
+
+All 73 focused conditional tests and all 2728 workspace tests pass, together
+with warnings-as-errors workspace Clippy, formatting and whitespace checks.
+G++ accepts the new fixture in C++20 mode. A fresh release export checks nine
+new callback sites exactly, plus the three execution-context controls and
+partial CFG coverage. With sequencing enabled, all 49 logical fixture relations
+match between jobs 1 and 4.
+
+Fresh release builds of `acdb1cc` and this change analyze the same clean pinned
+HDF/HiView/Camera revisions and minimal-export configuration above. Every
+semantic call-target identity is unchanged, including all indirect, direct,
+external and IPC targets. Functions, call sites, diagnostics and dlsym totals
+also stay unchanged. HDF has six argument substitutions; HiView/Camera add
+133/146 bindings without removing existing ones:
+
+| Corpus | Measurement | Before | After |
+|--------|-------------|-------:|------:|
+| HDF | argument-flow rows | 72232 | 72232 |
+| HDF | flow nodes / edges | 185557 / 164532 | 185571 / 164550 |
+| HDF | source-origin rows | 90141 | 90156 |
+| HiView | argument-flow rows | 32328 | 32461 |
+| HiView | flow nodes / edges | 85402 / 65525 | 85646 / 65849 |
+| HiView | source-origin rows | 30368 | 30530 |
+| camera | argument-flow rows | 58400 | 58546 |
+| camera | flow nodes / edges | 232980 / 170191 | 233407 / 170759 |
+| camera | source-origin rows | 84345 | 84629 |
+
+HDF's six `service` arguments in `hdf_remote_adapter_test.cpp:50/52/91/96/98/103`
+now use GEP temporaries projecting `HdfRemoteServiceHolder::service_`, replacing
+the unprojected `holder` actual at the same formal position. A positive probe
+requires all six projected bindings. Its 18 new flow edges are six GEP, ten
+copy, one address-of and one points-to edge. The fifteen new origin rows include
+twelve copy/GEP origins at those calls, copy origins at `devhost_test.cpp:423`
+and `vdi_sample2_driver.cpp:70`, and the temporary address for the existing
+`std::string()` default in `ast.h:431`.
+
+HiView's 133 additional bindings are reference-default temporaries, including
+`TraceStateMachine` output paths, `BuildEvent`'s extra string and eight
+`SettingObserverManager::GetStringValue` default values. Its flow-edge deltas
+are address-of +162, call-argument +81 and points-to +81. Camera's 146 additions
+include 136 `VideoInfo::moviePath` bindings across the two retained constructor
+signatures, five `SubscribeCommonEvent` permission defaults and five other
+reference defaults. Flow-edge deltas are address-of +283, call-argument +142,
+points-to +142 and copy +1. Positive probes require all eight setting defaults
+and all 136 movie-path defaults to receive an actual temporary address.
+
+After this identity/flow audit, HiView and Camera argument band centers are
+refreshed to 32461 and 58546 with tolerances 120/250 unchanged. HDF remains
+72232 with tolerance 150 in both entries. Existing known-imprecise audio,
+SubmitTask and cross-header-constructor probes stay separate and unchanged.
+Three new positive probes bring the total to 145 checks, passing against both
+fresh jobs-1 and jobs-8 exports. All 49 logical relations match across job
+counts for each corpus. Producer metadata is excluded from the before/after
+semantic comparison. This recapture adds no new claim of complete C++ default,
+conversion, lifetime or sequencing semantics.
+
 ## Owning-pointer `get()` aliases — 2026-10-31
 
 Issue #247: accessing a callback through `p.get()->callback` lost the

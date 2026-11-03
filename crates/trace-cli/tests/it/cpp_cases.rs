@@ -11346,14 +11346,21 @@ fn deref_argument_of_a_function_pointer_passes_it() {
     assert_passes("pass_member_fn", "o", &["gep op", "load"]);
 }
 
-/// Issue #151: `*(out + 1) = *h->pp` resolves no pointer to store
-/// through, nor do C's `*get_h()->pp = *h->pp` and `*&m_ap = *h->pp`, so
-/// the value is not evaluated: no fact and no temporary.
+/// Built-in offsets resolve the pointer summary before evaluating the RHS.
+/// Unsupported call/member-address operands still emit no RHS or temporary.
 #[test]
-fn deref_store_through_no_pointer_evaluates_no_value() {
+fn deref_store_resolves_offsets_before_evaluating_the_value() {
     let (program, _) = deref_member_reads();
+    let edges = deref_edges("store_offset");
+    let value = common::flow_chain(
+        &edges,
+        &[deref_local("store_offset", "h")],
+        &["gep pp", "load", "load"],
+    );
+    let stored = common::flow_chain(&edges, &value.into_iter().collect::<Vec<_>>(), &["store"]);
+    let destination = common::flow_chain(&edges, &[deref_local("store_offset", "out")], &["copy"]);
+    assert!(!stored.is_disjoint(&destination), "{edges:?}");
     for (func, params) in [
-        ("store_offset", &["h", "out"][..]),
         ("store_call_root", &["h"][..]),
         ("CppAddrOfMember::store", &["this", "h"][..]),
     ] {
@@ -11389,18 +11396,26 @@ fn deref_value_of_no_computable_operand_emits_nothing() {
 /// reference returns the referent's address, `cpp_g_hp`'s value.
 #[test]
 fn deref_return_by_reference_returns_the_address() {
+    use trace_ir::ReturnFlow::{Copy, LvalueAddress};
     let (program, _) = deref_member_reads();
     let returns = &program.fn_returns[&common::only_function(program, "cpp_inst")];
     let src = common::only_variable(program, "cpp_g_hp");
-    assert_eq!(returns, &[trace_ir::ReturnFlow::Copy { src }]);
+    assert_eq!(
+        returns,
+        &[Copy { src }, LvalueAddress(Box::new(Copy { src }))]
+    );
 }
 
 /// Issue #151: a function returning a reference, spelled `S &f()` or
 /// with a trailing `-> S &` (a lambda's included), returns `*cpp_g_hp` as
-/// `cpp_g_hp`'s value; `decltype(auto)` returns the value read.
+/// `cpp_g_hp`'s value. `decltype(auto)` keeps both the value read for value
+/// consumers and the original reference address for address consumers.
 #[test]
 fn deref_return_by_reference_follows_the_declared_return() {
-    use trace_ir::{FlowConstraint::Load, ReturnFlow::Copy};
+    use trace_ir::{
+        FlowConstraint::Load,
+        ReturnFlow::{Copy, LvalueAddress},
+    };
     let (program, _) = deref_member_reads();
     let hp = common::only_variable(program, "cpp_g_hp");
     let lambda = common::lambda_in(program, "cpp_make_lambda").id;
@@ -11410,12 +11425,17 @@ fn deref_return_by_reference_follows_the_declared_return() {
         common::only_function(program, "cpp_inst_trailing"),
         lambda,
     ] {
-        assert_eq!(returns(fid), [Copy { src: hp }], "{fid:?}");
+        assert_eq!(
+            returns(fid),
+            [Copy { src: hp }, LvalueAddress(Box::new(Copy { src: hp }))],
+            "{fid:?}"
+        );
     }
     let value = returns(common::only_function(program, "cpp_inst_value"));
-    let [Copy { src }] = value[..] else {
+    let [Copy { src }, LvalueAddress(ref address)] = value[..] else {
         panic!("{value:?}");
     };
+    assert_eq!(address.as_ref(), &Copy { src: hp });
     assert!(
         program
             .flow
@@ -11500,12 +11520,16 @@ fn deref_of_a_pointer_root_loads_the_pointer_first() {
 #[test]
 fn deref_of_this_follows_the_operand_rules() {
     use trace_ir::FlowConstraint::{Load, Store};
+    use trace_ir::ReturnFlow::{Copy, LvalueAddress};
     let (program, _) = deref_member_reads();
     let set = common::only_function(program, "CppChain::set");
     let this = common::local_variable(program, "CppChain::set", "this");
     assert_eq!(
         program.fn_returns[&set],
-        [trace_ir::ReturnFlow::Copy { src: this }]
+        [
+            Copy { src: this },
+            LvalueAddress(Box::new(Copy { src: this }))
+        ]
     );
     let pass = common::only_function(program, "CppChain::pass");
     let this = common::local_variable(program, "CppChain::pass", "this");

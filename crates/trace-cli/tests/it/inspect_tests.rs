@@ -1545,7 +1545,8 @@ fn source_dataflow_reference_identity_operations_calls_and_formats() {
         .unwrap();
     assert!(scope.location.path.ends_with("macro_cases.cpp"));
     assert_eq!(scope.location.line, 8);
-    // Missing default facts stay missing. Presentation must not fabricate them.
+    // Lowering supplies the omitted payload; presentation must expose the
+    // specific defaulted call through those facts.
     let defaults = dataflow_view(
         &conn,
         &[start(
@@ -1557,7 +1558,27 @@ fn source_dataflow_reference_identity_operations_calls_and_formats() {
         16,
     )
     .unwrap();
-    assert!(!defaults.edges.iter().any(|e| e.call_site_id.is_some()));
+    let source =
+        std::fs::read_to_string(fixture("dataflow_presentation").join("cases.cpp")).unwrap();
+    let line = source
+        .lines()
+        .position(|line| line.trim_start().starts_with("dispatch();"))
+        .unwrap()
+        + 1;
+    let default_site: trace_ir::CallSiteId = conn
+        .query_row(
+            "SELECT s.id FROM call_sites s JOIN functions c ON c.id=s.caller_fn_id \
+         JOIN call_edges e ON e.call_site_id=s.id \
+         JOIN functions t ON t.id=e.callee_fn_id WHERE c.name='run_cpp_cases' \
+         AND t.name='dispatch' AND s.line=?1",
+            [line as i64],
+            |row| row.get::<_, u32>(0).map(trace_ir::CallSiteId),
+        )
+        .unwrap();
+    assert!(defaults
+        .edges
+        .iter()
+        .any(|edge| edge.call_site_id == Some(default_site)));
 }
 
 #[test]
