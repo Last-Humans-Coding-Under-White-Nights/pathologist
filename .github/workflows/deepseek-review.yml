@@ -1,0 +1,30 @@
+name: DeepSeek PR Review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# The action works with the reviewer GitHub App token only.
+permissions: {}
+
+concurrency:
+  group: deepseek-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Forks of this repository have no reviewer secrets.
+    if: github.repository_owner == 'LHCWN'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Reads the diff through the GitHub API; pull request code is never checked out or run.
+      # Only members of the organization are reviewed, private memberships included;
+      # drafts and other authors are skipped.
+      # Reviewer: https://github.com/devnullexile/deepseek-review
+      - uses: devnullexile/deepseek-review@v1
+        with:
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          app-id: ${{ vars.REVIEW_APP_ID }}
+          app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          members-only: "true"
