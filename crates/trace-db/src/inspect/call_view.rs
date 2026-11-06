@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use trace_ir::FnId;
 
 /// The complete analysis graph or its stable lambda-free SQL projection.
@@ -15,14 +16,23 @@ impl CallGraphView {
         if self == Self::Complete {
             return Ok("call_edges");
         }
-        for relation in [
-            "functions_no_lambdas",
-            "call_edges_no_lambdas",
-            "unresolved_calls_no_lambdas",
+        for (relation, sql) in [
+            ("functions_no_lambdas", "SELECT id FROM functions_no_lambdas LIMIT 0"),
+            ("call_edges_no_lambdas", "SELECT caller_fn_id, callee_fn_id, call_site_id, resolution FROM call_edges_no_lambdas LIMIT 0"),
+            ("unresolved_calls_no_lambdas", "SELECT call_site_id, caller_fn_id, callee_text, file_id, line, col FROM unresolved_calls_no_lambdas LIMIT 0"),
         ] {
             if !table_exists(conn, relation)? {
                 bail!("`{relation}` missing: re-run `trace analyze` (or `trace-merge`) with this binary to use --hide-lambdas");
             }
+            // Resolve transitive dependencies without running the projection.
+            // Stepping LIMIT 0 also revalidates cached statements after DDL.
+            // Do not require specific internal helper names: older snapshots
+            // can have valid public views with different implementations.
+            conn.prepare_cached(sql)
+                .and_then(|mut stmt| stmt.exists([]))
+                .with_context(|| format!(
+                    "`{relation}` cannot be queried: re-run `trace analyze` (or `trace-merge`) with this binary to use --hide-lambdas"
+                ))?;
         }
         Ok("call_edges_no_lambdas")
     }
@@ -300,6 +310,59 @@ mod tests {
     }
 
     #[test]
+    fn broken_helper_dependencies_report_reexport_even_after_cached_validation() {
+        for compact in [false, true] {
+            for missing in ["_lambda_reachability", "_lambda_callers"] {
+                let conn = database(compact);
+                let view = CallGraphView::WithoutLambdas;
+                view.edges(&conn).unwrap();
+                conn.execute_batch(&format!("DROP VIEW {missing};"))
+                    .unwrap();
+                let error = view
+                    .call_graph(&conn, FnId(1), Direction::Down, 1)
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("re-run `trace analyze`"),
+                    "{error}"
+                );
+                assert!(format!("{error:#}").contains(missing), "{error:#}");
+                call_graph(&conn, 1, Direction::Down, 1).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn earlier_projection_definitions_need_no_new_helper_or_write_access() {
+        for compact in [false, true] {
+            let conn = database(compact);
+            // The first exports keyed recursion by the entering edge and had
+            // no _lambda_reachability helper. Keep those snapshots readable.
+            conn.execute_batch(
+                "DROP VIEW _lambda_callers; DROP VIEW _lambda_reachability;
+                 CREATE VIEW _lambda_callers AS
+                 WITH RECURSIVE paths(entry_edge_id,call_site_id,caller_fn_id,lambda_fn_id,resolution) AS (
+                   SELECT ce.id,ce.call_site_id,ce.caller_fn_id,ce.callee_fn_id,ce.resolution
+                   FROM call_edges ce
+                   JOIN functions_no_lambdas caller ON caller.id=ce.caller_fn_id
+                   LEFT JOIN functions_no_lambdas callee ON callee.id=ce.callee_fn_id
+                   WHERE callee.id IS NULL
+                   UNION
+                   SELECT p.entry_edge_id,p.call_site_id,p.caller_fn_id,ce.callee_fn_id,p.resolution
+                   FROM paths p JOIN call_edges ce ON ce.caller_fn_id=p.lambda_fn_id
+                   LEFT JOIN functions_no_lambdas callee ON callee.id=ce.callee_fn_id
+                   WHERE callee.id IS NULL
+                 ) SELECT * FROM paths;
+                 PRAGMA query_only=ON;",
+            ).unwrap();
+            let graph = CallGraphView::WithoutLambdas
+                .call_graph(&conn, FnId(1), Direction::Down, 1)
+                .unwrap();
+            assert!(graph.nodes.contains_key(&4));
+            assert!(!graph.nodes.contains_key(&2));
+        }
+    }
+
+    #[test]
     fn shared_callees_at_one_site_are_one_visible_edge_but_distinct_positions_survive() {
         for compact in [false, true] {
             let conn = database(compact);
@@ -331,7 +394,11 @@ mod tests {
             }
             let view = CallGraphView::WithoutLambdas;
             let graph = view.call_graph(&conn, FnId(1), Direction::Down, 1).unwrap();
-            // The fixture's unresolved leaf in lambda 3 remains visible too.
+            // Entry edge 13 reaches lambda 3 and its unresolved site 109.
+            assert!(graph
+                .edges
+                .iter()
+                .any(|e| e.from == 1 && e.to == -110 && e.label == "unresolved"));
             let resolved: Vec<_> = graph.edges.iter().filter(|e| e.to >= 0).collect();
             assert_eq!(resolved.len(), 2);
             assert_eq!(resolved.iter().map(|e| e.to).collect::<Vec<_>>(), [4, 5]);

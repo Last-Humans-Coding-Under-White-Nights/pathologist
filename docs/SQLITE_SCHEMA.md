@@ -256,6 +256,10 @@ provenance rows. `inspect callgraph` and `inspect callchain` deduplicate by visi
 endpoints, resolution, and full source path/line/column before traversal;
 copies with different call-site IDs can therefore collapse too, while
 distinct source positions remain distinct edges.
+Projected neighbors are visited in order of visible neighbor function ID,
+resolution, full source path, line, and column. Consequently `--hide-lambdas`
+can change BFS and text/JSON display order relative to entering-edge order;
+the order remains deterministic. Complete-graph traversal order is unchanged.
 
 An ordinary edge uses its own ID, call site, and resolution. A contracted
 edge's site identifies the invocation entering the lambda path, not a direct
@@ -281,8 +285,11 @@ limits, in either direction and in every output format. One projected edge
 counts as one hop. Source positions inside a lambda select the enclosing
 non-lambda function when present; explicitly naming a hidden lambda is an
 error. Without the flag, queries retain the complete graph and work on
-databases without the new views. The flag requires the new views and reports
-a re-export instruction if they are missing.
+databases without the new views. The flag requires the public views and
+reports a re-export instruction if they are missing or cannot be queried,
+including broken transitive helper dependencies. Validation resolves the
+stored definitions rather than requiring a fixed list of internal helper
+names, so earlier valid snapshots remain readable.
 
 ```sql
 SELECT caller.name, callee.name, e.resolution, e.call_site_id
