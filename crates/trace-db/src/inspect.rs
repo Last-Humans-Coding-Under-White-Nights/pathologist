@@ -9,9 +9,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use trace_analysis::LocKind;
 
+mod call_view;
 mod editor;
 mod sequence;
 mod slice;
+pub use call_view::*;
 pub use editor::*;
 pub use sequence::*;
 pub use slice::*;
@@ -403,13 +405,22 @@ pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNod
 
 type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, EdgeSite)>>;
 
-fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
-    let mut stmt = conn.prepare(
+fn load_call_adjacency(
+    conn: &Connection,
+    dir: Direction,
+    view: CallGraphView,
+) -> Result<Adjacency> {
+    let relation = view.edges(conn)?;
+    let order = match view {
+        CallGraphView::Complete => "ce.id",
+        CallGraphView::WithoutLambdas => "ce.entry_edge_id, ce.callee_fn_id",
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line, cs.col \
-         FROM call_edges ce \
+         FROM {relation} ce \
          LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
-         LEFT JOIN files p ON p.id = cs.file_id",
-    )?;
+         LEFT JOIN files p ON p.id = cs.file_id ORDER BY {order}",
+    ))?;
     let mut adj: Adjacency = FxHashMap::default();
     let rows = stmt.query_map([], |row| {
         // Synthetic edges (IPC bridges) have no call site; render them with a
@@ -758,20 +769,36 @@ pub fn call_graph(
     dir: Direction,
     max_depth: u32,
 ) -> Result<QueryGraph> {
+    call_graph_impl(conn, root_fn_id, dir, max_depth, CallGraphView::Complete)
+}
+
+fn call_graph_impl(
+    conn: &Connection,
+    root_fn_id: i64,
+    dir: Direction,
+    max_depth: u32,
+    view: CallGraphView,
+) -> Result<QueryGraph> {
     require_call_edge_caller(conn)?;
     let mut labels = load_function_labels(conn)?;
     if !labels.contains_key(&root_fn_id) {
         bail!("function id {root_fn_id} not found in database");
     }
-    let mut adj = load_call_adjacency(conn, dir)?;
+    view.require_visible(conn, root_fn_id)?;
+    let mut adj = load_call_adjacency(conn, dir, view)?;
     if dir == Direction::Down {
-        let mut stmt = conn.prepare(
+        let sql = if view == CallGraphView::WithoutLambdas {
+            "SELECT cs.call_site_id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
+             FROM unresolved_calls_no_lambdas cs JOIN files p ON p.id = cs.file_id \
+             ORDER BY cs.call_site_id, cs.caller_fn_id"
+        } else {
             "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
              FROM call_sites cs JOIN files p ON p.id = cs.file_id \
              WHERE cs.is_direct = 0 \
                AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
-             ORDER BY cs.id",
-        )?;
+             ORDER BY cs.id"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -963,6 +990,27 @@ pub fn call_chains(
     max_depth: u32,
     limit: Option<usize>,
 ) -> Result<CallChainsResult> {
+    call_chains_impl(
+        conn,
+        from_fn_id,
+        to_fn_id,
+        dir,
+        max_depth,
+        limit,
+        CallGraphView::Complete,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_chains_impl(
+    conn: &Connection,
+    from_fn_id: i64,
+    to_fn_id: i64,
+    dir: Direction,
+    max_depth: u32,
+    limit: Option<usize>,
+    view: CallGraphView,
+) -> Result<CallChainsResult> {
     require_call_edge_caller(conn)?;
     let labels = load_function_labels(conn)?;
     if !labels.contains_key(&from_fn_id) {
@@ -971,6 +1019,8 @@ pub fn call_chains(
     if !labels.contains_key(&to_fn_id) {
         bail!("target function id {to_fn_id} not found in database");
     }
+    view.require_visible(conn, from_fn_id)?;
+    view.require_visible(conn, to_fn_id)?;
     if max_depth == 0 {
         if from_fn_id == to_fn_id {
             return Ok(CallChainsResult {
@@ -984,7 +1034,7 @@ pub fn call_chains(
         bail!("depth must be >= 1");
     }
 
-    let mut adj = load_call_adjacency(conn, dir)?;
+    let mut adj = load_call_adjacency(conn, dir, view)?;
     for list in adj.values_mut() {
         list.sort_by(|a, b| {
             (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
@@ -1655,18 +1705,30 @@ pub fn resolve_function_target(
     file: Option<&str>,
     line: Option<i64>,
 ) -> Result<FunctionRef> {
+    resolve_function_target_impl(conn, name, file, line, CallGraphView::Complete)
+}
+
+fn resolve_function_target_impl(
+    conn: &Connection,
+    name: Option<&str>,
+    file: Option<&str>,
+    line: Option<i64>,
+    view: CallGraphView,
+) -> Result<FunctionRef> {
     if let Some(l) = line {
         let f = file.ok_or_else(|| anyhow::anyhow!("line specified without file"))?;
-        require_function_at(conn, f, l)
+        view.require_function_at(conn, f, l)
     } else if let Some(n) = name {
         if let Some((f, l_str)) = n.rsplit_once(':') {
             if let Ok(l) = l_str.parse::<i64>() {
                 if !f.is_empty() {
-                    return require_function_at(conn, f, l);
+                    return view.require_function_at(conn, f, l);
                 }
             }
         }
-        require_function_by_name(conn, n, file)
+        let function = require_function_by_name(conn, n, file)?;
+        view.require_visible(conn, function.id)?;
+        Ok(function)
     } else if let Some(f) = file {
         bail!("file specified without line or function name: '{f}'");
     } else {

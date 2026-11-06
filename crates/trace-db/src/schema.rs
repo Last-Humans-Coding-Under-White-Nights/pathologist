@@ -18,6 +18,59 @@ CREATE TABLE IF NOT EXISTS database_identity (
 );
 "#;
 
+// Consumer projections use the logical relations, shared by both storage
+// layouts and by analysis/merge exports. Their contract lives in
+// docs/SQLITE_SCHEMA.md, "Lambda-free call graph views".
+macro_rules! lambda_free_views {
+    () => {
+        r#"
+CREATE VIEW IF NOT EXISTS functions_no_lambdas AS
+SELECT id, name, file_id, line_start, line_end, linkage, signature,
+       is_defined, is_dep, is_weak, target_id
+FROM functions WHERE instr(name, '::$lambda') = 0;
+
+-- Internal reachability relation. UNION (not UNION ALL) bounds recursion
+-- even when lambdas call each other cyclically. Each state retains the
+-- first edge, so shared callbacks stay attached to their actual callers.
+CREATE VIEW IF NOT EXISTS _lambda_callers AS
+WITH RECURSIVE paths(entry_edge_id, call_site_id, caller_fn_id, lambda_fn_id, resolution) AS (
+    SELECT ce.id, ce.call_site_id, ce.caller_fn_id, ce.callee_fn_id, ce.resolution
+    FROM call_edges ce
+    JOIN functions_no_lambdas caller ON caller.id = ce.caller_fn_id
+    LEFT JOIN functions_no_lambdas callee ON callee.id = ce.callee_fn_id
+    WHERE callee.id IS NULL
+    UNION
+    SELECT p.entry_edge_id, p.call_site_id, p.caller_fn_id, ce.callee_fn_id, p.resolution
+    FROM paths p JOIN call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
+    LEFT JOIN functions_no_lambdas callee ON callee.id = ce.callee_fn_id
+    WHERE callee.id IS NULL
+)
+SELECT entry_edge_id, call_site_id, caller_fn_id, lambda_fn_id, resolution FROM paths;
+
+CREATE VIEW IF NOT EXISTS call_edges_no_lambdas AS
+SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id, ce.callee_fn_id, ce.resolution
+FROM call_edges ce
+JOIN functions_no_lambdas caller ON caller.id = ce.caller_fn_id
+JOIN functions_no_lambdas callee ON callee.id = ce.callee_fn_id
+UNION
+SELECT p.entry_edge_id, p.call_site_id, p.caller_fn_id, ce.callee_fn_id, p.resolution
+FROM _lambda_callers p JOIN call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
+JOIN functions_no_lambdas callee ON callee.id = ce.callee_fn_id;
+
+CREATE VIEW IF NOT EXISTS unresolved_calls_no_lambdas AS
+SELECT cs.id AS call_site_id, cs.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
+FROM call_sites cs JOIN functions_no_lambdas caller ON caller.id = cs.caller_fn_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM call_edges ce WHERE ce.call_site_id = cs.id)
+UNION
+SELECT cs.id, p.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
+FROM call_sites cs JOIN _lambda_callers p ON p.lambda_fn_id = cs.caller_fn_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM call_edges ce WHERE ce.call_site_id = cs.id);
+"#
+    };
+}
+
 // Legacy and compact layouts share every unaffected table and index.
 macro_rules! common_tables {
     ($variables:literal, $call_sites:literal, $flow_nodes:literal, $flow_edges:literal, $without_rowid:literal) => {
@@ -733,7 +786,8 @@ CREATE INDEX IF NOT EXISTS idx_flow_origins_dst_node ON "#,
 
 pub const TABLES_V7: &str = concat!(
     common_tables!("variables", "call_sites", "flow_nodes", "flow_edges", ""),
-    legacy_storage!()
+    legacy_storage!(),
+    lambda_free_views!()
 );
 pub const PROVENANCE_INDEXES_V7: &str = query_indexes!("call_sites", "call_edges");
 pub const INDEXES_V7: &str = concat!(
@@ -750,6 +804,7 @@ pub const INDEXES_V7: &str = concat!(
 pub const SCHEMA_V7: &str = concat!(
     common_tables!("variables", "call_sites", "flow_nodes", "flow_edges", ""),
     legacy_storage!(),
+    lambda_free_views!(),
     query_indexes!("call_sites", "call_edges"),
     remaining_indexes!(
         "call_edges",
@@ -769,7 +824,8 @@ pub const TABLES_V8: &str = concat!(
         "flow_edges_data",
         " WITHOUT ROWID"
     ),
-    compact_storage!()
+    compact_storage!(),
+    lambda_free_views!()
 );
 pub const PROVENANCE_INDEXES_V8: &str = query_indexes!("call_sites_data", "call_edges_data");
 pub const INDEXES_V8: &str = concat!(
@@ -793,6 +849,7 @@ pub const SCHEMA_V8: &str = concat!(
         " WITHOUT ROWID"
     ),
     compact_storage!(),
+    lambda_free_views!(),
     query_indexes!("call_sites_data", "call_edges_data"),
     remaining_indexes!(
         "call_edges_data",

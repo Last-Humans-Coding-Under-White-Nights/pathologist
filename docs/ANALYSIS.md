@@ -2340,6 +2340,11 @@ The kernel's data round trip is specified in
 
 ### Callback invocation (`invoke`)
 
+Lambda bodies remain separate functions in the analysis graph. Consumers can
+request the [lambda-free SQL projection](SQLITE_SCHEMA.md#lambda-free-call-graph-views)
+to display callback reachability without lambda intermediates; this does not
+change callback wiring or execution contexts.
+
 `invoke` says the callee may call one of its arguments: a task queue running
 what was submitted, a thread running its entry point. The callback is every
 function the argument names or may point to, restricted to the caller's link

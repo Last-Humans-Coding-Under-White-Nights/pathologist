@@ -183,6 +183,9 @@ enum InspectCommands {
     ///
     /// `--direction down` follows callees, `up` follows callers.
     Callgraph {
+        /// Contract lambda intermediates before traversal; depth counts visible hops.
+        #[arg(long)]
+        hide_lambdas: bool,
         /// File path substring (e.g. basename) locating the start function.
         #[arg(long)]
         file: String,
@@ -263,6 +266,9 @@ enum InspectCommands {
     /// Call chains (paths) between two functions no longer than depth.
     #[command(alias = "chains")]
     Callchain {
+        /// Contract lambda intermediates before traversal; depth counts visible hops.
+        #[arg(long)]
+        hide_lambdas: bool,
         /// Start function name, C++ qualified suffix, or FILE:LINE (e.g. `main` or `main.c:10`).
         #[arg(long)]
         from: Option<String>,
@@ -954,6 +960,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             }
         }
         InspectCommands::Callgraph {
+            hide_lambdas,
             file,
             line,
             depth,
@@ -965,8 +972,14 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             if depth == 0 {
                 anyhow::bail!("depth must be >= 1");
             }
-            let start = trace_db::require_function_at(&conn, &file, line)?;
-            let mut graph = trace_db::call_graph(&conn, start.id, dir, depth)?;
+            let view = if hide_lambdas {
+                trace_db::CallGraphView::WithoutLambdas
+            } else {
+                trace_db::CallGraphView::Complete
+            };
+            let start = view.require_function_at(&conn, &file, line)?;
+            let mut graph =
+                view.call_graph(&conn, trace_ir::FnId(u32::try_from(start.id)?), dir, depth)?;
             if let Some(p) = callgraph_filter {
                 let filter = trace_db::CallGraphFilter::from_file(&p)?;
                 trace_db::filter_query_graph(&mut graph, &filter);
@@ -1120,6 +1133,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             print!("{}", trace_db::render_slice(&slice, format.to_render())?);
         }
         InspectCommands::Callchain {
+            hide_lambdas,
             from,
             to,
             from_file,
@@ -1133,22 +1147,23 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             callgraph_filter,
         } => {
             let dir = trace_db::Direction::parse(&direction)?;
-            let start = trace_db::resolve_function_target(
+            let view = if hide_lambdas {
+                trace_db::CallGraphView::WithoutLambdas
+            } else {
+                trace_db::CallGraphView::Complete
+            };
+            let start = view.resolve_function_target(
                 &conn,
                 from.as_deref(),
                 from_file.as_deref(),
                 from_line,
             )?;
-            let target = trace_db::resolve_function_target(
+            let target =
+                view.resolve_function_target(&conn, to.as_deref(), to_file.as_deref(), to_line)?;
+            let mut result = view.call_chains(
                 &conn,
-                to.as_deref(),
-                to_file.as_deref(),
-                to_line,
-            )?;
-            let mut result = trace_db::call_chains(
-                &conn,
-                start.id,
-                target.id,
+                trace_ir::FnId(u32::try_from(start.id)?),
+                trace_ir::FnId(u32::try_from(target.id)?),
                 dir,
                 depth,
                 if limit == 0 { None } else { Some(limit) },

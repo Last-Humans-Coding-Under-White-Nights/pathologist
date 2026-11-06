@@ -299,6 +299,7 @@ trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction dow
 | `--file <SUBSTR>` | File path substring to disambiguate same-name functions. |
 | `--line <N>` | A line inside the function of interest. |
 | `--depth <N>` | Maximum BFS depth (default 3). |
+| `--hide-lambdas` | Contract lambda intermediates before traversal, counting only visible hops. Requires a database with the [lambda-free views](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views). |
 | `--direction` | `down` = callees (default), `up` = callers. |
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden, nodes left without any surviving edge are pruned. The start function (the root) is always kept even when it does not match, so the query anchor stays visible. |
@@ -329,6 +330,23 @@ trace inspect /tmp/hdf.db callgraph --file allocator.c --line 44 --callgraph-fil
 ```
 
 ### `trace inspect callchain`
+
+Use `--hide-lambdas` to count a path such as
+`ScheduleAbilityTransaction → lambda → HandleAbilityTransaction` as one
+visible hop. For example:
+
+```bash
+trace inspect graph.db callchain --from ScheduleAbilityTransaction --to HandleAbilityTransaction --depth 1 --hide-lambdas
+```
+
+Both callchain and callgraph support this option in either direction and in
+all output formats. New minimal, full, and merged databases include the
+stable `functions_no_lambdas`, `call_edges_no_lambdas`, and
+`unresolved_calls_no_lambdas` SQL views. These are an additive v8 capability;
+earlier databases require re-export or re-merge to use the option. The
+[view contract](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views) describes
+provenance, cycles, shared callbacks, unresolved calls, and execution-context
+limits. The complete graph remains the default.
 
 Find all simple call paths (chains) between two functions no longer than `--depth`.
 

@@ -199,6 +199,76 @@ Copies with the same caller, callee text and full spelling path/line/column
 share one leaf, including shared-header sites copied from multiple merge
 inputs. The lowest call-site ID supplies that leaf's query-local ID.
 
+## Lambda-free call graph views
+
+New exports add `functions_no_lambdas`, `call_edges_no_lambdas`, and
+`unresolved_calls_no_lambdas` in both minimal and full modes and in
+`trace-merge` outputs. This is an additive v8 capability; earlier databases
+may lack the views. Consumers check their presence, as described in the
+[version contract](#version-and-capability-contract). No schema version bump
+or automatic migration is needed. Re-export or re-merge to obtain the views.
+
+These are stable consumer relations: their columns and meanings remain
+compatible when internal lambda representation or storage changes. Read
+them instead of filtering generated names in client code. The underlying
+`functions`, `call_sites`, and `call_edges` retain the complete analysis.
+The `_lambda_callers` helper is internal and has no compatibility contract.
+
+`functions_no_lambdas` has the same columns and original IDs as `functions`,
+excluding generated lambda functions. Currently lowering names these with
+the reserved `::$lambda` segment; consumers should not depend on that spelling.
+
+`call_edges_no_lambdas` contracts every existing path from a non-lambda
+caller through one or more lambda functions to the next non-lambda callee.
+Ordinary edges are included unchanged. It does not traverse through a
+non-lambda function or infer invocation from lexical ownership. Thus an
+uninvoked lambda introduces no call from its enclosing function. Nested and
+shared lambdas, cycles, and edges without call sites are supported. Multiple
+lambda paths from the same entering edge to the same callee yield one row.
+
+| Column | Meaning |
+|--------|---------|
+| `entry_edge_id` | Original `call_edges.id` of the first edge in the path; **not unique** in this view (one entering edge may reach several callees) |
+| `call_site_id` | First edge's original call site, or NULL for a synthetic edge |
+| `caller_fn_id` | Original non-lambda caller ID |
+| `callee_fn_id` | Original non-lambda callee ID |
+| `resolution` | First edge's resolution, preserving how invocation starts |
+
+An ordinary edge uses its own ID, call site, and resolution. A contracted
+edge's site identifies the invocation entering the lambda path, not a direct
+call to the final callee. This projection expresses reachability: collapsing
+a scheduled callback does **not** imply synchronous execution or eliminate
+its execution-context boundary. Use the complete graph and
+`execution_contexts` for those details. SQL row order is unspecified; clients
+must use `ORDER BY` when order matters.
+
+`unresolved_calls_no_lambdas` preserves indirect sites with no resolved edge,
+including ones reached through lambdas. Its columns are `call_site_id`,
+`caller_fn_id`, `callee_text`, `file_id`, `line`, and `col`. The caller is the
+visible caller; the remaining columns describe the original unresolved site,
+which may lie inside a hidden lambda. Shared lambdas can yield the same
+unresolved site for multiple callers. Direct sites without edges are excluded,
+as in the [ordinary callgraph](#call-site-export-filter).
+
+For example, a recorded `ScheduleAbilityTransaction → lambda →
+HandleAbilityTransaction` becomes one edge in `call_edges_no_lambdas`.
+`trace inspect callgraph --hide-lambdas` and `trace inspect callchain
+--hide-lambdas` use these views **before** applying traversal depth and path
+limits, in either direction and in every output format. One projected edge
+counts as one hop. Source positions inside a lambda select the enclosing
+non-lambda function when present; explicitly naming a hidden lambda is an
+error. Without the flag, queries retain the complete graph and work on
+databases without the new views. The flag requires the new views and reports
+a re-export instruction if they are missing.
+
+```sql
+SELECT caller.name, callee.name, e.resolution, e.call_site_id
+FROM call_edges_no_lambdas e
+JOIN functions_no_lambdas caller ON caller.id = e.caller_fn_id
+JOIN functions_no_lambdas callee ON callee.id = e.callee_fn_id
+ORDER BY e.caller_fn_id, e.callee_fn_id, e.entry_edge_id;
+```
+
 ## Entity relationships
 
 ```text

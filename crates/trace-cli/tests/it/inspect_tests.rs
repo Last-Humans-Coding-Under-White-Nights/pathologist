@@ -25,6 +25,111 @@ fn build_and_export(name: &str) -> TempDb {
     export_tree(&fixture(name), name)
 }
 
+#[test]
+fn lambda_free_views_and_cli_count_scheduled_callbacks_as_one_hop() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    for full in [false, true] {
+        let db = export_tree_with(&fixture("lambda_call_view"), "lambda_view", full);
+        let conn = open_db(&db).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM call_edges_no_lambdas e \
+             JOIN functions_no_lambdas caller ON caller.id=e.caller_fn_id \
+             JOIN functions_no_lambdas callee ON callee.id=e.callee_fn_id \
+             WHERE caller.name='OHOS::UIAbilityThread::ScheduleAbilityTransaction' \
+               AND callee.name='OHOS::UIAbilityThread::HandleAbilityTransaction'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one projected hop in full={full}");
+        let run = |args: &[&str]| {
+            let out = Command::new(bin)
+                .args(["inspect", db.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let raw = run(&[
+            "callchain",
+            "--from",
+            "ScheduleAbilityTransaction",
+            "--to",
+            "HandleAbilityTransaction",
+            "--depth",
+            "1",
+        ]);
+        assert!(raw.contains("no call chain found"), "{raw}");
+        let raw = run(&[
+            "callchain",
+            "--from",
+            "ScheduleAbilityTransaction",
+            "--to",
+            "HandleAbilityTransaction",
+            "--depth",
+            "2",
+        ]);
+        assert!(raw.contains("$lambda"), "{raw}");
+        for format in ["text", "json", "graphviz", "mermaid"] {
+            for direction in ["down", "up"] {
+                let (from, to) = if direction == "down" {
+                    ("ScheduleAbilityTransaction", "HandleAbilityTransaction")
+                } else {
+                    ("HandleAbilityTransaction", "ScheduleAbilityTransaction")
+                };
+                let output = run(&[
+                    "callchain",
+                    "--from",
+                    from,
+                    "--to",
+                    to,
+                    "--depth",
+                    "1",
+                    "--direction",
+                    direction,
+                    "--format",
+                    format,
+                    "--hide-lambdas",
+                ]);
+                assert!(output.contains("ScheduleAbilityTransaction"), "{output}");
+                assert!(output.contains("HandleAbilityTransaction"), "{output}");
+                assert!(
+                    !output.contains("$lambda") && !output.contains("no call chain found"),
+                    "{output}"
+                );
+                // A position inside the lambda selects the enclosing visible function.
+                let line = if direction == "down" { "17" } else { "9" };
+                let graph = run(&[
+                    "callgraph",
+                    "--file",
+                    "lambda_call_view/main.cpp",
+                    "--line",
+                    line,
+                    "--depth",
+                    "1",
+                    "--direction",
+                    direction,
+                    "--format",
+                    format,
+                    "--hide-lambdas",
+                ]);
+                assert!(
+                    graph.contains("ScheduleAbilityTransaction")
+                        && graph.contains("HandleAbilityTransaction"),
+                    "{graph}"
+                );
+                assert!(!graph.contains("$lambda"), "{graph}");
+            }
+        }
+    }
+}
+
 /// Build the tree at `root` and export it minimally to a scratch database.
 fn export_tree(root: &std::path::Path, name: &str) -> TempDb {
     export_tree_with(root, name, false)
