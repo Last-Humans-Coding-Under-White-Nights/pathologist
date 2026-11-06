@@ -250,6 +250,10 @@ struct LowerContext {
     /// The result type of a `shared_from_this()` / `weak_from_this()` call,
     /// by node id, once decided ([`from_this_call`]).
     from_this_results: RefCell<HashMap<usize, TypeDesc>>,
+    /// Members a class body brings in with `using Base::member;`, by the
+    /// class that declares the using declaration. A body's bare call then
+    /// names the imported member, not one it inherits elsewhere.
+    class_member_imports: Vec<ClassMemberImport>,
     /// The heap object factory calls in a function build a class on
     /// ([`factory_object`]).
     factory_objects: RefCell<HashMap<(FnId, String), VarId>>,
@@ -3971,6 +3975,7 @@ fn lower_prepared_source(
         call_return_dst: RefCell::new(HashMap::default()),
         bare_std_calls: RefCell::new(HashMap::default()),
         from_this_results: RefCell::new(HashMap::default()),
+        class_member_imports: Vec::new(),
         factory_objects: RefCell::new(HashMap::default()),
         ast_depth: 0,
         ast_depth_warned: false,
@@ -4674,6 +4679,17 @@ fn enclosing_namespace_prefixes(ctx: &LowerContext) -> Vec<String> {
         .rev()
         .map(|len| chain[..len].join("::"))
         .collect()
+}
+
+/// One `using Base::member;` written in a class body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassMemberImport {
+    /// The class whose body declares it.
+    class: String,
+    /// The imported name, `member`.
+    member: String,
+    /// The spelling after `using`, `Base::member`.
+    target: String,
 }
 
 /// One `using X::member;` declaration.
@@ -5587,6 +5603,19 @@ fn register_class_prototypes(
         .iter()
         .filter_map(|t| t.rsplit("::").next())
         .collect();
+    for target in &using_targets {
+        let Some(member) = target.rsplit("::").next() else {
+            continue;
+        };
+        let import = ClassMemberImport {
+            class: cls_qual.to_string(),
+            member: member.to_string(),
+            target: target.clone(),
+        };
+        if !ctx.class_member_imports.contains(&import) {
+            ctx.class_member_imports.push(import);
+        }
+    }
     for target in &using_targets {
         let Some((base, member)) = target.rsplit_once("::") else {
             continue;
@@ -7516,11 +7545,15 @@ fn call_result_shape(
         } else {
             class_spelling_of_desc(&desc)?.to_string()
         };
-        let members = declared_members_upward(
-            program,
-            &receiver_lookup_name(&receiver),
-            &trace_ir::MethodKind::Named(field),
-        );
+        let members =
+            class_imported_members(program, ctx, &receiver_lookup_name(&receiver), &field)
+                .unwrap_or_else(|| {
+                    declared_members_upward(
+                        program,
+                        &receiver_lookup_name(&receiver),
+                        &trace_ir::MethodKind::Named(field),
+                    )
+                });
         (Overloads::Declared(members), Some(receiver))
     } else if func.cached_kind() == "field_expression" {
         let recv = func.cached_field("argument")?;
@@ -7539,7 +7572,9 @@ fn call_result_shape(
         if member_is_hidden_by_field(program, ctx, &cls, &name) {
             return None;
         }
-        let members = declared_members_upward(program, &cls, &trace_ir::MethodKind::Named(name));
+        let members = class_imported_members(program, ctx, &cls, &name).unwrap_or_else(|| {
+            declared_members_upward(program, &cls, &trace_ir::MethodKind::Named(name))
+        });
         (Overloads::Declared(members), Some(receiver))
     } else {
         let (name, _, var) = resolve_callee(program, ctx, source, func);
@@ -7554,11 +7589,13 @@ fn call_result_shape(
                 if member_is_hidden_by_field(program, ctx, &cc.qual_name, &name) {
                     return None;
                 }
-                declared_members_upward(
-                    program,
-                    &cc.qual_name,
-                    &trace_ir::MethodKind::Named(name.clone()),
-                )
+                class_imported_members(program, ctx, &cc.qual_name, &name).unwrap_or_else(|| {
+                    declared_members_upward(
+                        program,
+                        &cc.qual_name,
+                        &trace_ir::MethodKind::Named(name.clone()),
+                    )
+                })
             }
             _ => Vec::new(),
         };
@@ -8479,9 +8516,12 @@ fn from_this_result(
             }
         }
     } else {
+        // An alias of an instantiation keeps the arguments the written
+        // qualifier omits (`using E = enable_shared_from_this<M>;`).
         let instance = raw_qualifier
             .contains('<')
-            .then(|| raw_qualifier.to_owned());
+            .then(|| raw_qualifier.to_owned())
+            .or_else(|| aliased_instantiation(program, ctx, &qualifier));
         (class_seen_from(program, ctx, &qualifier)?, instance)
     };
     // The receiver may be the base itself (`enable_shared_from_this<M> &r`).
@@ -8535,18 +8575,100 @@ fn hides_from_this(
     if member_is_hidden_by_field(program, ctx, start, method) {
         return true;
     }
+    if class_import_hides_from_this(program, ctx, start, base, method) {
+        return true;
+    }
     let declared = declared_members_upward(
         program,
         start,
         &trace_ir::MethodKind::Named(method.to_owned()),
     );
-    declared.first().is_some_and(|&id| {
-        let name = &program.symbols.function(id).name;
-        name.rsplit_once("::").is_none_or(|(cls, _)| {
-            last_type_segment(cls) != ENABLE_SHARED_FROM_THIS
-                && cls != base
-                && !program.derives_from(base, cls)
-        })
+    declared
+        .first()
+        .is_some_and(|&id| !is_standard_from_this_declaration(program, base, id))
+}
+
+/// Whether a class body's `using Base::member;` selects a member other than
+/// the `enable_shared_from_this` one.
+fn class_import_hides_from_this(
+    program: &Program,
+    ctx: &LowerContext,
+    start: &str,
+    base: &str,
+    method: &str,
+) -> bool {
+    ctx.class_member_imports.iter().any(|import| {
+        import.member == method
+            && (import.class == start || program.derives_from(start, &import.class))
+            && !imported_member_is_standard(program, ctx, base, method, &import.target)
+    })
+}
+
+/// The members a class body's `using Base::member;` makes visible, if any:
+/// the imported declaration outranks one the class inherits elsewhere.
+fn class_imported_members(
+    program: &Program,
+    ctx: &LowerContext,
+    cls: &str,
+    name: &str,
+) -> Option<Vec<FnId>> {
+    ctx.class_member_imports.iter().rev().find_map(|import| {
+        if import.member != name
+            || !(import.class == cls || program.derives_from(cls, &import.class))
+        {
+            return None;
+        }
+        let (class, _) = import.target.rsplit_once("::")?;
+        let class = class_seen_from(program, ctx, class)?;
+        let members = declared_members_upward(
+            program,
+            &class,
+            &trace_ir::MethodKind::Named(name.to_owned()),
+        );
+        (!members.is_empty()).then_some(members)
+    })
+}
+
+/// Whether `target` (`Base::member`, after a class body's `using`) names the
+/// standard `enable_shared_from_this` member rather than a hiding one.
+fn imported_member_is_standard(
+    program: &Program,
+    ctx: &LowerContext,
+    base: &str,
+    method: &str,
+    target: &str,
+) -> bool {
+    let Some((class, _)) = target.rsplit_once("::") else {
+        return false;
+    };
+    let class = receiver_lookup_name(class);
+    if last_type_segment(&class) == ENABLE_SHARED_FROM_THIS {
+        return true;
+    }
+    let Some(class) =
+        class_seen_from(program, ctx, &class).or_else(|| program.types.declared_class(&class))
+    else {
+        return false;
+    };
+    let declared = declared_members_upward(
+        program,
+        &class,
+        &trace_ir::MethodKind::Named(method.to_owned()),
+    );
+    declared
+        .first()
+        .is_some_and(|&id| is_standard_from_this_declaration(program, base, id))
+}
+
+/// Whether function `id` declares the standard `enable_shared_from_this`
+/// member: it is written on the base, on a class the base derives from (an
+/// internal base a library may use), or on a class deriving from the base.
+fn is_standard_from_this_declaration(program: &Program, base: &str, id: FnId) -> bool {
+    let name = &program.symbols.function(id).name;
+    name.rsplit_once("::").is_none_or(|(cls, _)| {
+        last_type_segment(cls) == ENABLE_SHARED_FROM_THIS
+            || cls == base
+            || program.derives_from(base, cls)
     })
 }
 
@@ -8698,9 +8820,12 @@ fn from_this_value(
                 Some(pointer) => pointer,
                 None if call_may_return_reference(program, ctx, source, recv) => recv,
                 None if names_reference_member(program, ctx, source, recv) => recv,
-                None if recv.cached_kind() == "identifier" => {
-                    let var = lookup_var(ctx, program, node_text(source, &recv))?;
-                    return ctx.reference_bindings.contains(&var).then_some(var);
+                // A named object is the object's storage, and a reference
+                // binding holds its referent's address: either way the
+                // variable is what the result may alias. Qualified names
+                // (`n::r`, `Owner::r`) go through the same lookup.
+                None if matches!(recv.cached_kind(), "identifier" | "qualified_identifier") => {
+                    return lookup_var_node(program, ctx, source, recv);
                 }
                 None => return None,
             }
@@ -9548,6 +9673,11 @@ fn class_spelling(program: &Program, ctx: &LowerContext, text: &str) -> ClassSpe
 /// the arguments (`H<M>` for `using Mix = H<M>;`, `H` a template whose
 /// arguments decide its members' types).
 fn aliased_instantiation(program: &Program, ctx: &LowerContext, name: &str) -> Option<String> {
+    if let Some(TypeDesc::Struct { name, .. }) = local_alias(ctx, name) {
+        if name.contains('<') {
+            return Some(name.clone());
+        }
+    }
     find_in_scope(program, ctx, name, |candidate, _| {
         match program.types.resolve_alias(candidate)? {
             TypeDesc::Struct { name, .. } if name.contains('<') => Some(name.clone()),
@@ -15659,6 +15789,10 @@ fn lower_member_initializer_expression(
     let saved_scope = ctx.type_scope.replace(initializer.type_scope.clone());
     let saved_loads = ctx.callee_load_cache.take();
     let saved_receivers = ctx.call_receiver_cache.take();
+    // A reparsed initializer brings its own syntax tree, whose node ids may
+    // repeat those of the tree being lowered. A decided result is only valid
+    // while its call's node is alive.
+    let saved_from_this = ctx.from_this_results.take();
     let saved_returns = ctx.call_return_dst.take();
     let saved_news = ctx.handled_new_exprs.take();
     let saved_constructors = ctx.handled_constructor_exprs.take();
@@ -15682,6 +15816,7 @@ fn lower_member_initializer_expression(
     record_call_expressions(program, first_site, &expression);
     ctx.callee_load_cache.replace(saved_loads);
     ctx.call_receiver_cache.replace(saved_receivers);
+    ctx.from_this_results.replace(saved_from_this);
     ctx.call_return_dst.replace(saved_returns);
     ctx.handled_new_exprs.replace(saved_news);
     ctx.handled_constructor_exprs.replace(saved_constructors);
@@ -16403,12 +16538,30 @@ fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKi
     }
 }
 
-/// Whether a data member named `name` (a callable field) is what member
-/// lookup from `cls` finds before any function of that name: the call is
-/// then a field call, whose result the declared member's return does not
-/// type.
+/// Whether a data member named `name` (a callable field, static
+/// function-pointer member included) is what member lookup from `cls` finds
+/// before any function of that name: the call is then a field call, whose
+/// result the declared member's return does not type.
 fn member_is_hidden_by_field(program: &Program, ctx: &LowerContext, cls: &str, name: &str) -> bool {
-    lookup_field_in_hierarchy(program, Some(ctx), cls, name).is_some()
+    for (cur, _) in program.ancestor_closure(cls) {
+        if let Some(tid) = program.types.class_type_id(cur) {
+            if program.types.field_id_by_name(tid, name).is_some() {
+                return true;
+            }
+        }
+        let candidate = format!("{cur}::{name}");
+        if program
+            .symbols
+            .variable_named_in_scope(&candidate, ctx.current_file)
+            .is_some_and(|var| program.symbols.variable(var).is_static_member)
+        {
+            return true;
+        }
+        if names_function(program, ctx, &candidate) {
+            return false;
+        }
+    }
+    false
 }
 
 /// The entries the nearest declaring class up the inheritance chain has for
@@ -17060,7 +17213,7 @@ fn qualify_class_name(program: &Program, ctx: &LowerContext, name: &str) -> Stri
 /// a function-local alias, else through [`find_in_scope`].
 fn declared_class_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> Option<String> {
     if let Some(TypeDesc::Struct { name, .. }) = local_alias(ctx, name) {
-        return program.types.is_struct_declared(name).then(|| name.clone());
+        return program.types.declared_class(name);
     }
     find_in_scope(program, ctx, name, |candidate, _| {
         program.types.declared_class(candidate)
@@ -24602,6 +24755,7 @@ mod qualified_variable_lookup_tests {
             call_return_dst: RefCell::new(HashMap::default()),
             bare_std_calls: RefCell::new(HashMap::default()),
             from_this_results: RefCell::new(HashMap::default()),
+            class_member_imports: Vec::new(),
             factory_objects: RefCell::new(HashMap::default()),
             ast_depth: 0,
             ast_depth_warned: false,
