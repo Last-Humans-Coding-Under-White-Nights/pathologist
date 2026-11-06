@@ -199,6 +199,116 @@ Copies with the same caller, callee text and full spelling path/line/column
 share one leaf, including shared-header sites copied from multiple merge
 inputs. The lowest call-site ID supplies that leaf's query-local ID.
 
+## Lambda-free call graph views
+
+New exports add `functions_no_lambdas`, `call_edges_no_lambdas`, and
+`unresolved_calls_no_lambdas` in both minimal and full modes and in
+`trace-merge` outputs. This is an additive v8 capability; earlier databases
+may lack the views. Consumers check their presence, as described in the
+[version contract](#version-and-capability-contract). No schema version bump
+or automatic migration is needed. Re-export or re-merge to obtain the views.
+
+These are stable consumer relations: their columns and meanings remain
+compatible when internal lambda representation or storage changes. Read
+them instead of filtering generated names in client code. The underlying
+`functions`, `call_sites`, and `call_edges` retain the complete analysis.
+The `_lambda_callers` and `_lambda_reachability` helpers are internal and
+have no compatibility contract.
+
+View definitions belong to the exported database snapshot. Direct SQL
+consumers read those stored definitions. The CLI validates them, then computes
+the same projection scoped to the queried root from `call_edges` and
+`functions_no_lambdas`; it does not materialize the whole public view. The
+compatibility promise concerns the public columns and their meanings across
+producer revisions; it does not update an existing snapshot's SQL. Later
+implementation fixes require re-export or re-merge, even within v8. An older
+snapshot retains both its original lambda representation and its matching
+view definitions.
+
+`functions_no_lambdas` has the same columns and original IDs as `functions`,
+excluding generated lambda functions. Currently lowering names these with
+the reserved `::$lambda` segment; consumers should not depend on that spelling.
+
+`call_edges_no_lambdas` contracts every existing path from a non-lambda
+caller through one or more lambda functions to the next non-lambda callee.
+Ordinary edges are included unchanged. It does not traverse through a
+non-lambda function or infer invocation from lexical ownership. Thus an
+uninvoked lambda introduces no call from its enclosing function. Nested and
+shared lambdas, cycles, and edges without call sites are supported. Multiple
+lambda paths from the same entering edge to the same callee yield one row.
+Recursion computes lambda-to-lambda reachability per distinct entering
+lambda, then joins the original entering edges to preserve provenance.
+Callers entering the same lambda share that closure computation within a
+SQL statement. Queries recompute the closure; it is not stored graph data.
+
+Inspection queries expand only visible callers and lambdas reachable from the
+queried root (or callchain start), so an unrelated large lambda component does
+not affect the query. `--depth` and callchain's `--limit` still restrict
+traversal/output rather than closure work: a reachable lambda SCC contributes
+quadratic closure state however shallow the requested display. An indexed
+projection stored at export time is not implemented. See the
+[bounded synthetic measurements](EVAL_REPORT.md#lambda-free-view-review--2026-11-06);
+they do not establish latency or scalability on full production corpora.
+
+| Column | Meaning |
+|--------|---------|
+| `entry_edge_id` | Original `call_edges.id` of the first edge in the path; **not unique** in this view (one entering edge may reach several callees) |
+| `call_site_id` | First edge's original call site, or NULL for a synthetic edge |
+| `caller_fn_id` | Original non-lambda caller ID |
+| `callee_fn_id` | Original non-lambda callee ID |
+| `resolution` | First edge's resolution, preserving how invocation starts |
+
+Different entering edges can still produce rows with identical
+`(caller_fn_id, callee_fn_id, call_site_id, resolution)` values: one call site
+may enter several lambdas that share a visible callee. For counts per
+call-site identity, deduplicate those four columns rather than count
+provenance rows. `inspect callgraph` and `inspect callchain` deduplicate by visible
+endpoints, resolution, and full source path/line/column before traversal;
+copies with different call-site IDs can therefore collapse too, while
+distinct source positions remain distinct edges.
+Projected neighbors are visited in order of visible neighbor function ID,
+resolution, full source path, line, and column. Consequently `--hide-lambdas`
+can change BFS and text/JSON display order relative to entering-edge order;
+the order remains deterministic. Complete-graph traversal order is unchanged.
+
+An ordinary edge uses its own ID, call site, and resolution. A contracted
+edge's site identifies the invocation entering the lambda path, not a direct
+call to the final callee. This projection expresses reachability: collapsing
+a scheduled callback does **not** imply synchronous execution or eliminate
+its execution-context boundary. Use the complete graph and
+`execution_contexts` for those details. SQL row order is unspecified; clients
+must use `ORDER BY` when order matters.
+
+`unresolved_calls_no_lambdas` preserves indirect sites with no resolved edge,
+including ones reached through lambdas. Its columns are `call_site_id`,
+`caller_fn_id`, `callee_text`, `file_id`, `line`, and `col`. The caller is the
+visible caller; the remaining columns describe the original unresolved site,
+which may lie inside a hidden lambda. Shared lambdas can yield the same
+unresolved site for multiple callers. Direct sites without edges are excluded,
+as in the [ordinary callgraph](#call-site-export-filter).
+
+For example, a recorded `ScheduleAbilityTransaction → lambda →
+HandleAbilityTransaction` becomes one edge in `call_edges_no_lambdas`.
+`trace inspect callgraph --hide-lambdas` and `trace inspect callchain
+--hide-lambdas` use these views **before** applying traversal depth and path
+limits, in either direction and in every output format. One projected edge
+counts as one hop. Source positions inside a lambda select the enclosing
+non-lambda function when present; explicitly naming a hidden lambda is an
+error. Without the flag, queries retain the complete graph and work on
+databases without the new views. The flag requires the public views and
+reports a re-export instruction if they are missing or cannot be queried,
+including broken transitive helper dependencies. Validation resolves the
+stored definitions rather than requiring a fixed list of internal helper
+names, so earlier valid snapshots remain readable.
+
+```sql
+SELECT caller.name, callee.name, e.resolution, e.call_site_id
+FROM call_edges_no_lambdas e
+JOIN functions_no_lambdas caller ON caller.id = e.caller_fn_id
+JOIN functions_no_lambdas callee ON callee.id = e.callee_fn_id
+ORDER BY e.caller_fn_id, e.callee_fn_id, e.entry_edge_id;
+```
+
 ## Entity relationships
 
 ```text
