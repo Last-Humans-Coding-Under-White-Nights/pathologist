@@ -141,6 +141,8 @@ pub struct CallSourceKey<'a> {
     pub occurrence: crate::CallOccurrence,
     pub callee_name: &'a str,
     pub callee_fn_id: Option<FnId>,
+    /// Defaults are declaration source evaluated separately by each caller.
+    pub default_owner: Option<FnId>,
 }
 
 /// Stable source representative and the current canonical call record.
@@ -583,6 +585,8 @@ pub struct Program {
     pub source_expressions: SourceExpressions,
     /// Per-function return-value summaries collected during lowering.
     pub fn_returns: IndexMap<FnId, Vec<ReturnFlow>>,
+    /// Omitted parameter expressions with declaration scope, using declaration parameter positions.
+    pub default_arguments: IndexMap<FnId, Vec<(u32, std::sync::Arc<crate::MemberInitializer>)>>,
     pub diagnostics: Vec<Diagnostic>,
     /// Interfaces declared by `.idl` files, in sorted IDL path order
     /// (docs/ANALYSIS.md, "IDL-generated interfaces").
@@ -714,6 +718,7 @@ impl Program {
             }
         }
         self.fn_returns = IndexMap::new();
+        self.default_arguments = IndexMap::new();
     }
 
     /// List each `(source, added)`'s `added` as another target record of the
@@ -1390,6 +1395,7 @@ mod tests {
             occurrence: symbols.call_sites[0].occurrence(),
             callee_name: "call",
             callee_fn_id: None,
+            default_owner: None,
         };
         let mut index = CallSourceIndex::default();
         assert_eq!(
@@ -1428,6 +1434,7 @@ mod tests {
             occurrence: symbols.call_sites[1].occurrence(),
             callee_name: "call",
             callee_fn_id: None,
+            default_owner: None,
         };
         let mut index = CallSourceIndex::default();
         // Force an unrelated spelling into this fingerprint's bucket.

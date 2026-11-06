@@ -332,6 +332,15 @@ pub struct CallSite {
 /// vectors retain their original argument order.
 #[derive(Debug, Clone, Default)]
 pub struct CallSiteDetails {
+    /// Visible declaration and written explicit argument count for default
+    /// lowering, consumed before the per-TU index is published. Scalar
+    /// expressions need not appear in `var_args` or `fn_args`.
+    pub pending_defaults: Option<(FnId, u32)>,
+    /// Evaluation ownership for a call spelled inside a default argument.
+    /// Its request position remains the declaration's original source span.
+    pub default_origin: Option<Span>,
+    /// Additional destination for the address of a reference result.
+    pub address_return_dst: Option<VarId>,
     pub receiver_recovery: Option<Box<ReceiverRecovery>>,
     pub fn_args: Vec<(u32, FnId)>,
     /// Unresolved `&base.member` / `&arr[i]` positions naming the base
@@ -384,6 +393,9 @@ impl CallSiteDetails {
             None
         } else {
             Some(Box::new(Self {
+                pending_defaults: None,
+                default_origin: None,
+                address_return_dst: None,
                 receiver_recovery: None,
                 fn_args,
                 addr_of_member_args,
@@ -397,6 +409,12 @@ impl CallSiteDetails {
 }
 
 impl CallSite {
+    pub fn address_return_dst(&self) -> Option<VarId> {
+        self.details
+            .as_ref()
+            .and_then(|details| details.address_return_dst)
+    }
+
     pub fn fn_args(&self) -> &[(u32, FnId)] {
         self.details
             .as_ref()
@@ -439,14 +457,24 @@ impl CallSite {
             occurrence: self.occurrence(),
             callee_name: self.callee_name.as_str(),
             callee_fn_id: self.callee_fn_id,
+            default_owner: self
+                .details
+                .as_ref()
+                .and_then(|details| details.default_origin)
+                .map(|_| self.caller),
         }
     }
 
-    /// File whose lexical scope contains this invocation. Macro-body calls
+    /// File owning this evaluation. Default arguments retain declaration
+    /// spelling but belong to the invoking project body. Macro-body calls
     /// retain their replacement-list spelling in `span`, while name lookup,
     /// ownership, and visibility follow the expansion site.
     pub fn scope_file(&self) -> FileId {
-        self.expansion_span.map_or(self.span.file, |span| span.file)
+        self.details
+            .as_ref()
+            .and_then(|details| details.default_origin)
+            .or(self.expansion_span)
+            .map_or(self.span.file, |span| span.file)
     }
 
     /// Whether the site denotes a direct call recoverable by name: lowering
@@ -475,6 +503,7 @@ impl CallSite {
             exact_receiver: self.exact_receiver,
             unevaluated: self.unevaluated,
             return_dst: self.return_dst,
+            address_return_dst: self.address_return_dst(),
             receiver: self.receiver,
             receiver_recovery: self
                 .details
@@ -516,6 +545,7 @@ impl CallSite {
 /// drifting — a field added to `CallSite` and weighed here reaches both.
 #[derive(PartialEq, Eq, Hash)]
 struct CallFacts<'a> {
+    address_return_dst: Option<VarId>,
     receiver_recovery: Option<&'a ReceiverRecovery>,
     caller: FnId,
     callee_fn_id: Option<FnId>,
@@ -2499,6 +2529,65 @@ impl SymbolTable {
         )
     }
 
+    /// Definitions matching a file-scope initializer's selected declaration.
+    /// Signature filtering precedes TU-local definition precedence, just as
+    /// argument-count filtering does for an unselected initializer call.
+    pub fn initializer_declaration_candidates(
+        &self,
+        dst: VarId,
+        declaration: FnId,
+        types: &crate::TypeTable,
+    ) -> Vec<FnId> {
+        let var = self.variable(dst);
+        let selected = self.function(declaration);
+        let mut candidates = self.candidates_in_contexts_matching(
+            [(var.span.file, var.span.file)],
+            var.target,
+            &selected.name,
+            None,
+            |id| {
+                let candidate = self.function(id);
+                selected.variadic == candidate.variadic
+                    && selected
+                        .explicit_arity
+                        .zip(candidate.explicit_arity)
+                        .is_none_or(|(a, b)| a == b)
+                    && Self::references_alike(selected, candidate)
+                    && self
+                        .explicit_params_alike(
+                            selected,
+                            candidate,
+                            types,
+                            SpellingTolerance::Redeclaration,
+                        )
+                        .unwrap_or(true)
+            },
+        );
+        // A definition selected in this TU is already an exact overload.
+        // Keep image/weak selection authoritative before trusting the hint.
+        if candidates.contains(&declaration) && self.defined_in_tu(declaration, var.span.file) {
+            candidates.retain(|&id| id == declaration);
+        }
+        candidates
+    }
+
+    /// Explicit initializer arguments bound to a selected definition's
+    /// parameter variables, past a member's implicit receiver.
+    pub fn initializer_argument_bindings<'a>(
+        &'a self,
+        callee: FnId,
+        args: &'a [(u32, VarId)],
+    ) -> impl Iterator<Item = (VarId, VarId)> + 'a {
+        let function = self.function(callee);
+        let first = usize::from(self.has_this_param(callee));
+        args.iter().filter_map(move |&(index, actual)| {
+            function
+                .params
+                .get(first + index as usize)
+                .map(|&formal| (formal, actual))
+        })
+    }
+
     /// The shared resolution policy behind return and initializer lookup: per
     /// `(tu, lookup file)` context, the image-scoped candidates seen from the
     /// file, narrowed to the unit's own definitions when it has any.
@@ -2509,10 +2598,21 @@ impl SymbolTable {
         name: &str,
         argument_count: Option<u32>,
     ) -> Vec<FnId> {
+        self.candidates_in_contexts_matching(contexts, target, name, argument_count, |_| true)
+    }
+
+    fn candidates_in_contexts_matching(
+        &self,
+        contexts: impl IntoIterator<Item = (FileId, FileId)>,
+        target: Option<crate::TargetId>,
+        name: &str,
+        argument_count: Option<u32>,
+        admit: impl Fn(FnId) -> bool,
+    ) -> Vec<FnId> {
         let mut result = Vec::new();
         for (tu, file) in contexts {
             let mut candidates =
-                self.resolve_function_candidates_in_target(name, Some(file), target);
+                self.candidates_in_image_matching(name, Some(file), self.image_of(target), &admit);
             if let Some(count) = argument_count {
                 candidates.retain(|&id| {
                     let f = self.function(id);
@@ -3067,6 +3167,16 @@ impl SymbolTable {
         file: Option<FileId>,
         scope: TargetScope,
     ) -> Vec<FnId> {
+        self.candidates_in_image_matching(name, file, scope, &|_| true)
+    }
+
+    fn candidates_in_image_matching(
+        &self,
+        name: &str,
+        file: Option<FileId>,
+        scope: TargetScope,
+        admit: &impl Fn(FnId) -> bool,
+    ) -> Vec<FnId> {
         // Most probes miss — a scope walk asks about every enclosing scope —
         // so the vector stays unallocated until something is found.
         let mut out = CandidateSet::default();
@@ -3105,6 +3215,9 @@ impl SymbolTable {
             }
         }
         let mut candidates = out.into_vec();
+        // Select the declaration family before visibility and local-body
+        // precedence; another overload's body cannot hide this declaration.
+        candidates.retain(|&id| admit(id));
         if let Some(file) = file {
             // A visible declaration family supplies positive evidence; missing
             // provenance is uncertainty, never evidence of invisibility.

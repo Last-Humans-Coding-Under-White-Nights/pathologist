@@ -626,6 +626,37 @@ fn export_flow_provenance(
             _ => None,
         })
         .collect();
+    // Reference-address returns are selected through call sites, not a
+    // name-only CallReturn constraint. Reuse return provenance below with
+    // the actual analysis targets and the call's recorded operation.
+    let mut reference_origins: FxHashMap<trace_ir::FlowConstraint, Vec<_>> = FxHashMap::default();
+    let mut reference_flows = Vec::new();
+    for edge in &analysis.call_edges {
+        let Some(site) = program.symbols.call_site_by_id(edge.call_site) else {
+            continue;
+        };
+        let Some(dst) = site.address_return_dst() else {
+            continue;
+        };
+        let Some(origin) = site
+            .details
+            .as_ref()
+            .and_then(|d| d.return_operation.as_deref())
+        else {
+            continue;
+        };
+        let flow = trace_ir::FlowConstraint::CallReturnResolved {
+            dst,
+            callee: edge.callee,
+        };
+        let entry = reference_origins.entry(flow.clone()).or_default();
+        if entry.is_empty() {
+            reference_flows.push(flow);
+        }
+        if !entry.contains(origin) {
+            entry.push(origin.clone());
+        }
+    }
     // Origins are already unioned under constraint identity. Visit each
     // constraint once in first-occurrence order, rather than replaying its
     // complete site list for every repeated lowering fact.
@@ -634,6 +665,7 @@ fn export_flow_provenance(
         program
             .flow
             .iter()
+            .chain(reference_flows.iter())
             .filter(|flow| seen_flows.insert(*flow))
             .collect()
     };
@@ -714,10 +746,12 @@ fn export_flow_provenance(
             ])?;
         }
     }
-    let return_destinations: FxHashSet<_> = unique_flows
+    let mut return_destinations: FxHashSet<_> = unique_flows
         .iter()
         .filter_map(|flow| match flow {
             trace_ir::FlowConstraint::CallReturn { dst, .. }
+            | trace_ir::FlowConstraint::CallReferenceReturn { dst, .. }
+            | trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, .. }
             | trace_ir::FlowConstraint::CallReturnIndirect { dst, .. }
             | trace_ir::FlowConstraint::CallReturnResolved { dst, .. } => {
                 pag.var_node.get(dst).copied()
@@ -725,6 +759,25 @@ fn export_flow_provenance(
             _ => None,
         })
         .collect();
+    for flow in &unique_flows {
+        if let trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, callee, args } = flow {
+            if args.is_empty() {
+                continue;
+            }
+            for definition in
+                program
+                    .symbols
+                    .initializer_declaration_candidates(*dst, *callee, &program.types)
+            {
+                return_destinations.extend(
+                    program
+                        .symbols
+                        .initializer_argument_bindings(definition, args)
+                        .filter_map(|(formal, _)| pag.var_node.get(&formal).copied()),
+                );
+            }
+        }
+    }
     let mut incoming = std::collections::BTreeMap::<_, Vec<_>>::new();
     let mut seen_return_wiring = FxHashSet::default();
     for constraint in &pag.constraints {
@@ -747,7 +800,7 @@ fn export_flow_provenance(
     let mut seen_return_sites = FxHashSet::default();
     for edge in &analysis.call_edges {
         if let Some(site) = program.symbols.call_site_by_id(edge.call_site) {
-            if let Some(dst) = site.return_dst {
+            for dst in site.return_dst.into_iter().chain(site.address_return_dst()) {
                 if seen_return_sites.insert((dst, edge.callee, edge.call_site)) {
                     return_sites
                         .entry((dst, edge.callee))
@@ -775,6 +828,19 @@ fn export_flow_provenance(
                     .call_return_candidates(*caller, *dst, callee_name)
                     .to_vec(),
             ),
+            trace_ir::FlowConstraint::CallReferenceReturn { dst, callee_name } => (
+                *dst,
+                program
+                    .symbols
+                    .call_return_candidates(None, *dst, callee_name)
+                    .to_vec(),
+            ),
+            trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, callee, .. } => (
+                *dst,
+                program
+                    .symbols
+                    .initializer_declaration_candidates(*dst, *callee, &program.types),
+            ),
             trace_ir::FlowConstraint::CallReturnResolved { dst, callee } => (*dst, vec![*callee]),
             trace_ir::FlowConstraint::CallReturnIndirect { dst, callee_var } => {
                 let candidates = indirect_return_callees
@@ -787,13 +853,50 @@ fn export_flow_provenance(
         let Some(dst_node) = pag.var_node.get(&dst) else {
             continue;
         };
-        let Some(sites) = program.flow_origins.get(*flow) else {
+        let Some(sites) = program
+            .flow_origins
+            .get(*flow)
+            .or_else(|| reference_origins.get(*flow))
+        else {
             continue;
         };
+        let address = reference_origins.contains_key(*flow)
+            || matches!(
+                flow,
+                trace_ir::FlowConstraint::CallReferenceReturn { .. }
+                    | trace_ir::FlowConstraint::CallReferenceReturnDeclared { .. }
+            );
         let mut returned_by_callee = std::collections::BTreeMap::new();
         for root in root_callees {
             if returned_by_callee.contains_key(&root) {
                 continue;
+            }
+            if let trace_ir::FlowConstraint::CallReferenceReturnDeclared { args, .. } = flow {
+                for (formal, actual) in program.symbols.initializer_argument_bindings(root, args) {
+                    if let (Some(src), Some(dst)) =
+                        (pag.var_node.get(&actual), pag.var_node.get(&formal))
+                    {
+                        if incoming
+                            .get(dst)
+                            .into_iter()
+                            .flatten()
+                            .any(|edge| edge.src == *src && edge.kind == ConstraintKind::Copy)
+                        {
+                            for (span, expression) in sites {
+                                origins.execute(params![
+                                    src.0,
+                                    dst.0,
+                                    strings.intern("copy")?,
+                                    span.file.0,
+                                    span.line,
+                                    span.col,
+                                    strings.intern(expression.as_ref())?,
+                                    strings.intern("argument")?
+                                ])?;
+                            }
+                        }
+                    }
+                }
             }
             let mut pending = vec![root];
             let mut seen = FxHashSet::default();
@@ -803,7 +906,13 @@ fn export_flow_provenance(
                     continue;
                 }
                 for ret in program.fn_returns.get(&callee).into_iter().flatten() {
+                    let ret = match (address, ret) {
+                        (true, trace_ir::ReturnFlow::LvalueAddress(inner)) => inner.as_ref(),
+                        (true, _) | (false, trace_ir::ReturnFlow::LvalueAddress(_)) => continue,
+                        (false, ret) => ret,
+                    };
                     match ret {
+                        trace_ir::ReturnFlow::LvalueAddress(_) => {}
                         trace_ir::ReturnFlow::Copy { src } => {
                             if let Some(n) = pag.var_node.get(src) {
                                 returned.insert(*n);

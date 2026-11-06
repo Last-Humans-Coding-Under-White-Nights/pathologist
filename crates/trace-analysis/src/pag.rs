@@ -90,6 +90,10 @@ pub struct Pag {
     /// children start at 1). Bounds recursive `obj->next->next->...`
     /// location synthesis once interprocedural flow reaches chained structs.
     pub field_depth: FxHashMap<LocId, u8>,
+    /// Concrete subobject ancestry, used to recognize overlapping union views.
+    field_parents: FxHashMap<LocId, (LocId, FieldId)>,
+    /// Additional union-view spellings of canonical concrete field cells.
+    field_aliases: FxHashMap<(LocId, FieldId), LocId>,
     /// Per-(link target, struct type, field) summary location for
     /// instance-insensitive field flow. Separate images never share a mutable
     /// storage summary; without link metadata every key carries `None`.
@@ -422,6 +426,7 @@ impl Pag {
         self.field_depth.insert(loc_id, depth);
         self.set_location_target(loc_id, self.location_target(parent_loc));
         self.field_loc.insert((parent_loc, field), loc_id);
+        self.field_parents.insert(loc_id, (parent_loc, field));
         loc_id
     }
 
@@ -437,6 +442,14 @@ impl Pag {
         field: FieldId,
     ) -> Option<LocId> {
         if let Some(&loc) = self.field_loc.get(&(parent_loc, field)) {
+            return Some(loc);
+        }
+        if let Some(&loc) = self.field_aliases.get(&(parent_loc, field)) {
+            return Some(loc);
+        }
+        if let Some((parent, member)) = self.union_alias_field(program, parent_loc, field) {
+            let loc = self.ensure_field_loc(program, parent, member)?;
+            self.field_aliases.insert((parent_loc, field), loc);
             return Some(loc);
         }
         let parent_type = struct_type_for_loc(self, program, parent_loc)?;
@@ -464,6 +477,83 @@ impl Pag {
         );
         self.field_loc_to_summary.insert(field_loc, summary);
         Some(field_loc)
+    }
+
+    /// Reuse the earliest compatible storage view, independent of access order.
+    /// Scalar union members of the same shape overlap. Distinct struct views
+    /// share only fields within a matching layout/type prefix, never a suffix
+    /// after the first incompatible member. Keep the struct-view roots typed
+    /// separately so the ordinary GEP name guard remains authoritative.
+    fn union_alias_field(
+        &mut self,
+        program: &Program,
+        parent: LocId,
+        field: FieldId,
+    ) -> Option<(LocId, FieldId)> {
+        let parent_type = struct_type_for_loc(self, program, parent)?;
+        let layout = &program.types.get(parent_type).layout;
+        let requested = layout.fields.get(&field)?;
+        if matches!(
+            program.types.get(parent_type).desc.as_ref(),
+            trace_ir::TypeDesc::Union { .. }
+        ) {
+            let requested_type = program.types.get(requested.type_id).desc.as_ref();
+            for (&candidate, member) in &layout.fields {
+                if candidate == field {
+                    break;
+                }
+                if trace_ir::same_type_shape(
+                    requested_type,
+                    program.types.get(member.type_id).desc.as_ref(),
+                ) {
+                    return Some((parent, candidate));
+                }
+            }
+            return None;
+        }
+        let &(union, view) = self.field_parents.get(&parent)?;
+        let union_type = struct_type_for_loc(self, program, union)?;
+        if !matches!(
+            program.types.get(union_type).desc.as_ref(),
+            trace_ir::TypeDesc::Union { .. }
+        ) || !matches!(
+            program.types.get(parent_type).desc.as_ref(),
+            trace_ir::TypeDesc::Struct { .. }
+        ) {
+            return None;
+        }
+        let position = layout.fields.get_index_of(&field)?;
+        for (&candidate, member) in &program.types.get(union_type).layout.fields {
+            if candidate == view {
+                break;
+            }
+            let candidate_type = program.types.tag_identity(member.type_id);
+            let ty = program.types.get(candidate_type);
+            if !matches!(ty.desc.as_ref(), trace_ir::TypeDesc::Struct { .. })
+                || ty.layout.fields.len() <= position
+            {
+                continue;
+            }
+            let compatible = layout
+                .fields
+                .values()
+                .zip(ty.layout.fields.values())
+                .take(position + 1)
+                .all(|(a, b)| {
+                    a.offset == b.offset
+                        && a.size == b.size
+                        && trace_ir::same_type_shape(
+                            program.types.get(a.type_id).desc.as_ref(),
+                            program.types.get(b.type_id).desc.as_ref(),
+                        )
+                });
+            if compatible {
+                let member = *ty.layout.fields.get_index(position)?.0;
+                let parent = self.ensure_field_loc(program, union, candidate)?;
+                return Some((parent, member));
+            }
+        }
+        None
     }
 
     fn ensure_field_summary_loc(
@@ -579,7 +669,10 @@ impl Pag {
     }
 
     pub fn field_loc_for_parent(&self, parent_loc: LocId, field: FieldId) -> Option<LocId> {
-        self.field_loc.get(&(parent_loc, field)).copied()
+        self.field_loc
+            .get(&(parent_loc, field))
+            .or_else(|| self.field_aliases.get(&(parent_loc, field)))
+            .copied()
     }
 
     /// Declared parameter count of the function-pointer slot `base.field`,
@@ -711,6 +804,47 @@ impl Pag {
                         }
                     }
                 }
+                FlowConstraint::CallReferenceReturn { dst, callee_name } => {
+                    let dst_node = self.var_node_id(*dst);
+                    let mut visited = FxHashSet::default();
+                    for callee in program
+                        .symbols
+                        .call_return_candidates(None, *dst, callee_name)
+                    {
+                        self.expand_reference_returns(
+                            program,
+                            dst_node,
+                            callee,
+                            models,
+                            &mut visited,
+                        );
+                    }
+                }
+                FlowConstraint::CallReferenceReturnDeclared { dst, callee, args } => {
+                    let dst_node = self.var_node_id(*dst);
+                    let mut visited = FxHashSet::default();
+                    for definition in program.symbols.initializer_declaration_candidates(
+                        *dst,
+                        *callee,
+                        &program.types,
+                    ) {
+                        for (formal, actual) in program
+                            .symbols
+                            .initializer_argument_bindings(definition, args)
+                        {
+                            let dst = self.var_node_id(formal);
+                            let src = self.var_node_id(actual);
+                            self.add_copy(dst, src);
+                        }
+                        self.expand_reference_returns(
+                            program,
+                            dst_node,
+                            definition,
+                            models,
+                            &mut visited,
+                        );
+                    }
+                }
                 FlowConstraint::CallReturnResolved { dst, callee } => {
                     let dst_n = self.var_node_id(*dst);
                     self.expand_return_flows(
@@ -789,7 +923,23 @@ impl Pag {
             Vec<&trace_ir::CallSite>,
         > = FxHashMap::default();
         for cs in &program.symbols.call_sites {
-            if cs.unevaluated || (cs.receiver_class.is_none() && !cs.args_bound_past_this) {
+            if !cs.unevaluated {
+                if let Some(dst) = cs.address_return_dst() {
+                    let dst = self.var_node_id(dst);
+                    let mut visited = FxHashSet::default();
+                    for callee in program.callees_of(cs) {
+                        self.expand_reference_returns(program, dst, callee, models, &mut visited);
+                    }
+                }
+            }
+            if cs.unevaluated
+                || cs
+                    .return_dst
+                    .is_some_and(|dst| Some(dst) == cs.address_return_dst())
+                || (cs.receiver_class.is_none()
+                    && !cs.args_bound_past_this
+                    && cs.address_return_dst().is_none())
+            {
                 continue;
             }
             if let Some(dst_var) = cs.return_dst {
@@ -891,6 +1041,29 @@ impl Pag {
         models: &ModelLookup,
         visited: &mut FxHashSet<FnId>,
     ) -> bool {
+        self.expand_returns_in_mode(program, dst, callee, models, visited, false)
+    }
+
+    pub(crate) fn expand_reference_returns(
+        &mut self,
+        program: &Program,
+        dst: PagNodeId,
+        callee: FnId,
+        models: &ModelLookup,
+        visited: &mut FxHashSet<FnId>,
+    ) -> bool {
+        self.expand_returns_in_mode(program, dst, callee, models, visited, true)
+    }
+
+    fn expand_returns_in_mode(
+        &mut self,
+        program: &Program,
+        dst: PagNodeId,
+        callee: FnId,
+        models: &ModelLookup,
+        visited: &mut FxHashSet<FnId>,
+        address: bool,
+    ) -> bool {
         if !visited.insert(callee) {
             return false;
         }
@@ -898,7 +1071,13 @@ impl Pag {
             Some(flows) => {
                 let mut applied = false;
                 for flow in flows.clone() {
+                    let flow = match (address, flow) {
+                        (true, ReturnFlow::LvalueAddress(inner)) => *inner,
+                        (true, _) | (false, ReturnFlow::LvalueAddress(_)) => continue,
+                        (false, flow) => flow,
+                    };
                     match flow {
+                        ReturnFlow::LvalueAddress(_) => {}
                         ReturnFlow::AddrOfVar { src } => {
                             if let Some(loc) = self.ensure_var_loc(program, src) {
                                 let loc_n = self.loc_node[&loc];
@@ -924,14 +1103,16 @@ impl Pag {
                                 program.symbols.return_flow_candidates(callee, &callee_name);
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
-                                if self.expand_return_flows(program, dst, inner, models, visited) {
+                                if self.expand_returns_in_mode(
+                                    program, dst, inner, models, visited, address,
+                                ) {
                                     inner_applied = true;
                                 }
                             }
                             // Bodyless leaf (`return realloc(p, n)` where
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
-                            if !inner_applied {
+                            if !inner_applied && !address {
                                 if let Some(model) = models.model(&callee_name, EffectGroup::Return)
                                 {
                                     let params = inner_candidates
@@ -1150,10 +1331,15 @@ pub(crate) fn struct_type_for_loc(
     program: &Program,
     loc: LocId,
 ) -> Option<trace_ir::TypeId> {
-    if let Some(var) = pag.locations[loc.0 as usize].var {
-        return struct_type_from_type_id(program, program.symbols.variable_by_id(var)?.type_id);
+    let location = &pag.locations[loc.0 as usize];
+    // A field's `var` identifies its storage owner, not its declared type.
+    // Nested projection must use the subobject's type, including union views.
+    if location.kind != LocKind::Field {
+        if let Some(var) = location.var {
+            return struct_type_from_type_id(program, program.symbols.variable_by_id(var)?.type_id);
+        }
     }
-    type_id_of_loc(pag, program, loc)
+    struct_type_from_type_id(program, location.type_id)
 }
 
 fn inner_or_elem(desc: &trace_ir::TypeDesc) -> &trace_ir::TypeDesc {
@@ -1175,27 +1361,6 @@ fn array_element_type(program: &Program, elem: &trace_ir::TypeDesc) -> trace_ir:
     } else {
         exact
     }
-}
-
-fn type_id_of_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::TypeId> {
-    let mut type_id = pag.locations[loc.0 as usize].type_id;
-    for _ in 0..4 {
-        match program.types.get(type_id).desc.as_ref() {
-            trace_ir::TypeDesc::Ptr(inner) => {
-                type_id = program.types.resolve_type_id(inner);
-            }
-            // A table of structs: its elements' fields.
-            trace_ir::TypeDesc::Array { elem, .. } => {
-                type_id = array_element_type(program, elem);
-            }
-            _ => break,
-        }
-    }
-    matches!(
-        program.types.get(type_id).desc.as_ref(),
-        trace_ir::TypeDesc::Struct { .. } | trace_ir::TypeDesc::Union { .. }
-    )
-    .then_some(type_id)
 }
 
 fn struct_type_from_type_id(

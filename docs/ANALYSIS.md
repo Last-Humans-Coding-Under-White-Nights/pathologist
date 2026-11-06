@@ -145,6 +145,13 @@ system prerequisites as declarations too, including callable return shapes
 needed by inferred initializers. Imports between cached project-header units
 retain the existing types-only path; system bundles import prerequisite
 declarations regardless of their origin.
+Function dependencies of initializer constraints include selected reference
+getter declarations. Missing function IDs are filtered before remapping, and
+TU replay follows these dependencies. Replayed internal functions' returned
+file-static cells retain their supporting initializers. Imported file-static
+storage also receives its initializer when a default argument of an external
+inline function is its only consumer; connected initializer temporaries and
+address/function facts follow that storage.
 
 Header-unit selection and dependency scheduling reject a different language
 before consulting variant records, including the project-header fallback when
@@ -1191,6 +1198,12 @@ explicit C++ `nullptr` rule.
 
 ### Return-value flow
 
+When only a callee name is available, file-scope direct reference-getter
+addresses use `CallReferenceReturn { dst, callee_name }`. PAG construction
+resolves this fact after merge with the
+same destination-file/link-target lookup as a file-scope `CallReturn`, and
+expands only `LvalueAddress` return facts. It needs no synthetic call site.
+
 Functions record abstract return values in `program.fn_returns`:
 
 | `ReturnFlow` | Source |
@@ -1199,6 +1212,134 @@ Functions record abstract return values in `program.fn_returns`:
 | `AddrOfFn { callee }` | `return &Fn` / `return Fn` |
 | `Copy { src }` | `return local` or `return param` |
 | `Call { callee_name }` | `return Other()` (transitive; resolved in the returning function's contexts) |
+| `LvalueAddress(inner)` | Address of the lvalue returned by a reference-returning definition; `inner` uses the address/copy/call forms above |
+
+`CallReferenceReturnDeclared { dst, callee, args }` preserves a selected free
+or member declaration for a file-scope address consumer without inventing a
+call site.
+After merge, the shared initializer resolver matches the declaration's
+signature in the destination's file and link target before applying TU-local
+definition precedence. Only the selected definitions' `LvalueAddress` facts
+expand into `dst`; declaration hints do not bypass image or overload selection.
+The selected-declaration fact also retains explicit actual argument variables.
+After choosing definitions, PAG construction copies these values to the matching
+explicit parameters (past `this` for members) before expanding address returns.
+Reference parameters retain the actual lvalue's original cell address, so
+stores through the getter's returned reference reach that cell too.
+Free reference getters use the same signature-preserving path. No file-scope
+call site or synthetic caller is introduced.
+Default argument expressions retain their declaration scope and source mappings
+as function metadata through header imports and merge. A file-scope reference
+getter instantiates only omitted defaults for the selected declaration, then
+binds their values or original reference-cell addresses alongside explicit
+actuals. Explicit arguments suppress the corresponding defaults.
+
+`LvalueAddress` facts are separate from ordinary return values. Taking the
+address of a reference-returning call requests these facts through the same
+post-merge, image-aware callee selection, including virtual and indirect calls.
+Named returns identify their original cells; a dereferenced return preserves
+its pointer operand, and a returned reference call forwards the address facts.
+Value consumers continue to use the ordinary return facts. A call can retain
+both destinations when a reference result is needed in both forms.
+Forwarding a reference-returning call keeps an address destination on that
+actual call site and records a `Copy` of it inside `LvalueAddress`. The call's
+selected overload, parameter bindings and image remain authoritative after
+merge; the address fact does not repeat a name-only lookup. Value returns
+from that forwarding expression read the same original cell (class objects
+keep their address for member projection). Repeated address readers reuse
+the recorded destination.
+When viable overloads have mixed value/reference return categories, the value
+destination also receives ordinary return facts from every selected candidate.
+Only reference candidates contribute address facts; possible value-returning
+alternatives are not discarded because another candidate returns a reference.
+Reference-return classification follows the complete declarator to the
+function's own return binding, including pointer-reference returns such as
+`F *&get()`, and resolves trailing reference aliases (`auto get() -> R`). A
+pointer to a function returning a reference remains a pointer return.
+Ordinary consumers of a returned pointer reference still receive the loaded
+pointer value; its original cell address is a separate `LvalueAddress` fact.
+Callable aliases also retain whether their function returns a reference,
+separately from the alias's own binding and lowered pointer shape. This
+metadata survives header/type merges and local alias scopes, including merges
+where the destination already holds the alias name. The independent
+callable-reference flag is unioned across units; a unit without the flag does
+not clear an earlier positive fact. Indirect calls
+through such declarations establish lvalues for `decltype(auto)` wrappers;
+a pointer-returning callable with the same lowered shape remains a value.
+
+Selected ordinary calls and constructor/member sites bind omitted arguments
+through the same declaration-scoped expression lowering as file-scope getters.
+The written argument count is retained during lowering even when a scalar
+argument produces no pointer-flow variable. Explicit arguments suppress their
+defaults. Each selected declaration supplies only its applicable omitted
+positions; member positions are shifted past `this` exactly once. Default
+expressions retain their declaration source mapping and the executing caller;
+their nested calls and side effects are lowered before syntax state is retired.
+Lvalue reference defaults keep their original cells. A value expression bound
+to a reference, such as `const F &f = make()`, is instead lowered into a value
+temporary and passes that temporary's address; it does not require the
+value-returning getter to supply reference-address facts. This preserves value
+flow without simulating temporary destruction or general implicit conversions.
+Class-member prototypes retain expressions without allocating parameter
+variables, reserving the position that a definition's `this` will occupy.
+This does not change prototype signature interning: where no parameter type
+is recorded, the temporary can remain unknown while known default values flow.
+Virtual dispatch uses defaults from the statically visible declaration, rather
+than the override's defaults, and does not reject a matching override for
+omitting those defaults. Within a caller, repeated uses of one declaration's
+omitted position share its value and nested source call. Merge keys
+keep separate nested call records for different executing callers, even when
+the default is spelled at one shared-header location. Evaluation ownership
+follows the caller while exported request spans retain the declaration source;
+project calls can therefore evaluate defaults declared under a dependency root
+without enabling dependency function bodies. Transient requests
+retain the visible declaration and written count, and are consumed before
+publishing the per-TU index; no new SQLite column is introduced.
+The retained default also records its evaluated call sites. Loop evidence is
+unioned from every invoking host, including a later loop use of a cached value
+and nested default hosts. Calls inside a separate lambda body do not inherit
+the creating host's loop solely through that capture/default expression.
+Default expansion obeys the AST depth bound. Unknown callees and declarations
+without a retained default expression supply no invented argument value.
+This binds pointer/callback values and evaluated effects; it does not instantiate
+dependent templates. Default calls expanded after CFG construction currently
+lack their own argument-order events. With sequencing enabled, their host has
+an explicit `unsupported_construct` gap and partial coverage, rather than
+claiming complete ordering. See [Call sequencing](#call-sequencing-control-flow-sidecar).
+It is not a complete C++ default-argument evaluator: block-local default
+visibility and dependent/local type environments are not reconstructed. If
+overload ranking retains several candidates, each retained candidate can
+supply a default even when the compiler would select just one; such extra
+flows are precision debt. Conflicting same-qualified class declarations from
+different headers can also retain extra constructor candidates through the
+existing merged lookup. Name-only file-scope value-return summaries without
+a call site do not acquire ordinary call-site defaults through this pass.
+An `auto` callable variable also retains the initializer's known return
+binding, including named casts and function addresses. Cast targets establish
+their own return binding. Built-in callable array subscripts retain the
+element's binding; class `operator[]` inputs do not establish that category.
+Uninitialized declarations carry the same callable-return metadata as initialized
+ones. Validated pointer offsets preserve that binding, and subscript probes read
+pointer-table cast targets before checking the built-in element category.
+Selectors, comma/assignment callees and typed callable fields preserve that
+return category. Field category metadata follows its declaring class through
+header/type merging, independently of the field's pointer descriptor.
+Callable class objects use the selected `operator()` declarations from the
+shared call-result/overload lookup for return-category deduction, including
+compound object callees. A lambda's explicit reference-return declaration
+also establishes its initialized variable's callable binding. Thus a
+`decltype(auto)` wrapper retains the reference address supplied by either
+kind of callable; this does not add a general lambda/template deduction engine.
+
+Prototype classification reads the enclosing declaration's aliased return
+type as well as the full declarator. A wrapper lowered before the getter's
+definition can therefore recognize a reference-returning prototype.
+`decltype(auto)` definitions also record address facts for recognized lvalue
+returns: parenthesized names/members, dereferences, same-type lvalue selectors,
+assignment/comma results and known reference-returning calls. An unparenthesized
+name or member uses its declared reference identity; `return a` therefore stays
+a value when `a` is an ordinary variable, while `return (a)` preserves its
+reference. Plain `auto` does not apply this rule.
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
@@ -1228,6 +1369,338 @@ Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consum
 **`NewHeap`** represents C++ `new T(...)` allocations, and the object a recognised smart-pointer factory builds ([Factory construction](#factory-construction)). The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`). Lowering (`lower_new_object`, `construct_on_heap` in `lower.rs`) gives every `new T(args)` its heap object, a `$new<id>` temporary typed `T`, in value and statement position alike, and at file scope too; the constructor sites (in a body) take it as `this` and the constructor's own argument list as their arguments, never a placement list (`new (std::nothrow) T(a, b)` passes `a, b`); a braced list (`new T{a, b}`) is that list when `T` has a user-provided constructor, as for a braced local, and otherwise initializes an aggregate member by member, with no constructor site; and the expression's value is that object. A construction from one argument records no constructor site (`copies_implicitly`, checked in `emit_member_targets`) wherever the object is built (`new T(other)`, a factory, a local `T x(other)`, a class-typed member initializer `m_(other)`) when either no constructor of the class takes one argument, or the argument is an object of the class itself (directly or by reference) and no constructor takes the class: that is a copy or a move, which runs the implicit constructor, where arity filtering would otherwise fall back to every constructor, or rank `T(int)`, and bind the copied object to an unrelated parameter. A pointer argument (`T *`) is not an object copy; a reference to a pointer keeps that pointer type too. A user-declared copy or move constructor (`T(const T &)`) keeps its site, including constructors whose later parameters have defaults (`T(const T &, int = 0)`). An aggregate whose definition and constructor set are indexed, copied from its own type, records no unresolved constructor site. For `new` and factories, cached project headers import project prerequisites as types only, so an empty constructor lookup there retains a site for the later TU symbol merge to resolve. A missing class definition or an unknown constructor parameter type retains the possible constructor edge on those paths. Member-initializer lists omit the implicit default or copy constructor itself while retaining nontrivial construction of its base and member subobjects. A reference member's binding (`ref_(other)`) records none regardless of its class's constructors. See [Ctors / dtors](#c-support-first-step) for the member-initializer rule.
 
 **`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. String literals represent immutable constants and are excluded from being writable memory cells: stores through untyped or cast pointers do not write into string literal locations, and dereferences of pointers holding string literals do not merge cell memory (see [Propagation highlights](#propagation-highlights)). No `sprintf` / buffer writes.
+
+### Conditional values
+
+`condition ? left : right` contributes both arms under the flow-insensitive
+may-analysis. Lowering materializes one cached value per conditional syntax
+node, lowers the arms into that destination in source order, and copies the
+result wherever it is consumed: initializers, assignments (including stores),
+returns, arguments, receiver values and indirect callees. Nested conditionals
+use the same operation. Existing `Copy`, address, load, call-return, heap and
+null constraints union the alternatives monotonically, without selecting a
+runtime branch. Ordinary value returns use `ReturnFlow::Copy`, so the union
+survives a function boundary and translation-unit merging.
+
+Compound multidimensional array arguments decay to the selected arrays'
+original storage before binding pointer-to-array parameters. Character-array
+decay retains both storage addresses and interned strings for consumers such
+as `dlsym`. Struct arrays assigned to pointers likewise retain object storage;
+a pointer cast used for indexing projects fields from those objects.
+Known pointer/function aliases used as functional casts, including C/C++
+`(Alias)(value)`, preserve operand values without inventing calls to the alias.
+In C, a tag with the same spelling does not hide that ordinary typedef.
+Parenthesized alias casts also recognize an ungrouped comma operand list
+(`(Alias)(touch(), value)`); only its last operand supplies the value, while
+all evaluated operands retain their calls, effects and source provenance.
+For a reference cast, the argument-list-shaped comma operand forwards its last
+operand's original cell to address lowering as well as its value.
+The same nearest-type/value/function shadowing rules as reference casts apply.
+
+Built-in array ranges consume the same element summary when a range-for
+expression selects arrays or uses comma/assignment values. Explicit, `auto`
+and reference loop variables receive the possible elements. This does not
+supply a container iterator model. Callable class objects in compound callee
+expressions resolve their `operator()` through ordinary member lookup and
+overload ranking. Comma and assignment receivers retain their known class
+for method lookup, just as conditional receivers do.
+
+Compound elements in callback-array initializer lists (`F table[] =
+{c ? alpha : beta}`) copy their shared expression value into the array's
+index-insensitive element summary. Nested lists use the same summary. Arm
+calls retain their own return destinations; their temporary values do not
+replace the declared array type. Struct/union array members continue through
+the aggregate field paths rather than copying unrelated fields into this
+scalar element summary. Value casts around an initializer element are peeled
+by the same normalization as ordinary RHS lowering, while the element's
+enclosing operation retains its source provenance. Positional and field-designated
+struct arrays containing compound values use the existing typed aggregate
+traversal, including nested arrays and positional brace elision; each callback
+goes through its
+declared field's GEP and store. Known unrelated fields never join the scalar
+array summary. Mixed C lists advance from a designated subobject through its
+remaining array elements and fields before advancing the containing object.
+The designated cursor initially includes every available positional array
+element. Exhausting that cursor does not skip later explicit designators.
+After explicit clauses, untouched subobjects receive normal omitted-member
+initialization, including defaults at nested designated levels. An explicitly
+initialized subobject suppresses its declaration default. Constant declarator
+bounds are retained in the initializer's private traversal shape.
+Global default completion recovers those bounds before traversing an array, so
+written omitted elements execute their defaults even if the exported type has
+an unknown extent. For an omitted outer `[]` bound, designated completion
+infers the extent from the highest initialized index plus one. Contiguous
+coverage, including reordered designators, adds no whole-element default;
+gaps still evaluate their omitted elements' defaults. Arrays with known or
+initializer-inferred extents do not gain extra default evaluations when fully
+supplied. An explicitly written bound that cannot be computed remains
+conservative and can still cause an extra default evaluation; it is not
+treated as an omitted bound.
+For a designated union, only the explicitly selected member completes its
+nested defaults. Inactive members never run their declaration initializers.
+Field designators use the known containing type when projecting
+their fields. C positional, mixed and index-designated lists use the same
+typed subobject traversal when a layout is available. Anonymous aggregates
+and C structs do not require C++ construction metadata. Constructor-free
+unions initialize the first member or the designated member; nested array
+fields retain their element type while indices share summary storage.
+Constant struct arrays with distinct callback members or nested fields also
+use field stores, so a subsequent pointer cast cannot observe callbacks from
+unrelated members through a whole-array function summary. Existing constant
+tables with one callback field retain their per-array function summary.
+Opaque scalar spellings, including recovered enum tags, consume one clause;
+only available aggregate layouts introduce subobject traversal. Non-aggregate class-array elements lower their selector
+arguments through the ordinary constructor path.
+
+GNU shorthand `value ?: fallback` uses the condition itself as its true
+value, for both flow and type inference. A call in that position is lowered
+once and retains one source site and return destination. Plain `=` assignment
+arms contribute their assigned RHS value while also writing the destination;
+previous values in that destination do not become assignment-result values.
+Comma arms contribute only their right operand. Calls and side effects in
+the left operand remain indexed. The shared expression cache prevents the
+later body walk from repeating assignments materialized for a value reader.
+File-scope initializers have no body walk: their evaluated operands are walked
+once at the initializer boundary, before value, address or aggregate lowering.
+This includes conditions, comma operands, array-decay operands, subscript
+indices and lambda init-captures. Assignments
+use the same expression cache, so GNU shorthand and repeated value readers
+do not repeat a store. Walking operands for effects does not allocate an
+unused conditional-value temporary. The same effects walk covers parenthesized constructor arguments and
+instantiated default-member initializers at file scope. Nonempty positional
+and designated global aggregate lists complete omitted defaults while explicit
+member values suppress those defaults.
+Anonymous layouts and constructor-free unions use the same traversal. A
+default-initialized union selects its declared default member, including a
+member after the first. With a configured C++20 or newer standard, a global
+aggregate's parenthesized initializer completes omitted members as its
+braced form does. Explicitly supplied members suppress those defaults.
+The effects walk skips C `_Generic`
+controlling operands using the shared unevaluated-operand rule. Its explicit
+stack observes the ordinary AST depth limit and emits one warning instead of
+recursing through generated initializer chains.
+A closure's init-captures execute when
+the closure is created; its body and unevaluated operands such as `sizeof`
+and `noexcept` do not execute as part of that initializer.
+
+An address of a conditional lvalue (`&(c ? a : b)` in C++) unions the
+addresses of the original selected cells, rather than taking the address of
+the merged value temporary. This preserves both callbacks through a pointer
+argument and lets stores through the selected address reach `a` and `b`.
+Named variables, fields, dereferenced pointers, function designators and
+nested selectors share the ordinary address and GEP constraints. Array
+element addresses retain the ordinary index-insensitive base-array summary.
+Address-taken pointer/callback array summaries synchronize their tracked element
+values with storage; see [Variable cells](#propagation-highlights).
+Reference-returning call arms retain their original referent addresses via
+the separate [reference return facts](#return-value-flow), including across
+translation units and through indirect and virtual calls. A bodyless getter
+without reference-address return facts does not supply a known cell.
+These address values also flow through initializers, assignments and returns.
+Standalone `&(touch(), a)` and `&(p = a)` use the same address lowering.
+Assignments to conditional lvalues (`(c ? a : b) = value`) store into both
+possible cells under the may-analysis.
+
+Field paths and dereference operands also consume the shared compound value:
+`(c ? &a : &b)->callback()`, `*(c ? pa : pb)` and stores through the latter
+retain the flow of their named-pointer equivalents. Smart-pointer field roots
+continue through the existing wrapper boundaries and compatibility filter.
+Built-in subscripts with a compound table (`(c ? a : b)[i]`) select the
+original array-summary addresses or the pointer arms' values, then load or
+store through that address. Initializers, arguments, returns, callees and
+assignment targets share this lowering. Unknown indices remain summaries;
+class `operator[]` and container return models retain their existing limits.
+Reference casts used as tables, including functional casts through array
+reference aliases (`R(c ? a : b)[i]`), unwrap before array decay. Reads and
+stores therefore reach the original element-summary cells, as do element
+addresses and indirect calls.
+Ordinary pointer casts around compound tables also preserve the operand's
+pointer value, with array decay applied before indexing. An aggregate element
+retains its selected object address for member projection (`(c ? a : b)[i].f`);
+scalar elements load the contents of their summary cell. Multidimensional
+subscripts remove one type layer per index. Each additional pointer index loads
+the intermediate pointer, while array layers retain summary storage. The rule
+applies to selected pointer tables' reads, stores and addresses. Compound
+callees preserve their original dereference chain before materialization.
+Indexed member paths collect
+indices in the syntax walk and validate them during one forward field/type
+traversal. Pointer layers load their stored values at the index/arrow boundary;
+array layers keep summary storage. Mixed arrays of pointers use both steps.
+Dereference operands with built-in pointer offsets (`array + index`,
+`index + pointer`, `pointer - index`) retain that index-insensitive
+pointer/array summary, including reference returns such as
+`return *(table + index)`. This operand path requires a known integer offset;
+known unscoped enum tags and directly spelled defined unscoped enumerators
+also admit integer offsets. Class bodies register their enums in the owning
+scope, and enum/enumerator offset lookup uses ordinary enclosing scopes,
+using-declarations and using-directives. Their integer category survives shared
+type imports. Built-in integral arithmetic, shifts, bitwise/unary operations,
+comparisons and logical operations retain integral offset compatibility when
+their operands establish the required built-in types. Integral cast targets
+and `sizeof`/`alignof` also establish it. This category probe stays separate
+from overload argument typing: it does not coerce enum identities there or
+interpret overloaded class arithmetic as built-in arithmetic.
+Ordinary pointer-offset
+values and arguments, offset arms of selectors, and dereferenced offset
+callees use this same cached value path. Offset-chain type probing uses an
+explicit stack bounded by the ordinary AST limit, so generated arithmetic
+does not recursively overflow the parser's stack.
+Pointer differences, unknown offset types and class operator overloads do
+not establish a pointer value. It does not add offset arguments to byte-buffer
+or class-conversion models. Nested known-integer offsets materialize
+their pointer operands recursively through the same cached value path.
+Class value conversions keep their own semantics; their constructor input
+does not become a built-in table through cast peeling.
+Address lowering also applies this element-address rule to ordinary subscript
+arms: `&(c ? p[i] : q[j])` selects the cells reached through `p` and `q`,
+as `&(c ? p : q)[i]` does. Taking the address of a pointer variable would
+add a spurious level of indirection; taking an array element's address keeps
+the array's existing summary cell.
+Field-held tables still require their field layout/value to be resolvable;
+the root pointer variable's storage does not substitute for a missing field.
+Lvalue reference casts in an address (`static_cast<T&>(x)`, C-style reference
+casts, reference aliases and nested reference casts) preserve the original
+referent cell. Address lowering unwraps each reference cast separately and
+keeps the enclosing cast's operation provenance. Reference-return facts use
+the same recognition, including deduced lvalue-reference returns. Value and
+pointer casts do not establish this cell identity.
+Recognized reference casts on assignment targets use the same referent-address
+path as conditional lvalues, for both ordinary assignments and assignments
+whose result is consumed. This includes named, functional and C-style
+reference casts, including an address passed directly as an argument.
+Reference binding detection follows function, array and pointer declarators
+to the modifier nearest the declared name or abstract endpoint. Explicit
+function-reference targets such as `void(&)()` preserve the same function
+address as a function-type alias followed by `&`. `F*&` binds a reference
+to a pointer; `F& (*)()` binds a pointer to a function returning a reference
+and does not establish reference identity for that pointer.
+Casts to rvalue references to functions (`void(&&)()`, or a function-type
+alias followed by `&&`) also produce function lvalues and retain function
+addresses. Object casts to `T&&` retain their xvalue category.
+A one-argument functional cast through a visible reference alias (`R(x)`)
+uses the same referent-address lowering and records no call to `R`. Ordinary
+calls through shadowing variables/members or nearer functions retain normal
+resolution. Calls inside a cast's operand retain their own source sites and
+return destinations. Alias lookup stops at the nearest visible declared
+class or union, including a forward declaration, before consulting outer
+reference aliases. A class constructor sharing an outer alias's name retains
+its ordinary constructor and receiver behavior. Receiver and conditional
+type probes use the alias's referent type, preserving any additional pointer
+or array layers, before ordinary function-result lookup. Thus
+`R(c ? a : b).method()` and a selector
+between two `R(x)` casts have the same receiver type as their referents.
+Functional reference casts also contribute values as arguments and indirect
+callees, including when the cast wraps a selector. Complete function-reference
+aliases (`using Ref = void(&)();` and the corresponding typedef) retain their
+reference binding with the same declarator walk used for explicit casts.
+Same-signature function designators in an lvalue selector can produce
+`decltype(auto)` reference-address facts; signature comparison uses the shared
+symbol metadata, including parameter binding and variadic status.
+Compound assignments on compound lvalues read the selected value and write
+it through the selected addresses without re-entering the same assignment.
+Pointer offsets remain summarized; arithmetic does not select a runtime arm.
+
+The condition and calls in both arms retain their ordinary source sites.
+Arm operations and the right operand of standalone comma values retain their
+own flow provenance. Calls assigning an arm retain the conditional's return
+destination when the later body walk records
+their sites. Reusing the conditional value avoids repeating arm lowering or
+allocating a second callee temporary when return lowering and call collection
+visit the same expression. Scope, linkage and target selection still use the
+ordinary resolvers described in [Return-value flow](#return-value-flow).
+When default member initializers are reparsed for construction, their syntax
+caches are isolated and the enclosing caches restored afterward. Node IDs
+from a discarded initializer tree never identify a different initializer.
+
+A result type is inferred only when both arm types agree by the IR's strict
+type-shape comparison, when one C++ class pointer converts to the other arm's
+known base-class pointer, when a class converts to the other arm's known
+base class, or when a null arm (`nullptr` or literal zero)
+accompanies a known pointer type. Otherwise the result type is unknown,
+while every known arm value still flows. This also
+applies to `auto` deduction and receiver/argument type probes. Named class and
+union types compare by their canonical tag name, independently of the layout
+fields available at either arm; pointer layers and function signatures must
+still match, and unknown types are not wildcards. Nested conditional type
+probes cache each syntax node's result, including unknown types, so materializing
+successive suffixes of a selector chain does not rescan those suffixes. Type
+probes and value materialization obey the AST depth bound; a truncated suffix
+can therefore lose values and is reported by the depth warning. Reparsing an
+initializer isolates this type cache alongside its value caches. Explicit casts to known classes use
+their written type when probing conditional arms. Base-pointer conversion
+uses the shared inheritance graph and applies to one pointer layer only;
+unrelated classes and sibling classes' common ancestors are not inferred.
+Common-class type probes do not recurse through lvalue-category checks;
+reference-return classification checks the category separately.
+Matching array lvalues retain their array shape. Mixed/null arms apply
+array-to-pointer decay, including for `auto` deduction and receiver probes;
+the value flow then carries the original array summary's address.
+Selecting between
+container-returned values still depends on the container's return
+model and visible type declarations; selecting smart pointers retains the
+existing [unwrap rules and compatibility filter](#smart-pointer-unwrap).
+The reduced `conditional_values` fixture uses explicit stream getters and
+null-or-object construction to test these flows independently of container
+models. Field values retain the existing instance-insensitive summary rule.
+
+#### Conditional value limitations
+
+The support above extends the existing expression and pointer models; it is
+not a complete implementation of C/C++ expression semantics. The regression
+fixtures establish the covered forms, not every possible composition of casts,
+declarators, overloads, templates, initializers and value categories. A source
+file parsing without diagnostics does not guarantee complete value flow.
+
+- **No path or execution-order precision.** Both arms contribute even when a
+  condition is constant. Correlations between selections are lost. Initializer
+  and assignment effects accumulate monotonically; they do not simulate
+  execution order, object lifetime or which branch actually runs.
+- **Summarized storage.** Array indices and pointer offsets share element
+  summaries, and field summaries are instance-insensitive. Different elements
+  or objects can therefore contribute extra targets. Null arms contribute no
+  pointee; retaining a non-null alternative does not prove dereference safety.
+  The structural union/first-member aliases described in
+  [Field sensitivity](#field-sensitivity) do not provide a general byte-storage,
+  ABI layout, arbitrary type-punning or bidirectional cast model. Packed layouts,
+  bit-field widths and full C++ standard-layout eligibility are not established
+  by these rules. A compatible layout prefix can conservatively alias even
+  when the analyzer cannot prove all language eligibility requirements.
+- **Partial type and conversion inference.** The result-type rules above do
+  not implement the full C++ conditional-conversion or overload rules. Common
+  ancestors of sibling classes and conversions through multiple pointer layers
+  are not inferred. Unknown argument types can retain multiple overloads;
+  unknown receiver types can prevent method resolution even when arm values
+  are preserved. No complete user-defined conversion or template evaluator is
+  supplied by this feature.
+- **Built-in arithmetic only.** Pointer-offset flow requires a recognized
+  pointer/array operand and a known integral offset. Unknown offset types,
+  pointer differences and overloaded class arithmetic do not establish a
+  pointer value through this rule. Offsets do not distinguish elements or
+  model byte ranges and bounds.
+- **Existing model dependencies remain.** Arms can contribute only values
+  established by their declarations, bodies or summaries. Container element
+  returns and iterator ranges need container models; smart-pointer receivers
+  need the existing unwrap/type-compatibility rules; fields need resolvable
+  layouts. This change does not fill in missing library bodies or summaries.
+- **Parser and traversal limits remain.** Accepted syntax can still contain
+  unmodeled value forms. Bounded AST walks warn and skip deeper nodes when
+  their depth limit is reached, so generated extreme inputs can have incomplete
+  flow despite completing analysis.
+  Value, lvalue-address and array-decay expansion share the AST budget.
+  Function-designator representatives and lvalue categories cache each syntax
+  node's result, including misses, and bound category recursion too. Scratch
+  initializer trees isolate these caches together with the type/value caches.
+  The alias-call normalization here admits pointer/function/reference aliases;
+  an ambiguous scalar/class alias cast parsed as a call, such as `(ul)(p)` for
+  a scalar typedef, remains outside this path and can produce a phantom call.
+
+Exact target assertions apply to the focused fixtures. Pinned-corpus comparisons
+measure the configured revisions and models, not all valid C/C++ programs; the
+known HDF summary imprecision is recorded in the
+[evaluation report](EVAL_REPORT.md#conditional-pointer-and-callback-values--2026-11-03).
+Uncovered combinations should be assessed against these limits and a reduced
+control before being described as regressions. Crashes, invalid IDs and lost
+targets in covered forms remain defects regardless of how rare the input is.
 
 ### Dereferenced operands
 
@@ -1260,6 +1733,9 @@ through and passes. `*x` goes through the value `x` holds, computed as a value
   `Array { elem }`); an element of a member table (`h->t[i]`) is loaded from
   the table's cell.
 - An inner `*` is loaded: `**pp` loads twice.
+- A conditional, assignment or comma operand uses its cached compound value
+  before the dereference, for reads, stores and arguments alike; see
+  [Conditional values](#conditional-values).
 - A call's result, for a direct call by plain name (`*f()`) or a call through
   a function-pointer data member (`*h->cb()`). A method's result is not
   modeled, so `*obj->Get()` has no value.
@@ -1332,16 +1808,17 @@ Limits:
   called through its closure variable) passes the combined temporary for `*x`.
 - `*h->t[i]` on a member table of pointers reads one level short, as
   `field_table` reads a table element.
-- Casts, pointer arithmetic (`*(p + 1)`) and elements of a local array
+- Unsupported cast operands and elements of a local array
   (`*arr[i]`) are not values: a read or store target and an argument keep
   the root variable where the lvalue names one, and `return` or a store
   source emits nothing.
 - `&*x` is not simplified: `&*h->f` takes `h`'s address.
 - A `T *&` out-parameter is bound by value, so assigning to it does not reach
   the caller's pointer.
-- A reference return spelled through an alias (`Ref f()` with
-  `using Ref = S &;`) or deduced by `decltype(auto)` is taken as by value, so
-  `return *p;` there reads one level too deep.
+
+Built-in pointer offsets retain their index-insensitive summary; see
+[Conditional values](#conditional-values). Aliased and deduced reference
+return classification follows [Return-value flow](#return-value-flow).
 
 ### Cast receivers
 
@@ -1640,12 +2117,20 @@ A variable whose address is taken (`&v`, or `return &v`) has two representations
 - **Node → cell.** When `pts[Var(v)]` gains locations, they are written into `memory_pts[loc(v)]`, filtered by the cell's slot guard exactly like a store (`FnFilter::admits`). The cell's loaders are requeued so pending loads see the growth.
 - **Cell → node.** When a store grows `memory_pts[loc(v)]`, the cell is merged into `pts[Var(v)]` through the load path (`merge_memory_into_if_grown`, same guard).
 
+Address-taken arrays of pointers or callbacks also synchronize their
+index-insensitive element summary with their memory cell. Their own storage
+location is excluded from node-to-cell synchronization: array decay still
+names storage, while the summary's contents are element values. This lets
+`&array[i]` carry initialized callbacks and lets a store through that address
+reach subsequent element reads. The element slot's existing signature guard
+continues to filter function values; struct arrays retain field-cell modeling.
+
 Only a real address may reach a synced cell, so a name that denotes a *value* never stands for its own address. One rule, `seeds_own_location` / `var_is_pointer_like`, decides both places the solver used to assume it did:
 
 - **The static-storage seed.** `solve` starts a global/static's node holding its own location only when its name denotes its storage (an aggregate, an array). A pointer static's name denotes only its value: seeding it would make `p = G; *p = &k;` write `k` into `G`'s cell, and syncing would turn that into `G = &k`. (The flow graph's `points_to` edges are a different thing — storage connectivity, drawn for every variable with a location; see `docs/SQLITE_SCHEMA.md`.)
 - **The store's `self_loc`.** A store `*p = v` also writes `v`'s own location only when `v`'s name denotes its storage (`*p = arr`, an array decaying). For a pointer `v` it stores the value alone; `*out = &G` lowers to an explicit `AddrOfVar` temp (see "Argument flow"), so the address is a real, address-taken one.
 
-Consequences: `get_buf(&q); x = q;` sees what `get_buf` stored (the out-parameter idiom), `v = &h; x = *(&v);` sees `h`, and `cb_t cb; get_cb(&cb); cb();` resolves the callback `get_cb` stored with `*out = handler`, `*out = &handler`, `*out = (cb_t)handler` or a qualified `*out = &ns::handler`. A function designator stored through a pointer lowers like a field store of one (`AddrOfFn` temp + `Store`; `fn_designator` for both paths), and a function-pointer variable's own cell gets the fn-pointer slot guard (see "Signature-guarded function-value propagation"). Aggregate variables (`struct`/`union`/array objects) are not pointer-like and are not synced: their contents live in field cells and summaries; a table's elements are its cell, so `table[i]()` lowers as a load from `table` (which also passes through the functions its initializer placed), and a field array's elements are its field's cell: `s.ops[i] = fn` stores into the field, and every read of an element — a call `s.ops[i]()` / `p->ops[i]()`, an initializer or assignment `f = s.ops[i]`, an argument, or the source of `t.a[i] = s.b[j]` — loads from it (`field_table`, which also peels `s.m[i][j]`; `matrix[i][j]()` likewise loads from `matrix`).
+Consequences: `get_buf(&q); x = q;` sees what `get_buf` stored (the out-parameter idiom), `v = &h; x = *(&v);` sees `h`, and `cb_t cb; get_cb(&cb); cb();` resolves the callback `get_cb` stored with `*out = handler`, `*out = &handler`, `*out = (cb_t)handler` or a qualified `*out = &ns::handler`. A function designator stored through a pointer lowers like a field store of one (`AddrOfFn` temp + `Store`; `fn_designator` for both paths), and a function-pointer variable's own cell gets the fn-pointer slot guard (see "Signature-guarded function-value propagation"). Aggregate variables (`struct`/`union` and non-pointer array objects) are not pointer-like and are not synced: their contents live in field cells and summaries; a table's elements are its cell, so `table[i]()` lowers as a load from `table` (which also passes through the functions its initializer placed), and a field array's elements are its field's cell: `s.ops[i] = fn` stores into the field, and every read of an element — a call `s.ops[i]()` / `p->ops[i]()`, an initializer or assignment `f = s.ops[i]`, an argument, or the source of `t.a[i] = s.b[j]` — loads from it (`field_table`, which also peels `s.m[i][j]`; `matrix[i][j]()` likewise loads from `matrix`).
 
 Lazily created *field* cells get no slot guard: their recorded type can be another same-named field's (HDF's `UartDriverData` has a fn-pointer `config` and a nested `params.config` struct), and guarding them by it dropped real edges.
 
@@ -1942,6 +2427,28 @@ then merge the new databases to follow the indexed framework route.
 - **A location's struct type** (`struct_type_for_loc`) is the type its field positions refer to: a variable's own snapshot, or the tag's definition when the variable was declared with a forward-declared (empty) tag, as lowering numbers such fields (`struct_type_for_var`); through pointers and arrays, the pointee or element (an array element snapshot that was never separately interned falls back to its named tag declaration; an interned snapshot keeps its own positions); for a non-variable location (heap, field, table element) the same through its recorded type. A scalar has none. Variable-based summary lookup uses the same type resolver, including forward-declared tags, so it selects the same member as concrete field lookup.
 - **The GEP field-name guard** rejects a pointee whose struct type lacks the GEP's named field at that position, and a pointee with no struct type at all, so a wrong-type pointer cannot pull fields out of an unrelated layout. Function values are not judged by it: a table's initializer places its functions directly in the table's points-to (`ArrayFnMember`), and they reach `table[i].func` through the table-member and arity rules instead (HDF's local `dispatchFunc[i].func(..)` tables).
 
+Overlapping union views preserve storage identity without initializing inactive
+members. Same-shape union members share a concrete field cell. For distinct
+struct members of a union, fields share cells only within a prefix whose
+declared types, offsets and sizes agree; names may differ. The first incompatible
+field ends that prefix. Struct-view roots retain their own declared types so
+the ordinary GEP name guard still applies. Canonical cells follow declaration
+order, independently of which view is accessed first, and retain their original
+link target. Export records each canonical field location once. A field's root
+variable identifies its storage owner; further member lookup uses the field's
+own declared type.
+
+A recognized C++ pointer cast from known aggregate storage to its first
+member's pointer type projects that member's cell when its offset is zero and
+its type shape matches. For example, `reinterpret_cast<F *>(table)` for
+`struct S { F first; F second; }; S table[1];` reads `first` through the cast,
+without joining `second`. The cached projection precedes value-cast
+normalization in initializers, returns, arguments and dereference/callee
+consumers; these positions share the same member address. This is an
+aggregate-to-first-member rule, not an
+arbitrary cast or byte-offset alias model; see
+[Conditional value limitations](#conditional-value-limitations).
+
 ## Arrays and function-pointer tables
 
 - **Constant index**: treated conservatively (element refinement is future work).
@@ -2057,7 +2564,7 @@ occupants of the "no target" indirect bucket.
 
 When a call edge is created (direct or indirect), actuals are connected to callee formals:
 
-- **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types)
+- **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types). Callback-pointer chains retain this persistent edge at every depth, including reference-return addresses that arrive through copies after initial parameter wiring.
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
 - **Dereferenced arguments** (`f(*x)`) pass what [Dereferenced operands](#dereferenced-operands) gives the parameter kind
 - **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` preserves the member’s own field address using the same GEP path as a stored address; unresolved paths and `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument follows the same field path), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
@@ -3926,8 +4433,9 @@ Known C++ imprecision (in addition to the general list below):
   it does not infer returns from bodies, substitute general templates, or
   infer function-pointer call results. Trailing `auto` return declarations
   remain unknown. Named casts (`auto p = static_cast<T *>(v)`) parse as calls
-  to the cast and stay unknown until C2, as do conditional expressions
-  (`auto p = c ? a : b`). Cast arguments in a call-result receiver probe are
+  to the cast and stay unknown until C2. Conditional expressions infer only
+  the shapes described in [Conditional values](#conditional-values).
+  Cast arguments in a call-result receiver probe are
   conservatively unknown for overload ranking. `unique_ptr::release` has no
   extraction summary; supported `get()` forms are described in
   [Smart-pointer unwrap](#smart-pointer-unwrap).
@@ -6419,8 +6927,8 @@ view; re-analyze databases exported before they were introduced.
 
 Limitations are those of the recorded constraint graph: it is not an execution
 trace or a complete source evaluator. In the `dataflow_presentation` fixture,
-omitted default arguments are selected as calls but their values currently
-lack parameter-flow edges; `default_output` has no flow node. Explicit pointer
+retained omitted defaults have the argument bindings described in
+[Return-value flow](#return-value-flow); `default_output` has no flow node. Explicit pointer
 arguments and C++ `nullptr` retain their recorded argument connections; `nullptr` is displayed as a null pointer value, never an object's
 address or an unknown value. Each occurrence keeps its own parameter positions
 and source location in every format, with call-site IDs retained internally.

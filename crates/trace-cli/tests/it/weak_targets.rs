@@ -658,3 +658,151 @@ fn suppressed_weak_definitions_do_not_leak_origins_of_surviving_constraints() {
         }
     }
 }
+
+#[test]
+fn conditional_returns_keep_link_targets_and_deterministic_exports() {
+    conditional_returns_in_images(false);
+}
+
+#[test]
+fn conditional_reference_addresses_keep_link_targets_and_deterministic_exports() {
+    conditional_returns_in_images(true);
+}
+
+fn conditional_returns_in_images(reference: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let extension = if reference { "cpp" } else { "c" };
+    fs::write(
+        root.join(format!("select.{extension}")),
+        if reference {
+            r#"
+typedef void (*Callback)(void);
+Callback &get_alpha();
+Callback &get_beta();
+Callback &forward_alpha() { return get_alpha(); }
+void entry(int c) { Callback *p = &(c ? forward_alpha() : get_beta()); (*p)(); }
+extern int flag;
+Callback *file_selected = &(flag ? forward_alpha() : get_beta());
+void entry_global() { (*file_selected)(); }
+struct ImageMemberGetter { Callback &get_alpha(); Callback &get_beta(); Callback &get_alpha(int); };
+ImageMemberGetter member_getter;
+Callback *file_member_selected = flag ? &member_getter.get_alpha() : &member_getter.get_beta();
+void entry_member() { (*file_member_selected)(); }
+"#
+        } else {
+            r#"
+typedef void (*Callback)(void);
+Callback get_alpha(void);
+Callback get_beta(void);
+Callback choose(int c) { return c ? get_alpha() : get_beta(); }
+void entry(int c) { Callback f = choose(c); f(); }
+"#
+        },
+    )
+    .unwrap();
+    for image in ["a", "b"] {
+        fs::write(
+            root.join(format!("{image}.{extension}")),
+            if reference {
+                r#"
+typedef void (*Callback)(void);
+static void alpha(void) {}
+static void beta(void) {}
+void unrelated(void) {}
+static Callback a = alpha, b = beta;
+Callback &get_alpha() { return a; }
+Callback &get_beta() { return b; }
+struct ImageMemberGetter { Callback &get_alpha(); Callback &get_beta(); Callback &get_alpha(int); };
+Callback &ImageMemberGetter::get_alpha() { return a; }
+Callback &ImageMemberGetter::get_beta() { return b; }
+Callback bad = unrelated;
+Callback &ImageMemberGetter::get_alpha(int) { return bad; }
+"#
+            } else {
+                r#"
+typedef void (*Callback)(void);
+static void alpha(void) {}
+static void beta(void) {}
+void unrelated(void) {}
+Callback get_alpha(void) { return alpha; }
+Callback get_beta(void) { return beta; }
+"#
+            },
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("link_commands.json"),
+        json!([
+            {"directory":root,"arguments":["cc",format!("select.{extension}"),format!("a.{extension}"),"-o","a"]},
+            {"directory":root,"arguments":["cc",format!("select.{extension}"),format!("b.{extension}"),"-o","b"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let mut previous = None;
+    for jobs in [1, 4] {
+        let (db, conn) = analyze(root, Some(jobs));
+        let rows = common::text_rows(
+            &conn,
+            "SELECT t.name, target.name, p.path,
+                caller.target_id=target.target_id
+            FROM call_edges e
+            JOIN functions caller ON caller.id=e.caller_fn_id
+            JOIN functions target ON target.id=e.callee_fn_id
+            JOIN link_targets t ON t.id=caller.target_id
+            JOIN files p ON p.id=target.file_id
+            WHERE caller.name='entry' AND e.resolution='indirect'
+            ORDER BY t.name,target.name",
+        );
+        let expected: Vec<Vec<String>> = ["a", "b"]
+            .into_iter()
+            .flat_map(|image| {
+                ["alpha", "beta"].into_iter().map(move |callee| {
+                    vec![
+                        format!("Text({image:?})"),
+                        format!("Text({callee:?})"),
+                        format!(
+                            "Text({:?})",
+                            root.join(format!("{image}.{extension}"))
+                                .canonicalize()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                        ),
+                        "Integer(1)".into(),
+                    ]
+                })
+            })
+            .collect();
+        assert_eq!(rows, expected);
+        if reference {
+            let rows = common::text_rows(&conn,
+                "SELECT t.name,target.name,p.path,caller.target_id=target.target_id
+                 FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id
+                 JOIN functions target ON target.id=e.callee_fn_id
+                 JOIN link_targets t ON t.id=caller.target_id JOIN files p ON p.id=target.file_id
+                 WHERE caller.name='entry_global' AND e.resolution='indirect' ORDER BY t.name,target.name");
+            assert_eq!(
+                rows, expected,
+                "file-scope reference results keep their link image"
+            );
+            let member_rows = common::text_rows(&conn,
+                "SELECT t.name,target.name,p.path,caller.target_id=target.target_id
+                 FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id
+                 JOIN functions target ON target.id=e.callee_fn_id
+                 JOIN link_targets t ON t.id=caller.target_id JOIN files p ON p.id=target.file_id
+                 WHERE caller.name='entry_member' AND e.resolution='indirect' ORDER BY t.name,target.name");
+            assert_eq!(
+                member_rows, expected,
+                "member address returns keep their selected overload and link image"
+            );
+        }
+        let rows = common::analysis_rows(&db);
+        if let Some(previous) = previous {
+            assert_eq!(rows, previous);
+        }
+        previous = Some(rows);
+    }
+}

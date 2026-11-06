@@ -65,6 +65,8 @@ Current kinds:
 - `ArrayFnMember { array, callee }`: Function-pointer array initializer member (`{ fn0, fn1 }`).
 - `CallReturn { dst, callee_name, caller }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns` in `caller`'s scope (`None` for a file-scope initializer; see `docs/ANALYSIS.md`, "Return-value flow").
 - `CallReturnResolved { dst, callee }`: Return from an exact selected `FnId`, expanded by the PAG; used after merge for file-scope getters without a call site.
+- `CallReferenceReturn { dst, callee_name }`: Address returned by a direct file-scope reference getter; expanded after merge in the destination's file and link target using `LvalueAddress` facts.
+- `CallReferenceReturnDeclared { dst, callee, args }`: Address returned by a selected file-scope getter; its declaration and explicit actual variables are remapped, matched to definitions by signature in the destination's file and link target, then bound before address-return expansion.
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
 - `NewHeap { dst }`: Heap allocation (`new T(...)`, and a smart-pointer factory's object; see `docs/ANALYSIS.md`, "Factory construction"), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
 - `StringConst { dst, value }`: String literal constant interned as abstract location, enabling dynamic symbol lookup (`dlsym`, `GetProcAddress`).
@@ -76,6 +78,7 @@ Return-value flow (`ReturnFlow` in `program.fn_returns`):
 - `AddrOfFn { callee }`: `return &fn`
 - `Copy { src }`: `return local` or `return param`
 - `Call { callee_name }`: `return other()` (transitive call return)
+- `LvalueAddress(inner)`: address/copy/call fact for the original cell of a returned reference; expanded only for address consumers (see `docs/ANALYSIS.md`, "Return-value flow")
 
 ## Adding analysis constraints
 
