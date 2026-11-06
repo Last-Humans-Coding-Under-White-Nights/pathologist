@@ -1486,6 +1486,18 @@ The receiver value is the variable for a plain name, and the object it names for
 
 This is a may-alias relation. Expiry, a null result, and ownership counts are not modeled. `return wp.lock();` records no return flow: `ReturnFlow` has no receiver form.
 
+### `shared_from_this`
+
+`shared_from_this()` and `weak_from_this()` on an object whose class derives, directly or through its bases, from a class named `enable_shared_from_this` yield that object. One recognizer (`from_this_call` in `lower.rs`) decides both the result's type and its value, as [Weak-pointer promotion](#weak-pointer-promotion) does, once per call:
+
+- a call with no arguments: bare in a member body (or a lambda capturing `this`) unless a local, a function the body imports (`using factories::shared_from_this;`) or an explicit global qualifier (`::shared_from_this()`) makes the name something else, or with an explicit receiver, the base itself included (`enable_shared_from_this<M> &r`) (`this->`, `p->`, `sp->`, `r.`, `m_ref.` for a reference member, `(*p).`, `Get().` for a call returning a reference). A class that declares its own `shared_from_this` without deriving from `enable_shared_from_this`, or that hides the inherited member with its own (`shared_ptr<Derived> shared_from_this()` casting the base's result, or a callable data member of that name: ordinary member lookup finds it before the base's), keeps it as an ordinary member call. A declaration on the base, or on a class the base derives from (an internal base a library may declare the members on), is the standard member, not a hiding one. A qualified call names the member its qualifier sees: `Base::shared_from_this()` is `Base`'s, past such a hiding member, and `enable_shared_from_this<C>::shared_from_this()` the base's own; a qualifier spelled as an instantiation (`Shared<M>::`) binds its template's parameters as a receiver's does;
+- the result is `shared_ptr<C>` / `weak_ptr<C>` in `enable_shared_from_this`'s own namespace (`std::shared_ptr<Manager>`; `std` when no declaration of the base is in the tree, however `using namespace std` reached it). `C` is the class `enable_shared_from_this<C>` names, resolved where the base is written; through class-template holders (`template <class T> class Shared : public enable_shared_from_this<T>`) it is the argument the deriving class binds, substituted down every level (`M : Shared<M>` yields `shared_ptr<M>`), or the one a receiver spelled as an instantiation binds (`Shared<M> *p`). Substitution is the one [Template-parameter bases](#template-parameter-bases) uses: an omitted argument takes its default, a file-local (anonymous-namespace) holder is the unit's own, and a base named through an alias of an instantiation (`using Mix = H<M>; struct M : Mix`) is that instantiation. Such a holder's spelling keeps its arguments in the receiver's type, as a template whose members return a parameter does; an alias of the instantiation (`using InfoCallback = Callback<Info>;`) still names the template's class, so an out-of-line `InfoCallback::Format` is `Callback::Format`. The declared overloads are not consulted: the standard's const twins (`shared_ptr<T> f()`, `shared_ptr<const T> f() const`) disagree on the result, and `<memory>` need not be in the tree. `auto` locals, init-captures (`[self = shared_from_this()]`) and call receivers (`shared_from_this()->Run()`) are typed through it;
+- the result is `Copy { dst: result, src: object address }`: wrapper variables hold their pointee's address, so the result may alias `this`, the pointer an arrow or `*p` reads through, a reference's or reference member's referent, or what a reference-returning call yields (loaded through, as any such receiver is). A by-value object (`obj.shared_from_this()`) is owned by no `shared_ptr`, so its call carries no value. `return shared_from_this();` returns the object (`ReturnFlow::Copy`), and the copy is emitted wherever a call result lands, as for a promotion. A weak result carries the object into a later `.lock()` wherever the promotion is recognized.
+
+The call site itself is recorded as before, so the call edge to the external `shared_from_this`/`weak_from_this` remains.
+
+This is a may-alias relation. It does not check that a `shared_ptr` owns the object (calling `shared_from_this()` on an unowned object is undefined and not diagnosed), and expiry, ownership counts, the held class's constness and the C++17 availability of `weak_from_this` are not modeled.
+
 ### `dlsym` / `GetProcAddress`
 
 Built-in models treat `dlsym` / `dlvsym` / `GetProcAddress` as **symbol lookup**: the return destination of a call (the `CallSite.return_dst` of `f = dlsym(...)`, including `return dlsym(...)` via a temp) may point to every **in-tree** function whose exact name matches a string constant in the name argument (parameter 1). Out-of-tree names add no pointees (true external). The handle / DSO path is ignored. Lookup searches the caller’s link target and its incorporated dependencies when link metadata exists, otherwise the whole program. Dynamically loaded targets absent from that dependency closure are not modeled. Non-literal names that never receive a string constant stay unresolved — they do **not** fan out to every exported function.
@@ -3896,7 +3908,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   never `T`'s), and a pointer argument inside a wrapper (`sptr<Svc *>`)
   stays unknown, as do a template template parameter used as the wrapper
   (`Ptr<T>`) and a spelling with more than one argument list
-  (`Traits<T>::Ptr<U>`).
+  (`Traits<T>::Ptr<U>`). A cv-qualified parameter (`shared_ptr<const T>`,
+  `const T *`) substitutes as the parameter, its qualifier dropped: member
+  lookup does not need it, and const twins (`shared_ptr<T> Get()` beside
+  `shared_ptr<const T> Get() const`) then agree on one result.
   In-class prototypes of an overload set record their explicit parameter
   types (see below), so same-arity overloads (`T *Get(int)` beside
   `Decoy *Get(long)`) are two entries, each with its own return, and

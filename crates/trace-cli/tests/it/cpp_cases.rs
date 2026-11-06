@@ -10009,6 +10009,656 @@ fn smart_pointer_promotion_ignores_non_promotions() {
     ));
 }
 
+analyzed_fixture!(cpp_shared_from_this);
+
+/// The one variable `name` of the lambda inside `outer`.
+fn lambda_local(program: &Program, outer: &str, name: &str) -> trace_ir::VarId {
+    common::local_variable(program, &common::lambda_in(program, outer).name, name)
+}
+
+fn type_name(program: &Program, var: trace_ir::VarId) -> &str {
+    match program
+        .types
+        .get(program.symbols.variable(var).type_id)
+        .desc
+        .as_ref()
+    {
+        trace_ir::TypeDesc::Struct { name, .. } => name,
+        other => panic!("not a class type: {other:?}"),
+    }
+}
+
+#[test]
+fn shared_from_this_results_reach_the_holders_members() {
+    let (program, analysis) = cpp_shared_from_this();
+    let lambdas = [
+        "Manager::InitCapture",
+        "Manager::InitCaptureWeak",
+        "Manager::CaptureThis",
+    ]
+    .map(|outer| common::lambda_in(program, outer).name.as_str());
+    for caller in ["Manager::ViaShared", "Manager::ViaWeak", "Explicit"]
+        .into_iter()
+        .chain(lambdas)
+    {
+        assert!(
+            has_any_edge(program, analysis, caller, "Manager::Handle"),
+            "{caller} -> Manager::Handle"
+        );
+    }
+    for caller in ["Manager::ViaWeak", lambdas[1]] {
+        assert!(
+            has_any_edge(program, analysis, caller, "std::weak_ptr::lock"),
+            "{caller}: the weak result is promoted"
+        );
+    }
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Derived::Run",
+        "Derived::Notify"
+    ));
+    // The call itself is recorded as before.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Manager::ViaShared",
+        "std::enable_shared_from_this::shared_from_this"
+    ));
+}
+
+#[test]
+fn shared_from_this_results_are_the_holders_wrapper() {
+    let (program, _) = cpp_shared_from_this();
+    for (func, var, wrapper) in [
+        ("Manager::ViaShared", "self", "std::shared_ptr<Manager>"),
+        ("Manager::ViaWeak", "w", "std::weak_ptr<Manager>"),
+        ("Explicit", "via_arrow", "std::shared_ptr<Manager>"),
+        ("Explicit", "via_ref", "std::weak_ptr<Manager>"),
+        ("Derived::Run", "inherited", "std::shared_ptr<Base>"),
+    ] {
+        let var = common::local_variable(program, func, var);
+        assert_eq!(type_name(program, var), wrapper, "{func}");
+    }
+    for (outer, var, wrapper) in [
+        ("Manager::InitCapture", "self", "std::shared_ptr<Manager>"),
+        ("Manager::InitCaptureWeak", "w", "std::weak_ptr<Manager>"),
+    ] {
+        let var = lambda_local(program, outer, var);
+        assert_eq!(type_name(program, var), wrapper, "{outer}: init-capture");
+    }
+}
+
+#[test]
+fn shared_from_this_results_alias_the_object() {
+    let (program, _) = cpp_shared_from_this();
+    let local = |func, name| common::local_variable(program, func, name);
+    let this = |func| local(func, "this");
+    for (from, to) in [
+        (
+            this("Manager::ViaShared"),
+            local("Manager::ViaShared", "self"),
+        ),
+        (this("Manager::ViaWeak"), local("Manager::ViaWeak", "w")),
+        (
+            this("Manager::InitCapture"),
+            lambda_local(program, "Manager::InitCapture", "self"),
+        ),
+        (
+            this("Manager::InitCaptureWeak"),
+            lambda_local(program, "Manager::InitCaptureWeak", "w"),
+        ),
+        (local("Explicit", "p"), local("Explicit", "via_arrow")),
+        (local("Explicit", "r"), local("Explicit", "via_ref")),
+        (local("Explicit", "p"), local("Explicit", "via_deref")),
+    ] {
+        assert!(value_reaches(program, from, to), "{from:?} -> {to:?}");
+    }
+    let getter = common::only_function(program, "Manager::Self");
+    assert_eq!(
+        program.fn_returns[&getter],
+        [trace_ir::ReturnFlow::Copy {
+            src: this("Manager::Self")
+        }],
+        "`return shared_from_this();` returns the object"
+    );
+    let own = local("Impostor::Run", "own");
+    assert!(
+        !value_reaches(program, this("Impostor::Run"), own),
+        "a class not deriving from enable_shared_from_this keeps its own member"
+    );
+}
+
+/// The const-only stub: `shared_ptr<const T>` still names the holder.
+#[test]
+fn shared_from_this_const_overloads_alone_reach_the_holder() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"namespace std {
+template <class T> class shared_ptr { public: T *operator->() const; };
+template <class T> class weak_ptr { public: shared_ptr<T> lock(); };
+template <class T> class enable_shared_from_this {
+public:
+    shared_ptr<const T> shared_from_this() const;
+    weak_ptr<const T> weak_from_this() const noexcept;
+};
+}
+class Manager : public std::enable_shared_from_this<Manager> {
+public:
+    void Handle();
+    void ViaShared() { auto self = shared_from_this(); self->Handle(); }
+    void ViaWeak() { auto w = weak_from_this(); auto self = w.lock(); self->Handle(); }
+};
+void Manager::Handle() {}
+"#,
+    )]);
+    for caller in ["Manager::ViaShared", "Manager::ViaWeak"] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, "Manager::Handle"),
+            "{caller}"
+        );
+    }
+}
+
+/// A class hiding the inherited member keeps its own declaration's result.
+#[test]
+fn shared_from_this_hidden_by_a_derived_member_is_an_ordinary_call() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"namespace std {
+template <class T> class shared_ptr { public: T *operator->() const; };
+template <class T> class enable_shared_from_this {
+public:
+    shared_ptr<T> shared_from_this();
+};
+}
+class Base : public std::enable_shared_from_this<Base> {};
+class Derived : public Base {
+public:
+    std::shared_ptr<Derived> shared_from_this();
+    void Only();
+    void Run() { auto self = shared_from_this(); self->Only(); }
+};
+void Derived::Only() {}
+"#,
+    )]);
+    let self_var = common::local_variable(&program, "Derived::Run", "self");
+    assert_eq!(type_name(&program, self_var), "std::shared_ptr<Derived>");
+    for callee in ["Derived::shared_from_this", "Derived::Only"] {
+        assert!(
+            has_any_edge(&program, &analysis, "Derived::Run", callee),
+            "{callee}"
+        );
+    }
+}
+
+/// Members a library declares on an internal base of
+/// `enable_shared_from_this` are the standard ones, not a hiding override.
+#[test]
+fn shared_from_this_declared_on_an_internal_base_is_the_intrinsic() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"namespace std {
+template <class T> class shared_ptr { public: T *operator->() const; };
+template <class T> class weak_ptr { public: shared_ptr<T> lock(); };
+template <class T> class __enable_shared_from_this {
+public:
+    shared_ptr<T> shared_from_this();
+    shared_ptr<const T> shared_from_this() const;
+    weak_ptr<T> weak_from_this() noexcept;
+    weak_ptr<const T> weak_from_this() const noexcept;
+};
+template <class T> class enable_shared_from_this : public __enable_shared_from_this<T> {};
+}
+class Manager : public std::enable_shared_from_this<Manager> {
+public:
+    void Handle();
+    void Run() { auto self = shared_from_this(); self->Handle(); }
+};
+void Manager::Handle() {}
+"#,
+    )]);
+    let self_var = common::local_variable(&program, "Manager::Run", "self");
+    assert_eq!(type_name(&program, self_var), "std::shared_ptr<Manager>");
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "Manager::Run",
+        "Manager::Handle"
+    ));
+}
+
+const FROM_THIS_STUB: &str = r#"namespace std {
+template <class T> class shared_ptr { public: T *operator->() const; };
+template <class T> class weak_ptr { public: shared_ptr<T> lock(); };
+template <class T> class enable_shared_from_this {
+public:
+    shared_ptr<T> shared_from_this();
+    shared_ptr<const T> shared_from_this() const;
+    weak_ptr<T> weak_from_this() noexcept;
+    weak_ptr<const T> weak_from_this() const noexcept;
+};
+}
+struct Other { void OtherOnly(); };
+void Other::OtherOnly() {}
+"#;
+
+/// A bare name that finds something other than the inherited member is no
+/// intrinsic: an explicitly global function, a function the body imports,
+/// or a callable data member of a derived class.
+#[test]
+fn shared_from_this_names_hidden_from_the_member_are_not_the_intrinsic() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"std::shared_ptr<Other> shared_from_this();
+namespace factories { std::shared_ptr<Other> shared_from_this(); }
+struct Global : std::enable_shared_from_this<Global> {
+    void Run() { auto global = ::shared_from_this(); global->OtherOnly(); }
+};
+struct Imported : std::enable_shared_from_this<Imported> {
+    void Run() {
+        using factories::shared_from_this;
+        auto imported = shared_from_this();
+        imported->OtherOnly();
+    }
+};
+struct Base : std::enable_shared_from_this<Base> {};
+struct Field : Base {
+    std::shared_ptr<Other> (*shared_from_this)();
+    void Run() { auto field = shared_from_this(); auto arrow = this->shared_from_this(); }
+};
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for func in ["Global::Run", "Imported::Run"] {
+        assert!(
+            has_any_edge(&program, &analysis, func, "Other::OtherOnly"),
+            "{func}"
+        );
+    }
+    for (func, var) in [
+        ("Global::Run", "global"),
+        ("Imported::Run", "imported"),
+        ("Field::Run", "field"),
+        ("Field::Run", "arrow"),
+    ] {
+        let var_id = common::local_variable(&program, func, var);
+        assert!(
+            !value_reaches(
+                &program,
+                common::local_variable(&program, func, "this"),
+                var_id
+            ),
+            "{func}::{var} is not the object"
+        );
+        let ty = program.types.get(program.symbols.variable(var_id).type_id);
+        assert!(
+            !matches!(ty.desc.as_ref(), trace_ir::TypeDesc::Struct { name, .. } if name.contains("<Global>") || name.contains("<Imported>") || name.contains("<Base>")),
+            "{func}::{var} is not typed as the holder's wrapper: {:?}",
+            ty.desc
+        );
+    }
+}
+
+/// The held class from the receiver or base clause however it is spelled:
+/// the base itself as receiver, an omitted argument's default, a file-local
+/// holder template, and a base named through an alias of an instantiation.
+#[test]
+fn shared_from_this_held_class_through_base_defaults_anonymous_and_aliases() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> { void Handle(); };
+void M::Handle() {}
+void ViaBase(std::enable_shared_from_this<M> &r) { auto via_base = r.shared_from_this(); via_base->Handle(); }
+struct D;
+template <class Tag, class T = D> struct H : std::enable_shared_from_this<T> {};
+struct D : H<int> { void Handle(); };
+void D::Handle() {}
+struct N : H<int, N> { void Handle(); };
+void N::Handle() {}
+void ViaDefault(H<int> *p) { auto via_default = p->shared_from_this(); via_default->Handle(); }
+namespace {
+template <class T> struct Local : std::enable_shared_from_this<T> {};
+struct LM : Local<LM> { void Handle(); };
+void LM::Handle() {}
+struct LN : Local<LN> { void Handle(); };
+void LN::Handle() {}
+}
+void ViaLocal(Local<LM> *p) { auto via_local = p->shared_from_this(); via_local->Handle(); }
+template <class T> struct Holder : std::enable_shared_from_this<T> {};
+struct AM;
+using Mix = Holder<AM>;
+struct AM : Mix { void Handle(); void Run() { auto via_alias = shared_from_this(); via_alias->Handle(); } };
+void AM::Handle() {}
+struct AN : Holder<AN> { void Handle(); };
+void AN::Handle() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for (func, var, wrapper, handle, other) in [
+        (
+            "ViaBase",
+            "via_base",
+            "std::shared_ptr<M>",
+            "M::Handle",
+            None,
+        ),
+        (
+            "ViaDefault",
+            "via_default",
+            "std::shared_ptr<D>",
+            "D::Handle",
+            Some("N::Handle"),
+        ),
+        (
+            "ViaLocal",
+            "via_local",
+            "std::shared_ptr<LM>",
+            "LM::Handle",
+            Some("LN::Handle"),
+        ),
+        (
+            "AM::Run",
+            "via_alias",
+            "std::shared_ptr<AM>",
+            "AM::Handle",
+            Some("AN::Handle"),
+        ),
+    ] {
+        let var_id = common::local_variable(&program, func, var);
+        assert_eq!(type_name(&program, var_id), wrapper, "{func}::{var}");
+        assert!(
+            has_any_edge(&program, &analysis, func, handle),
+            "{func} -> {handle}"
+        );
+        if let Some(other) = other {
+            assert!(
+                must_not_have_edge(&program, &analysis, func, other),
+                "{func} -/-> {other}"
+            );
+        }
+    }
+}
+
+/// A member returning a cv-qualified parameter in a wrapper substitutes it,
+/// so const twins agree and a const-only member is typed (issue #264, root
+/// cause 2); and a holder chain inside a namespace binds the receiver's
+/// argument as a global one does.
+#[test]
+fn cv_qualified_template_returns_and_namespaced_holder_chains() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"template <class T> struct Box {
+    std::shared_ptr<T> Get();
+    std::shared_ptr<const T> Get() const;
+    std::shared_ptr<const T> Peek() const;
+};
+struct X { void F() const; };
+void X::F() const {}
+void Twins(Box<X> &b) { auto twin = b.Get(); twin->F(); }
+void ConstOnly(Box<X> &b) { auto peeked = b.Peek(); peeked->F(); }
+namespace app {
+template <class T> class Base : public std::enable_shared_from_this<T> {};
+template <class T> class Mid : public Base<T> {};
+}
+struct C : app::Mid<C> { void Handle(); };
+void C::Handle() {}
+struct E : app::Mid<E> { void Handle(); };
+void E::Handle() {}
+void ViaMid(app::Mid<C> *p) { auto mid = p->shared_from_this(); mid->Handle(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for (func, var, wrapper, callee) in [
+        ("Twins", "twin", "std::shared_ptr<X>", "X::F"),
+        ("ConstOnly", "peeked", "std::shared_ptr<X>", "X::F"),
+        ("ViaMid", "mid", "std::shared_ptr<C>", "C::Handle"),
+    ] {
+        let var_id = common::local_variable(&program, func, var);
+        assert_eq!(type_name(&program, var_id), wrapper, "{func}::{var}");
+        assert!(
+            has_any_edge(&program, &analysis, func, callee),
+            "{func} -> {callee}"
+        );
+    }
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "ViaMid",
+        "E::Handle"
+    ));
+}
+
+/// A member function hides a base data member of its name, so a callable
+/// field only hides what it is nearer than: `D::f()` keeps its declared
+/// result past `B::f`.
+#[test]
+fn member_function_hides_a_base_field_of_its_name() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"struct R { void G(); };
+void R::G() {}
+struct B { int f; };
+struct D : B {
+    R *f();
+    void Run() { auto nearer = f(); nearer->G(); }
+};
+void Use(D *p) { auto through = p->f(); through->G(); }
+"#,
+    )]);
+    for (func, var) in [("D::Run", "nearer"), ("Use", "through")] {
+        let var_id = common::local_variable(&program, func, var);
+        let desc = program
+            .types
+            .get(program.symbols.variable(var_id).type_id)
+            .desc
+            .as_ref();
+        assert!(
+            matches!(desc, trace_ir::TypeDesc::Ptr(inner) if matches!(inner.as_ref(), trace_ir::TypeDesc::Struct { name, .. } if name == "R")),
+            "{func}::{var}: {desc:?}"
+        );
+        assert!(
+            has_any_edge(&program, &analysis, func, "R::G"),
+            "{func} -> R::G"
+        );
+    }
+}
+
+/// With no `<memory>` and `enable_shared_from_this` reached through
+/// `using namespace std` (in a namespace too): a class-template holder, one
+/// level down or two, binds `C` from the class deriving from it or from the
+/// receiver's own instantiation (`Shared<M> *p`), a qualified call names the base's member past a hiding
+/// one (keeping its instantiation, `Shared<M>::`), and a reference-returning
+/// receiver or a reference member yields its referent.
+#[test]
+fn shared_from_this_through_templates_qualifiers_and_references() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"using namespace std;
+template <class T> class Shared : public enable_shared_from_this<T> {};
+template <class U> class Layer : public Shared<U> {};
+class M : public Shared<M> {
+public:
+    void MOnly();
+    void Run() { auto crtp = shared_from_this(); crtp->MOnly(); }
+    void Qualified() { auto instance_qualified = Shared<M>::shared_from_this(); }
+};
+struct Peer {
+    M &m_peer;
+    void ViaRefMember() { auto member_ref = m_peer.shared_from_this(); member_ref->MOnly(); }
+};
+class Deep : public Layer<Deep> {
+public:
+    void DeepOnly();
+    void Run() { auto layered = shared_from_this(); layered->DeepOnly(); }
+};
+namespace app {
+using namespace std;
+class Scoped : public enable_shared_from_this<Scoped> {
+public:
+    void Run() { auto scoped = shared_from_this(); }
+};
+}
+class Base : public enable_shared_from_this<Base> {
+public:
+    void BaseOnly();
+};
+class Derived : public Base {
+public:
+    shared_ptr<Derived> shared_from_this();
+    void Use() {
+        auto qualified = Base::shared_from_this();
+        qualified->BaseOnly();
+        auto own = this->enable_shared_from_this<Base>::shared_from_this();
+        own->BaseOnly();
+    }
+};
+M *gm;
+M &GetM() { return *gm; }
+void FromRef() { auto referent = GetM().shared_from_this(); referent->MOnly(); }
+void M::MOnly() {}
+void Deep::DeepOnly() {}
+void Base::BaseOnly() {}
+void ViaHolder(Shared<M> *p, Shared<M> &r, Layer<Deep> *l) {
+    auto holder_ptr = p->shared_from_this();
+    holder_ptr->MOnly();
+    auto holder_ref = r.weak_from_this();
+    auto holder_strong = holder_ref.lock();
+    holder_strong->MOnly();
+    auto layer_ptr = l->shared_from_this();
+}
+"#,
+    )]);
+    let local = |func, name| common::local_variable(&program, func, name);
+    for (func, var, wrapper) in [
+        ("M::Run", "crtp", "std::shared_ptr<M>"),
+        ("Deep::Run", "layered", "std::shared_ptr<Deep>"),
+        ("app::Scoped::Run", "scoped", "std::shared_ptr<app::Scoped>"),
+        ("Derived::Use", "qualified", "std::shared_ptr<Base>"),
+        ("Derived::Use", "own", "std::shared_ptr<Base>"),
+        ("FromRef", "referent", "std::shared_ptr<M>"),
+        ("ViaHolder", "holder_ptr", "std::shared_ptr<M>"),
+        ("ViaHolder", "holder_ref", "std::weak_ptr<M>"),
+        ("ViaHolder", "holder_strong", "std::shared_ptr<M>"),
+        ("ViaHolder", "layer_ptr", "std::shared_ptr<Deep>"),
+        ("M::Qualified", "instance_qualified", "std::shared_ptr<M>"),
+        ("Peer::ViaRefMember", "member_ref", "std::shared_ptr<M>"),
+    ] {
+        assert_eq!(
+            type_name(&program, local(func, var)),
+            wrapper,
+            "{func}::{var}"
+        );
+    }
+    for (caller, callee) in [
+        ("M::Run", "M::MOnly"),
+        ("Deep::Run", "Deep::DeepOnly"),
+        ("Derived::Use", "Base::BaseOnly"),
+        ("FromRef", "M::MOnly"),
+    ] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    for var in ["qualified", "own"] {
+        assert!(value_reaches(
+            &program,
+            local("Derived::Use", "this"),
+            local("Derived::Use", var)
+        ));
+    }
+    assert!(
+        value_reaches(
+            &program,
+            local("Peer::ViaRefMember", "this"),
+            local("Peer::ViaRefMember", "member_ref")
+        ),
+        "a reference member's referent"
+    );
+    let returned = flows_in(&program, "FromRef")
+        .find_map(|flow| match flow {
+            trace_ir::FlowConstraint::CallReturn {
+                dst, callee_name, ..
+            } if callee_name == "GetM" => Some(*dst),
+            _ => None,
+        })
+        .expect("GetM()'s result is received");
+    assert!(
+        value_reaches(&program, returned, local("FromRef", "referent")),
+        "the referent GetM() returns"
+    );
+}
+
+/// A holder whose arguments its receivers keep (`NapiInfoCallback<Info>`)
+/// is still the class an alias of an instantiation names: a specialized
+/// out-of-line member through the alias is the template's own, and reaches
+/// the members it inherits.
+#[test]
+fn shared_from_this_holder_alias_keeps_out_of_line_members() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"namespace std { template <class T> class enable_shared_from_this; }
+struct ListenerBase { void ExecuteCallback(); };
+void ListenerBase::ExecuteCallback() {}
+template <class T>
+class Callback : public ListenerBase, public std::enable_shared_from_this<Callback<T>> {
+public:
+    void Send() { auto self = this->weak_from_this(); auto cb = self.lock(); cb->Format(); }
+    void Format() const;
+};
+struct Info {};
+using InfoCallback = Callback<Info>;
+template <> void InfoCallback::Format() const { ExecuteCallback(); }
+"#,
+    )]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "Callback::Format",
+        "ListenerBase::ExecuteCallback"
+    ));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "InfoCallback::Format",
+        "ExecuteCallback"
+    ));
+}
+
+/// Without `<memory>`'s bodies, an out-of-line member's weak result reaches
+/// the promoted strong pointer: `this` flows through `.lock()`.
+#[test]
+fn shared_from_this_without_standard_bodies_flows_through_lock() {
+    let (program, analysis) = common::analyze_source(
+        &[
+            (
+                "manager.h",
+                "namespace std {\ntemplate <class T> class weak_ptr;\ntemplate <class T> class enable_shared_from_this;\n}\nnamespace ns {\nclass Manager : public std::enable_shared_from_this<Manager> {\npublic:\n    void Handle();\n    void Schedule();\n};\n}\n",
+            ),
+            (
+                "manager.cpp",
+                "#include \"manager.h\"\nnamespace ns {\nvoid Manager::Handle() {}\nvoid Manager::Schedule() {\n    auto task = [weak = weak_from_this()]() {\n        auto strong = weak.lock();\n        strong->Handle();\n    };\n    task();\n}\n}\n",
+            ),
+        ],
+    );
+    let lambda = common::lambda_in(&program, "ns::Manager::Schedule")
+        .name
+        .clone();
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        &lambda,
+        "ns::Manager::Handle"
+    ));
+    let this = common::local_variable(&program, "ns::Manager::Schedule", "this");
+    let strong = common::local_variable(&program, &lambda, "strong");
+    assert!(
+        value_reaches(&program, this, strong),
+        "this -> weak -> strong"
+    );
+}
+
 /// The source of the one receiver copy into `result` in `func`.
 fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
     let result = common::local_variable(program, func, result);

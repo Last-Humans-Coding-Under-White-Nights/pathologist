@@ -321,7 +321,7 @@ impl<'p> Members<'p> {
 
 /// Which class templates a lookup sees.
 #[derive(Clone, Copy)]
-enum Templates<'u> {
+pub(crate) enum Templates<'u> {
     /// While lowering a class defined in `file` of a translation unit whose
     /// files are `unit` (sorted): a file-local (anonymous-namespace) template
     /// is visible to its whole unit, so the class's own file's template of
@@ -340,10 +340,6 @@ enum Templates<'u> {
 /// following dependent template bases with their arguments substituted.
 /// Arguments as written resolve in `scope`, the derived class's declaration
 /// scope; defaults were qualified in the template's.
-///
-/// Breadth first, so each instantiation is first reached, and expanded once,
-/// at its least depth: a self-referential template stops, and one reached
-/// deep first is still expanded from a shallower path.
 fn parameter_bases(
     program: &Program,
     spelling: &str,
@@ -351,6 +347,59 @@ fn parameter_bases(
     templates: Templates<'_>,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    walk_dependent_bases(
+        program,
+        spelling,
+        scope,
+        templates,
+        |base, parameters, substituted| {
+            if names_parameter(base, parameters) {
+                // `: public I` or `: public B<T>` — the argument, instantiated
+                // where the base is a template template parameter, is the base.
+                let name = sanitize_type_name(substituted);
+                if let Some(class) = held_class_in_declaration_scope(program, scope, &name) {
+                    let class = receiver_lookup_name(&class).into_owned();
+                    if !out.contains(&class) {
+                        out.push(class);
+                    }
+                }
+            }
+        },
+    );
+    out
+}
+
+/// Every base `spelling`'s template reaches through its dependent bases,
+/// with the arguments substituted (`std::enable_shared_from_this<M>` for
+/// `Shared<M>`, `template <class T> Shared : enable_shared_from_this<T>`),
+/// breadth first: omitted arguments take their defaults, a pack expands, and
+/// `templates` says which file-local templates are seen. Arguments as written
+/// resolve in `scope`.
+pub(crate) fn substituted_bases(
+    program: &Program,
+    spelling: &str,
+    scope: &str,
+    templates: Templates<'_>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_dependent_bases(program, spelling, scope, templates, |_, _, substituted| {
+        out.push(substituted.to_owned());
+    });
+    out
+}
+
+/// Visit `(base as declared, the template's parameters, base substituted)`
+/// for every dependent base `spelling`'s template reaches, breadth first, so
+/// each instantiation is first reached, and expanded once, at its least
+/// depth: a self-referential template stops, and one reached deep first is
+/// still expanded from a shallower path.
+fn walk_dependent_bases(
+    program: &Program,
+    spelling: &str,
+    scope: &str,
+    templates: Templates<'_>,
+    mut visit: impl FnMut(&str, &[Option<String>], &str),
+) {
     let mut reached = HashSet::from([spelling.to_owned()]);
     let mut pending = VecDeque::from([(spelling.to_owned(), 0)]);
     while let Some((spelling, depth)) = pending.pop_front() {
@@ -365,18 +414,7 @@ fn parameter_bases(
                 else {
                     continue;
                 };
-                if names_parameter(base, &template.parameters) {
-                    // `: public I` or `: public B<T>` — the argument,
-                    // instantiated where the base is a template template
-                    // parameter, is the base.
-                    let name = sanitize_type_name(&substituted);
-                    if let Some(class) = held_class_in_declaration_scope(program, scope, &name) {
-                        let class = receiver_lookup_name(&class).into_owned();
-                        if !out.contains(&class) {
-                            out.push(class);
-                        }
-                    }
-                }
+                visit(base, &template.parameters, &substituted);
                 if substituted.contains('<')
                     && depth + 1 < MAX_TEMPLATE_BASE_DEPTH
                     && reached.insert(substituted.clone())
@@ -386,7 +424,6 @@ fn parameter_bases(
             }
         }
     }
-    out
 }
 
 /// Whether `base`'s class is itself a parameter (`I`, or `B` in `B<T>`).
@@ -399,7 +436,7 @@ fn names_parameter(base: &str, parameters: &[Option<String>]) -> bool {
 
 /// The class template `spelling` instantiates: by the name lowering recorded,
 /// else as `scope` sees it (`Outer<A>::In<B>` is recorded as written).
-fn class_template<'p>(
+pub(crate) fn class_template<'p>(
     program: &'p Program,
     spelling: &str,
     scope: &str,

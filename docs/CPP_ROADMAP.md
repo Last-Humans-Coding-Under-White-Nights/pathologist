@@ -160,7 +160,11 @@ are `invoke` models; the list and its imprecision are in
 submitted lambda (`FaultLogDatabase::SaveFaultLogInfo`, the
 `PassthroughMonitor` handlers) now has an edge **from the submitter**
 ([EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
-`std::bind` (e.g. `base/plugin.cpp:93`), `packaged_task` and lambda captures remain.
+Lambda captures bind the enclosing scope (`docs/ANALYSIS.md`, "C++ support
+(first step)"), and `[callback = shared_from_this()]` captures the object
+itself, typed as its `shared_ptr` (`docs/ANALYSIS.md`, "`shared_from_this`"),
+so `uc_telemetry_callback.cpp:187` reaches `RunTraceOnTimeTask`.
+`std::bind` (e.g. `base/plugin.cpp:93`) and `packaged_task` remain.
 
 **Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy`;
 `EventLoop::ProcessEvent` packaged path reaches `EventHandler::OnEventProxy`.

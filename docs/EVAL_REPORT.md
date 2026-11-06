@@ -1,5 +1,59 @@
 # Evaluation Report
 
+## `enable_shared_from_this` results: #264 — 2026-11-06
+
+`shared_from_this()` and `weak_from_this()` are typed as the deriving
+class's `shared_ptr` / `weak_ptr` and alias the object
+([`shared_from_this`](ANALYSIS.md#shared_from_this)), so a callback that
+captures the object (`auto self = shared_from_this(); [self] { self->F(); }`,
+`[weak = weak_from_this()] { weak.lock()->F(); }`) reaches its handler. On
+the pinned corpora only edges are added; none is removed. "Before" is the
+parent commit (`d48a899`) analyzed on the same checkouts, so the deltas are
+this change's alone; the previously pinned centers had drifted a few edges
+from it (hiview `edges_direct` 23319, camera `edges_total` 116135), within
+tolerance.
+
+| Corpus | Count | Before | After |
+|--------|-------|-------:|------:|
+| hiview | `edges_total` | 39299 | 39315 |
+| hiview | `edges_direct` | 23321 | 23332 |
+| hiview | `edges_external` | 15688 | 15693 |
+| hiview | `arg_flow_edges` | 32049 | 32058 |
+| camera | `edges_total` | 116137 | 116253 |
+| camera | `edges_direct` | 68820 | 68918 |
+| camera | `edges_external` | 46067 | 46085 |
+| camera | `arg_flow_edges` | 57894 | 58048 |
+
+- hiview: `uc_telemetry_callback.cpp:187`
+  `[callback = shared_from_this()] { callback->RunTraceOnTimeTask(); }` (the
+  `docs/CPP_ROADMAP.md` C4 case, now a probe) and the lambdas in
+  `ListenerStatusMonitor::InitReportTask`, `TraceAsyncStrategy::DumpTrace`,
+  `TraceZipHandler::HandleTrace`, `EventDispatchQueue::Enqueue` and
+  `DynamicLibraryHandle::HoldDynamicLibraryForSomeTime` reach their
+  handlers.
+- camera: 105 of the 116 added edges leave a lambda. 73 are the taihe listeners'
+  `sharePtr->ExecuteAsyncCallback` / `ExecuteErrorCallback` /
+  `ExecuteCallback` (e.g. `camera_manager_taihe.cpp:191`, `auto sharePtr =
+  shared_from_this();`); the rest are timer and task bodies such as
+  `PhotoTrailingState::StartTrailing` (`thisPtr.lock()->OnTimerOut()`) and
+  the moving-photo filters.
+- camera, the other 11: a holder template whose instantiations keep their
+  arguments is still the class an alias of one names
+  (`using UnifiedPiplineProcessNodeDefault = UnifiedPiplineProcessNode<...>`).
+  `MockUnifiedPiplineProcessNode`, deriving from that alias in
+  `camera_common_pipeline_unittest.cpp`, now reaches its base's
+  constructor from the tests that build it (10 edges), and
+  `NodeBaseProcessBuffer` dispatches to the mock's `ProcessBuffer`. The
+  same rule keeps the specialized out-of-line
+  `StitchingTargetInfoCallbackListener::ToNapiFormat` (an alias of
+  `NapiInfoCallback<StitchingTargetInfo>`) on `NapiInfoCallback`.
+
+HDF is unchanged. Indirect, IPC and dlsym edges and diagnostics are
+unchanged on all three. With GCC 15's libstdc++ indexed
+(`--system-includes`), the results are typed, but `->` on a
+`std::shared_ptr` resolves no member there in general, whether or not the
+pointer comes from `shared_from_this`; that is not changed here.
+
 ## Owning-pointer `get()` aliases — 2026-10-31
 
 Issue #247: accessing a callback through `p.get()->callback` lost the

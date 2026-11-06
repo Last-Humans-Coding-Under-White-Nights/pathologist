@@ -247,6 +247,9 @@ struct LowerContext {
     /// function asked about) names that function, once resolved
     /// ([`bare_names_std`]).
     bare_std_calls: RefCell<HashMap<(usize, &'static str), bool>>,
+    /// The result type of a `shared_from_this()` / `weak_from_this()` call,
+    /// by node id, once decided ([`from_this_call`]).
+    from_this_results: RefCell<HashMap<usize, TypeDesc>>,
     /// The heap object factory calls in a function build a class on
     /// ([`factory_object`]).
     factory_objects: RefCell<HashMap<(FnId, String), VarId>>,
@@ -3967,6 +3970,7 @@ fn lower_prepared_source(
         call_receiver_cache: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
         bare_std_calls: RefCell::new(HashMap::default()),
+        from_this_results: RefCell::new(HashMap::default()),
         factory_objects: RefCell::new(HashMap::default()),
         ast_depth: 0,
         ast_depth_warned: false,
@@ -4018,6 +4022,7 @@ fn lower_prepared_source(
     ctx.call_receiver_cache.borrow_mut().clear();
     ctx.call_return_dst.borrow_mut().clear();
     ctx.bare_std_calls.borrow_mut().clear();
+    ctx.from_this_results.borrow_mut().clear();
     ctx.factory_objects.borrow_mut().clear();
     ctx.local_scope_log.clear();
 
@@ -5116,22 +5121,7 @@ fn lower_struct_specifier(
         // class's file and unit say which file-local templates it sees.
         if !concrete_template_bases.is_empty() {
             let file = anonymous_in.unwrap_or_else(|| node_span(program, ctx, node).file);
-            let unit = if program.anonymous_class_templates.is_empty() {
-                &[][..]
-            } else {
-                ctx.unit_files.get_or_init(|| {
-                    let mut files: Vec<_> = std::iter::once(ctx.current_file)
-                        .chain(
-                            ctx.included_headers
-                                .iter()
-                                .filter_map(|h| program.symbols.file_by_path(h)),
-                        )
-                        .collect();
-                    files.sort_unstable();
-                    files.dedup();
-                    files
-                })
-            };
+            let unit = unit_files(program, ctx);
             for (spelling, declaration_scope) in concrete_template_bases {
                 crate::template_bases::add_parameter_bases(
                     program,
@@ -7507,6 +7497,9 @@ fn call_result_shape(
             Spelling::Lowered,
         )));
     }
+    if let Some(from_this) = from_this_call(program, ctx, source, value) {
+        return Some(CallResult::Decided(Some(from_this.result)));
+    }
     if let Some(extraction) = pointer_extraction(program, ctx, source, value) {
         return Some(CallResult::Decided(Some(extraction.result)));
     }
@@ -7541,11 +7534,12 @@ fn call_result_shape(
         } else {
             class_spelling_of_desc(&desc)?.to_string()
         };
-        let members = declared_members_upward(
-            program,
-            &receiver_lookup_name(&receiver),
-            &trace_ir::MethodKind::Named(strip_template_args(&field)),
-        );
+        let cls = receiver_lookup_name(&receiver);
+        let name = strip_template_args(&field);
+        if member_is_hidden_by_field(program, ctx, &cls, &name) {
+            return None;
+        }
+        let members = declared_members_upward(program, &cls, &trace_ir::MethodKind::Named(name));
         (Overloads::Declared(members), Some(receiver))
     } else {
         let (name, _, var) = resolve_callee(program, ctx, source, func);
@@ -7556,13 +7550,10 @@ fn call_result_shape(
         // just as it does for collect_call_at_node, unless shadowed by a
         // function-local using declaration.
         let members = match &ctx.class_ctx {
-            Some(cc)
-                if is_bare_callee_node(func, &name)
-                    && !ctx
-                        .using_name_imports
-                        .iter()
-                        .any(|u| u.base == name && u.scope == ImportScope::Body) =>
-            {
+            Some(cc) if is_bare_callee_node(func, &name) && !imported_in_body(ctx, &name) => {
+                if member_is_hidden_by_field(program, ctx, &cc.qual_name, &name) {
+                    return None;
+                }
                 declared_members_upward(
                     program,
                     &cc.qual_name,
@@ -8317,21 +8308,432 @@ fn weak_promotion<'t>(
     })
 }
 
-/// For a weak-pointer promotion `call`, the variable holding its receiver's
-/// value: the strong result may alias it (docs/ANALYSIS.md, "Weak-pointer
-/// promotion"). Every call-result site asks before resolving a callee.
+/// For a weak-pointer promotion or a [`from_this_call`], the variable holding
+/// the value the result may alias: the weak pointer's (docs/ANALYSIS.md,
+/// "Weak-pointer promotion") or the object's address ("`shared_from_this`").
+/// Every call-result site asks before resolving a callee.
 fn promoted_receiver_value(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
     call: Node,
 ) -> Option<VarId> {
-    let promotion = weak_promotion(program, ctx, source, call)?;
+    match weak_promotion(program, ctx, source, call) {
+        Some(promotion) => promotion_value(program, ctx, source, promotion),
+        None => from_this_value(program, ctx, source, call),
+    }
+}
+
+/// The weak pointer's value for a recognized [`weak_promotion`].
+fn promotion_value(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    promotion: WeakPromotion,
+) -> Option<VarId> {
     let weak = program
         .types
         .class_type_id(&promotion.weak)
         .unwrap_or_else(|| program.types.unknown());
     receiver_value(program, ctx, source, promotion.receiver, weak)
+}
+
+/// `std::enable_shared_from_this` members that yield the object itself, and
+/// the wrapper each yields it in.
+const FROM_THIS_WRAPPERS: &[(&str, &str)] = &[
+    ("shared_from_this", "shared_ptr"),
+    ("weak_from_this", "weak_ptr"),
+];
+
+/// The class whose members [`from_this_call`] recognizes.
+const ENABLE_SHARED_FROM_THIS: &str = "enable_shared_from_this";
+
+/// The object a `from_this` call is made on.
+#[derive(Clone, Copy)]
+enum FromThisReceiver<'t> {
+    /// The implicit `this` of a member body.
+    This,
+    /// `p->shared_from_this()`.
+    Arrow(Node<'t>),
+    /// `r.shared_from_this()`.
+    Dot(Node<'t>),
+}
+
+/// A recognized `shared_from_this()` / `weak_from_this()`: a zero-argument
+/// call on an object whose class derives from `enable_shared_from_this`.
+struct FromThis<'t> {
+    receiver: FromThisReceiver<'t>,
+    /// `std::shared_ptr<C>` / `std::weak_ptr<C>`, `C` the class
+    /// `enable_shared_from_this<C>` names.
+    result: TypeDesc,
+}
+
+/// The one place `from_this` calls are recognized, for result typing
+/// ([`call_result_shape`]) and for value flow ([`from_this_value`]). The
+/// declared overloads are not consulted: the standard's const twins disagree
+/// on the result, and `<memory>` need not be in the tree (docs/ANALYSIS.md,
+/// "`shared_from_this`"). Every call-result site asks of the same call, so
+/// the result is decided once per call node.
+fn from_this_call<'t>(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node<'t>,
+) -> Option<FromThis<'t>> {
+    let call = peel_expression(call);
+    if !ctx.is_cpp || call.cached_kind() != "call_expression" {
+        return None;
+    }
+    let func = call.cached_field("function")?;
+    let (name, receiver) = match func.cached_kind() {
+        "identifier" | "qualified_identifier" => (func, FromThisReceiver::This),
+        "field_expression" => {
+            let recv = func.cached_field("argument")?;
+            let receiver = if is_arrow_access(func) {
+                FromThisReceiver::Arrow(recv)
+            } else {
+                FromThisReceiver::Dot(recv)
+            };
+            (func.cached_field("field")?, receiver)
+        }
+        _ => return None,
+    };
+    // The method name settles almost every call before anything allocates
+    // or the receiver is typed.
+    let spelled = node_text(source, &name);
+    if !FROM_THIS_WRAPPERS
+        .iter()
+        .any(|(method, _)| spelled.ends_with(method))
+    {
+        return None;
+    }
+    // The qualifier keeps its arguments (`Shared<M>::shared_from_this()`).
+    let spelled = normalize_spacing(spelled);
+    let (qualifier, method) = spelled.rsplit_once("::").unwrap_or(("", &spelled));
+    // `::shared_from_this()` names a free function, never the member.
+    if qualifier.is_empty() && spelled.starts_with("::") {
+        return None;
+    }
+    let &(method, wrapper) = FROM_THIS_WRAPPERS.iter().find(|(m, _)| *m == method)?;
+    if !call_arg_nodes(call).is_empty() {
+        return None;
+    }
+    // Only a decided result is kept: a miss may be settled by facts a later
+    // query sees, as `call_receiver_cache` keeps hits only.
+    let known = ctx.from_this_results.borrow().get(&call.id()).cloned();
+    let result = match known {
+        Some(result) => result,
+        None => {
+            let result =
+                from_this_result(program, ctx, source, receiver, qualifier, method, wrapper)?;
+            ctx.from_this_results
+                .borrow_mut()
+                .insert(call.id(), result.clone());
+            result
+        }
+    };
+    Some(FromThis { receiver, result })
+}
+
+/// [`from_this_call`]'s result for `method` on `receiver`, called through
+/// `qualifier` (empty when unqualified).
+fn from_this_result(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    receiver: FromThisReceiver,
+    qualifier: &str,
+    method: &str,
+    wrapper: &str,
+) -> Option<TypeDesc> {
+    // `Base::shared_from_this()` names the member `Base` sees, past one the
+    // receiver's class declares; `enable_shared_from_this<C>::` the base's own.
+    let raw_qualifier = qualifier;
+    let qualifier = receiver_lookup_name(qualifier);
+    let names_base = last_type_segment(&qualifier) == ENABLE_SHARED_FROM_THIS;
+    // The receiver's class, and its instantiation as the call site spells it
+    // (`Shared<M>` for `Shared<M> *p`), whose arguments a class template's
+    // dependent base is substituted with.
+    let (start, instance) = if qualifier.is_empty() || names_base {
+        match receiver {
+            FromThisReceiver::This => {
+                // A local, or a function imported into the body, the bare
+                // name finds first is no member.
+                if qualifier.is_empty()
+                    && (lookup_var(ctx, program, method).is_some() || imported_in_body(ctx, method))
+                {
+                    return None;
+                }
+                (ctx.class_ctx.as_ref()?.qual_name.clone(), None)
+            }
+            FromThisReceiver::Arrow(recv) | FromThisReceiver::Dot(recv) => {
+                let arrow = matches!(receiver, FromThisReceiver::Arrow(_));
+                let class = member_receiver_class(program, ctx, source, recv, arrow)?;
+                let instance = receiver_desc(program, ctx, source, recv)
+                    .and_then(|desc| match arrow {
+                        true => resolve_operator_arrow_receiver(program, desc),
+                        false => class_spelling_of_desc(&desc).map(str::to_owned),
+                    })
+                    .filter(|spelled| receiver_lookup_name(spelled) == class);
+                (class, instance)
+            }
+        }
+    } else {
+        let instance = raw_qualifier
+            .contains('<')
+            .then(|| raw_qualifier.to_owned());
+        (class_seen_from(program, ctx, &qualifier)?, instance)
+    };
+    // The receiver may be the base itself (`enable_shared_from_this<M> &r`).
+    let (holder, base) = if last_type_segment(&start) == ENABLE_SHARED_FROM_THIS {
+        (start.clone(), start.clone())
+    } else {
+        program
+            .ancestor_closure(&start)
+            .into_iter()
+            .find_map(|(cls, _)| {
+                program
+                    .base_names(cls)
+                    .find(|base| last_type_segment(base) == ENABLE_SHARED_FROM_THIS)
+                    .map(|base| (cls.to_owned(), base.to_owned()))
+            })?
+    };
+    if !names_base && start != base && hides_from_this(program, ctx, &start, &base, method) {
+        return None;
+    }
+    let held = match from_this_held_class(program, ctx, &start, instance.as_deref()) {
+        Some(held) => held,
+        // The base itself names no class without its argument.
+        None if start == base => return None,
+        None => holder,
+    };
+    // An `enable_shared_from_this` with no declaration in the tree is the
+    // standard one, however the base clause reached it.
+    let scope = match program.types.declared_class(&base) {
+        Some(_) => &base[..base.len() - ENABLE_SHARED_FROM_THIS.len()],
+        None => "std::",
+    };
+    Some(TypeDesc::Struct {
+        name: format!("{scope}{wrapper}<{held}>"),
+        fields: Vec::new(),
+    })
+}
+
+/// Whether member lookup of `method` from `start` finds something other than
+/// the `enable_shared_from_this` member `base` declares: a function that
+/// hides it (`shared_ptr<Derived> shared_from_this()` casting the base's
+/// result) or a callable data member of that name. The base's own
+/// declaration, or one on a class it derives from (an internal base a
+/// library may declare the members on), is the standard member.
+fn hides_from_this(
+    program: &Program,
+    ctx: &LowerContext,
+    start: &str,
+    base: &str,
+    method: &str,
+) -> bool {
+    if member_is_hidden_by_field(program, ctx, start, method) {
+        return true;
+    }
+    let declared = declared_members_upward(
+        program,
+        start,
+        &trace_ir::MethodKind::Named(method.to_owned()),
+    );
+    declared.first().is_some_and(|&id| {
+        let name = &program.symbols.function(id).name;
+        name.rsplit_once("::").is_none_or(|(cls, _)| {
+            last_type_segment(cls) != ENABLE_SHARED_FROM_THIS
+                && cls != base
+                && !program.derives_from(base, cls)
+        })
+    })
+}
+
+/// The class `C` of the `enable_shared_from_this<C>` that `class` inherits. A receiver spelled as an instantiation (`instance`) gives it
+/// first, its arguments named from the call's scope as any receiver
+/// spelling's are: its own argument when it is the base
+/// (`enable_shared_from_this<M> &r`), else the one its template's
+/// dependent bases substitute (`Shared<M> *p`). Otherwise a base clause of
+/// `class` or of a class it derives from gives it, written there
+/// (`M : enable_shared_from_this<M>`) or substituted through it
+/// (`M : Shared<M>`). Substitution is [`template_bases::substituted_bases`]:
+/// defaults, packs and file-local templates included.
+fn from_this_held_class(
+    program: &Program,
+    ctx: &LowerContext,
+    class: &str,
+    instance: Option<&str>,
+) -> Option<String> {
+    let templates = unit_templates(program, ctx);
+    let reached = |spelling: &str, scope: &str| {
+        if last_type_segment(&receiver_lookup_name(spelling)) == ENABLE_SHARED_FROM_THIS {
+            return Some(spelling.to_owned());
+        }
+        crate::template_bases::substituted_bases(program, spelling, scope, templates)
+            .into_iter()
+            .find(|base| last_type_segment(&receiver_lookup_name(base)) == ENABLE_SHARED_FROM_THIS)
+    };
+    let held_argument = |spelling: &str| -> Option<String> {
+        let [arg]: [String; 1] = template_arguments(spelling).try_into().ok()?;
+        Some(arg)
+    };
+    if let Some(instance) = instance.filter(|i| i.contains('<')) {
+        if let Some(spelling) = reached(instance, &ctx.namespace_scope()) {
+            return held_class(program, ctx, &held_argument(&spelling)?);
+        }
+    }
+    program
+        .ancestor_closure(class)
+        .into_iter()
+        .find_map(|(cls, _)| {
+            program
+                .template_bases_of(cls)
+                .into_iter()
+                .filter(|fact| !fact.is_dependent)
+                .find_map(|fact| {
+                    let spelling = reached(&fact.spelling, &fact.declaration_scope)?;
+                    held_class_in_declaration_scope(
+                        program,
+                        &fact.declaration_scope,
+                        &held_argument(&spelling)?,
+                    )
+                })
+        })
+}
+
+/// Whether `cls` is `enable_shared_from_this`, or a class template that
+/// reaches it through a base mentioning its parameters
+/// (`Shared<T> : enable_shared_from_this<T>`, `Layer<U> : Shared<U>`): its
+/// arguments then decide a [`from_this_call`]'s result, so a spelling of it
+/// keeps them (`Shared<M> *p`).
+fn template_reaches_from_this(program: &Program, ctx: &LowerContext, cls: &str) -> bool {
+    if last_type_segment(cls) == ENABLE_SHARED_FROM_THIS {
+        return true;
+    }
+    if program.class_templates.is_empty() && program.anonymous_class_templates.is_empty() {
+        return false;
+    }
+    let templates = unit_templates(program, ctx);
+    let mut pending = vec![(Cow::Borrowed(cls), 0)];
+    while let Some((name, depth)) = pending.pop() {
+        let Some(template) = crate::template_bases::class_template(program, &name, "", templates)
+        else {
+            continue;
+        };
+        for base in &template.dependent_bases {
+            let head = receiver_lookup_name(base);
+            if last_type_segment(&head) == ENABLE_SHARED_FROM_THIS {
+                return true;
+            }
+            if depth < MAX_FROM_THIS_BASE_DEPTH {
+                pending.push((Cow::Owned(head.into_owned()), depth + 1));
+            }
+        }
+    }
+    false
+}
+
+/// Nesting depth [`template_reaches_from_this`] follows through bases.
+const MAX_FROM_THIS_BASE_DEPTH: usize = 8;
+
+/// The class templates this unit sees: file-local ones of its own files
+/// first, then linked ones ([`template_bases::Templates::Unit`]).
+fn unit_templates<'c>(
+    program: &Program,
+    ctx: &'c LowerContext,
+) -> crate::template_bases::Templates<'c> {
+    crate::template_bases::Templates::Unit {
+        file: ctx.current_file,
+        unit: unit_files(program, ctx),
+    }
+}
+
+/// The sorted files of the unit being lowered (its `#include` closure),
+/// which file-local templates it sees. Empty while no file-local template
+/// is known, as nothing then needs them.
+fn unit_files<'c>(program: &Program, ctx: &'c LowerContext) -> &'c [trace_ir::FileId] {
+    if program.anonymous_class_templates.is_empty() {
+        return &[];
+    }
+    ctx.unit_files.get_or_init(|| {
+        let mut files: Vec<_> = std::iter::once(ctx.current_file)
+            .chain(
+                ctx.included_headers
+                    .iter()
+                    .filter_map(|h| program.symbols.file_by_path(h)),
+            )
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
+    })
+}
+
+/// Whether a function-local `using` declaration imports `name` into the
+/// body, hiding a member of that name.
+fn imported_in_body(ctx: &LowerContext, name: &str) -> bool {
+    ctx.using_name_imports
+        .iter()
+        .any(|u| u.base == name && u.scope == ImportScope::Body)
+}
+
+/// For a [`from_this_call`], the variable holding the object's address,
+/// which the result aliases: the implicit or explicit `this`, the pointer an
+/// arrow or `*p` reads through, a reference binding's referent, or what a
+/// call returning a reference names. A by-value object is not owned by any
+/// `shared_ptr`, so its call yields nothing.
+fn from_this_value(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    call: Node,
+) -> Option<VarId> {
+    let pointer = match from_this_call(program, ctx, source, call)?.receiver {
+        FromThisReceiver::This => return ctx.locals.get("this").copied(),
+        FromThisReceiver::Arrow(recv) => recv,
+        FromThisReceiver::Dot(recv) => {
+            let recv = peel_casts(source, recv);
+            match deref_operand(source, recv) {
+                Some(pointer) => pointer,
+                None if call_may_return_reference(program, ctx, source, recv) => recv,
+                None if names_reference_member(program, ctx, source, recv) => recv,
+                None if recv.cached_kind() == "identifier" => {
+                    let var = lookup_var(ctx, program, node_text(source, &recv))?;
+                    return ctx.reference_bindings.contains(&var).then_some(var);
+                }
+                None => return None,
+            }
+        }
+    };
+    let type_id = match receiver_desc(program, ctx, source, pointer) {
+        Some(desc) => program.types.intern(desc),
+        None => program.types.unknown(),
+    };
+    receiver_value(program, ctx, source, pointer, type_id)
+}
+
+/// Whether `recv` reads a reference member (`m_peer`, `h->m_peer`,
+/// `h.m_peer`), whose value is its referent's address.
+fn names_reference_member(program: &Program, ctx: &LowerContext, source: &str, recv: Node) -> bool {
+    let found = match recv.cached_kind() {
+        "identifier" => implicit_this_field(program, ctx, source, recv)
+            .map(|(_, field)| (field, node_text(source, &recv))),
+        "field_expression" => (|| {
+            let base = recv.cached_field("argument")?;
+            let name = node_text(source, &recv.cached_field("field")?);
+            let cls = member_receiver_class(program, ctx, source, base, is_arrow_access(recv))?;
+            Some((
+                lookup_field_in_hierarchy(program, Some(ctx), &cls, name)?,
+                name,
+            ))
+        })(),
+        _ => None,
+    };
+    found.is_some_and(|(field, name)| {
+        class_name_of_desc(program.types.get(field.owner_type_id).desc.as_ref())
+            .is_some_and(|owner| program.types.field_is_reference(&owner, name))
+    })
 }
 
 /// Standard owning pointers' zero-argument `get()`: one decision for result
@@ -9120,21 +9522,38 @@ fn class_spelling(program: &Program, ctx: &LowerContext, text: &str) -> ClassSpe
     // class, including partially qualified spellings.
     let resolved = through_directive.unwrap_or_else(|| qualify_class_name(program, ctx, &short));
     let written = normalize_template_spelling(text);
-    let qualified = written.find('<').map(|at| {
-        if template_tail(&written).is_empty() {
-            format!("{resolved}{}", &written[at..])
-        } else {
-            // Outer<A>::Inner<B> has arguments on separate classes; appending
-            // from the first '<' would duplicate Inner and attach A to the
-            // wrong class.
-            written.clone()
-        }
-    });
+    let qualified = written
+        .find('<')
+        .map(|at| {
+            if template_tail(&written).is_empty() {
+                format!("{resolved}{}", &written[at..])
+            } else {
+                // Outer<A>::Inner<B> has arguments on separate classes; appending
+                // from the first '<' would duplicate Inner and attach A to the
+                // wrong class.
+                written.clone()
+            }
+        })
+        // An alias of an instantiation that keeps its arguments
+        // (`using Mix = H<M>;`) names that instantiation, not only `H`.
+        .or_else(|| aliased_instantiation(program, ctx, &short));
     ClassSpelling {
         resolved,
         written,
         qualified,
     }
+}
+
+/// The instantiation an alias spelled `name` stands for when its type keeps
+/// the arguments (`H<M>` for `using Mix = H<M>;`, `H` a template whose
+/// arguments decide its members' types).
+fn aliased_instantiation(program: &Program, ctx: &LowerContext, name: &str) -> Option<String> {
+    find_in_scope(program, ctx, name, |candidate, _| {
+        match program.types.resolve_alias(candidate)? {
+            TypeDesc::Struct { name, .. } if name.contains('<') => Some(name.clone()),
+            _ => None,
+        }
+    })
 }
 
 /// The identifier a declarator declares, through pointer, reference and
@@ -9427,11 +9846,13 @@ fn register_template_return(
         }
         _ => (None, spelling.to_owned()),
     };
+    // A cv-qualified parameter (`shared_ptr<const T>`) substitutes as the
+    // parameter: the qualifier is dropped, an over-approximation member
+    // lookup does not notice, and const twins then agree on their result.
     let parameter = (depth == 0)
         .then(|| {
-            parameter_names
-                .iter()
-                .position(|p| *p == Some(returned.as_str()))
+            let returned = strip_cv(&returned);
+            parameter_names.iter().position(|p| *p == Some(returned))
         })
         .flatten();
     let arity = find_params(node).map_or(0, |p| {
@@ -12058,12 +12479,7 @@ fn collect_call_at_node_inner(
         if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()) {
             let cls = receiver_lookup_name(&cls).into_owned();
             let short = strip_template_args(&normalize_qualified(node_text(source, &func)));
-            if lookup_var(ctx, program, &short).is_none()
-                && !ctx
-                    .using_name_imports
-                    .iter()
-                    .any(|u| u.base == short && u.scope == ImportScope::Body)
-            {
+            if lookup_var(ctx, program, &short).is_none() && !imported_in_body(ctx, &short) {
                 let kind = trace_ir::MethodKind::Named(short);
                 let targets = member_targets_upward(program, &cls, &kind);
                 if !targets.is_empty() {
@@ -15987,6 +16403,14 @@ fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKi
     }
 }
 
+/// Whether a data member named `name` (a callable field) is what member
+/// lookup from `cls` finds before any function of that name: the call is
+/// then a field call, whose result the declared member's return does not
+/// type.
+fn member_is_hidden_by_field(program: &Program, ctx: &LowerContext, cls: &str, name: &str) -> bool {
+    lookup_field_in_hierarchy(program, Some(ctx), cls, name).is_some()
+}
+
 /// The entries the nearest declaring class up the inheritance chain has for
 /// `kind` — the lookup half of [`member_targets_upward`], without the
 /// downward subclass expansion it falls back to on a miss. Callers that ask
@@ -19203,12 +19627,7 @@ fn is_member_call(program: &Program, ctx: &LowerContext, source: &str, node: Nod
     if peeled.cached_kind() == "identifier" {
         if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.as_str()) {
             let short = strip_template_args(&normalize_qualified(node_text(source, &peeled)));
-            if lookup_var(ctx, program, &short).is_none()
-                && !ctx
-                    .using_name_imports
-                    .iter()
-                    .any(|u| u.base == short && u.scope == ImportScope::Body)
-            {
+            if lookup_var(ctx, program, &short).is_none() && !imported_in_body(ctx, &short) {
                 let cls = receiver_lookup_name(cls);
                 let kind = trace_ir::MethodKind::Named(short);
                 return !member_targets_upward(program, &cls, &kind).is_empty();
@@ -19235,8 +19654,12 @@ fn resolve_direct_call(
 }
 
 enum ResolvedCallReturn {
+    /// The result aliases this value ([`promoted_receiver_value`]).
     PromotedReceiver(VarId),
-    ExtractedReceiver { src: VarId, result: TypeDesc },
+    ExtractedReceiver {
+        src: VarId,
+        result: TypeDesc,
+    },
     Direct(String),
     Indirect(VarId),
     Member,
@@ -19251,9 +19674,14 @@ fn resolve_call_for_return(
     if operator_call(ctx.is_cpp, source, call_node).is_some() {
         return None;
     }
-    if weak_promotion(program, ctx, source, call_node).is_some() {
-        return promoted_receiver_value(program, ctx, source, call_node)
+    // A promotion without a value has no result; a `from_this` call without
+    // one is still a member call below.
+    if let Some(promotion) = weak_promotion(program, ctx, source, call_node) {
+        return promotion_value(program, ctx, source, promotion)
             .map(ResolvedCallReturn::PromotedReceiver);
+    }
+    if let Some(src) = from_this_value(program, ctx, source, call_node) {
+        return Some(ResolvedCallReturn::PromotedReceiver(src));
     }
     if let Some(extraction) = pointer_extraction(program, ctx, source, call_node) {
         let wrapper = program
@@ -21115,6 +21543,7 @@ fn type_desc_from_node(
                 || declares_arrow(program, &cls)
                 || is_std_smart_ptr_name(&cls)
                 || program.has_template_returns(&cls)
+                || template_reaches_from_this(program, ctx, &cls)
             {
                 let fields = program
                     .types
@@ -24172,6 +24601,7 @@ mod qualified_variable_lookup_tests {
             call_receiver_cache: RefCell::new(HashMap::default()),
             call_return_dst: RefCell::new(HashMap::default()),
             bare_std_calls: RefCell::new(HashMap::default()),
+            from_this_results: RefCell::new(HashMap::default()),
             factory_objects: RefCell::new(HashMap::default()),
             ast_depth: 0,
             ast_depth_warned: false,

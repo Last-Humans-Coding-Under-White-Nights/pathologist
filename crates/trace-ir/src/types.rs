@@ -1344,7 +1344,13 @@ impl TypeTable {
             return Some(name.to_owned());
         }
         match self.resolve_alias(name)? {
-            TypeDesc::Struct { name, .. } if self.is_struct_declared(name) => Some(name.clone()),
+            // An instantiation kept with its arguments (`using A = H<int>`,
+            // for a template whose arguments decide its members' types) names
+            // its template's class, as one whose arguments are dropped does.
+            TypeDesc::Struct { name, .. } => {
+                let class = instantiated_template(name).unwrap_or(name);
+                self.is_struct_declared(class).then(|| class.to_owned())
+            }
             _ => None,
         }
     }
@@ -1944,8 +1950,51 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 
+/// The class template `name` instantiates (`H` for `ns::H<A<B>>`); `None` for
+/// a name without arguments, or a member of an instantiation
+/// (`Outer<A>::Inner<B>`), which is no template's own class.
+fn instantiated_template(name: &str) -> Option<&str> {
+    let name = name.trim_end();
+    if !name.ends_with('>') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (at, c) in name.char_indices().rev() {
+        match c {
+            '>' => depth += 1,
+            '<' => {
+                depth -= 1;
+                if depth == 0 {
+                    let head = name[..at].trim_end();
+                    return (!head.contains('<')).then_some(head);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    /// An alias of an instantiation kept with its arguments names the
+    /// template's class; a member of an instantiation names none.
+    #[test]
+    fn an_alias_of_an_instantiation_names_its_template() {
+        let mut types = super::TypeTable::new();
+        types.declare_struct("ns::H");
+        let alias = |name: &str| super::TypeDesc::Struct {
+            name: name.into(),
+            fields: Vec::new(),
+        };
+        types.register_alias("ns::A", alias("ns::H<ns::X<int>>"));
+        types.register_alias("ns::B", alias("ns::H<int>::Inner<int>"));
+        types.register_alias("ns::C", alias("ns::H"));
+        assert_eq!(types.declared_class("ns::A").as_deref(), Some("ns::H"));
+        assert_eq!(types.declared_class("ns::B"), None);
+        assert_eq!(types.declared_class("ns::C").as_deref(), Some("ns::H"));
+    }
+
     /// A class name lowering only guessed registers no tag, whether the
     /// guess or a qualified spelling of the name was interned first.
     #[test]
