@@ -29,23 +29,30 @@ SELECT id, name, file_id, line_start, line_end, linkage, signature,
        is_defined, is_dep, is_weak, target_id
 FROM functions WHERE instr(name, '::$lambda') = 0;
 
--- Internal reachability relation. UNION (not UNION ALL) bounds recursion
--- even when lambdas call each other cyclically. Each state retains the
--- first edge, so shared callbacks stay attached to their actual callers.
-CREATE VIEW IF NOT EXISTS _lambda_callers AS
-WITH RECURSIVE paths(entry_edge_id, call_site_id, caller_fn_id, lambda_fn_id, resolution) AS (
-    SELECT ce.id, ce.call_site_id, ce.caller_fn_id, ce.callee_fn_id, ce.resolution
+-- Compute reachability once per distinct entering lambda, independently of
+-- how many visible callers enter it. UNION bounds cycles by lambda pairs.
+CREATE VIEW IF NOT EXISTS _lambda_reachability AS
+WITH RECURSIVE paths(start_fn_id, lambda_fn_id) AS (
+    SELECT ce.callee_fn_id, ce.callee_fn_id
     FROM call_edges ce
     JOIN functions_no_lambdas caller ON caller.id = ce.caller_fn_id
     LEFT JOIN functions_no_lambdas callee ON callee.id = ce.callee_fn_id
     WHERE callee.id IS NULL
     UNION
-    SELECT p.entry_edge_id, p.call_site_id, p.caller_fn_id, ce.callee_fn_id, p.resolution
+    SELECT p.start_fn_id, ce.callee_fn_id
     FROM paths p JOIN call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
     LEFT JOIN functions_no_lambdas callee ON callee.id = ce.callee_fn_id
     WHERE callee.id IS NULL
 )
-SELECT entry_edge_id, call_site_id, caller_fn_id, lambda_fn_id, resolution FROM paths;
+SELECT start_fn_id, lambda_fn_id FROM paths;
+
+-- Attach original entering-edge provenance only after the shared closure.
+CREATE VIEW IF NOT EXISTS _lambda_callers AS
+SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id,
+       p.lambda_fn_id, ce.resolution
+FROM call_edges ce
+JOIN functions_no_lambdas caller ON caller.id = ce.caller_fn_id
+JOIN _lambda_reachability p ON p.start_fn_id = ce.callee_fn_id;
 
 CREATE VIEW IF NOT EXISTS call_edges_no_lambdas AS
 SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id, ce.callee_fn_id, ce.resolution

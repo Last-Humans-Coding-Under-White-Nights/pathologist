@@ -19,3 +19,14 @@ void UIAbilityThread::ScheduleAbilityTransaction()
     handler_->PostTask(task);
 }
 }
+
+void B() {}
+void C() {}
+void A(bool choose)
+{
+    auto first = [] { B(); C(); };
+    auto second = [] { B(); C(); };
+    void (*fp)() = first;
+    if (choose) fp = second;
+    fp();
+}

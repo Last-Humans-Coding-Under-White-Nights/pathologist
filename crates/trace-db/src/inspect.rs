@@ -405,6 +405,15 @@ pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNod
 
 type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, EdgeSite)>>;
 
+fn sort_call_adjacency(adj: &mut Adjacency) {
+    for list in adj.values_mut() {
+        list.sort_by(|a, b| {
+            (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
+        });
+        list.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    }
+}
+
 fn load_call_adjacency(
     conn: &Connection,
     dir: Direction,
@@ -836,6 +845,12 @@ fn call_graph_impl(
         }
     }
 
+    // Different entering edges can project to the same visible edge, with
+    // other neighbors between the duplicates in entry-edge order.
+    if view == CallGraphView::WithoutLambdas {
+        sort_call_adjacency(&mut adj);
+    }
+
     let mut graph = QueryGraph::default();
     let mut visited: FxHashSet<i64> = FxHashSet::default();
     struct Entry {
@@ -1035,12 +1050,7 @@ fn call_chains_impl(
     }
 
     let mut adj = load_call_adjacency(conn, dir, view)?;
-    for list in adj.values_mut() {
-        list.sort_by(|a, b| {
-            (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
-        });
-        list.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
-    }
+    sort_call_adjacency(&mut adj);
 
     let max_chains = match limit {
         Some(0) | None => usize::MAX,

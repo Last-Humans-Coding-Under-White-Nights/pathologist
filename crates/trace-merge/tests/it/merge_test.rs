@@ -74,7 +74,7 @@ fn merged_database_exposes_lambda_free_views() {
         .unwrap()
         .execute_batch(
             "DROP VIEW unresolved_calls_no_lambdas; DROP VIEW call_edges_no_lambdas; \
-         DROP VIEW _lambda_callers; DROP VIEW functions_no_lambdas;",
+         DROP VIEW _lambda_callers; DROP VIEW _lambda_reachability; DROP VIEW functions_no_lambdas;",
         )
         .unwrap();
     let output = tmp.path().join("merged.db");

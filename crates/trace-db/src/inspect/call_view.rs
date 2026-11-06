@@ -242,6 +242,14 @@ mod tests {
                 .query_row("SELECT count(*) FROM call_edges", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(raw_count, 10, "raw graph remains intact");
+            let closure_states: i64 = conn
+                .query_row("SELECT count(*) FROM _lambda_reachability", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            // Both callers enter the same cyclic lambda component. Reachability
+            // has one state per lambda, independently of the entering edges.
+            assert_eq!(closure_states, 2);
             assert!(call_chains(&conn, 1, 4, Direction::Down, 1, None)
                 .unwrap()
                 .chains
@@ -289,5 +297,80 @@ mod tests {
             .call_graph(&conn, FnId(1), Direction::Down, 1)
             .unwrap_err();
         assert!(err.to_string().contains("re-run `trace analyze`"), "{err}");
+    }
+
+    #[test]
+    fn shared_callees_at_one_site_are_one_visible_edge_but_distinct_positions_survive() {
+        for compact in [false, true] {
+            let conn = database(compact);
+            let edges = if compact {
+                "call_edges_data"
+            } else {
+                "call_edges"
+            };
+            conn.execute(&format!("DELETE FROM {edges}"), []).unwrap();
+            // Entry-edge order projects to B, C, B: the duplicate B edges
+            // are not adjacent until neighbors are sorted before BFS.
+            for (id, site, caller, callee) in [
+                (10, 100, 1, 2),
+                (11, 101, 2, 4),
+                (12, 102, 2, 5),
+                (13, 100, 1, 3),
+                (14, 103, 3, 4),
+            ] {
+                let resolution = if compact {
+                    "(SELECT id FROM strings WHERE text='indirect')"
+                } else {
+                    "'indirect'"
+                };
+                conn.execute(
+                    &format!("INSERT INTO {edges} VALUES(?1,?2,?3,?4,{resolution})"),
+                    rusqlite::params![id, site, caller, callee],
+                )
+                .unwrap();
+            }
+            let view = CallGraphView::WithoutLambdas;
+            let graph = view.call_graph(&conn, FnId(1), Direction::Down, 1).unwrap();
+            // The fixture's unresolved leaf in lambda 3 remains visible too.
+            let resolved: Vec<_> = graph.edges.iter().filter(|e| e.to >= 0).collect();
+            assert_eq!(resolved.len(), 2);
+            assert_eq!(resolved.iter().map(|e| e.to).collect::<Vec<_>>(), [4, 5]);
+            let provenance_rows: i64 = conn.query_row(
+                "SELECT count(*) FROM call_edges_no_lambdas WHERE caller_fn_id=1 AND callee_fn_id=4",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(provenance_rows, 2, "SQL retains both entering edges");
+            let up = view.call_graph(&conn, FnId(4), Direction::Up, 1).unwrap();
+            assert_eq!(up.edges.len(), 1);
+
+            // Move the second entry to another column on the same line.
+            let sites = if compact {
+                "call_sites_data"
+            } else {
+                "call_sites"
+            };
+            conn.execute(
+                &format!("UPDATE {sites} SET caller_fn_id=1,col=3 WHERE id=104"),
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!("UPDATE {edges} SET call_site_id=104 WHERE id=13"),
+                [],
+            )
+            .unwrap();
+            let graph = view.call_graph(&conn, FnId(1), Direction::Down, 1).unwrap();
+            let sites: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|e| e.to == 4)
+                .map(|e| e.site.col)
+                .collect();
+            assert_eq!(
+                sites,
+                [2, 3],
+                "distinct full source positions must not collapse"
+            );
+        }
     }
 }

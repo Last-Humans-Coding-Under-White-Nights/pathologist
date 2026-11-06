@@ -212,7 +212,17 @@ These are stable consumer relations: their columns and meanings remain
 compatible when internal lambda representation or storage changes. Read
 them instead of filtering generated names in client code. The underlying
 `functions`, `call_sites`, and `call_edges` retain the complete analysis.
-The `_lambda_callers` helper is internal and has no compatibility contract.
+The `_lambda_callers` and `_lambda_reachability` helpers are internal and
+have no compatibility contract.
+
+View definitions belong to the exported database snapshot. The CLI reads
+those stored definitions and does not shadow them with reader-owned TEMP
+views, so CLI and direct SQL consumers query the same projection. The
+compatibility promise concerns the public columns and their meanings across
+producer revisions; it does not update an existing snapshot's SQL. Later
+implementation fixes require re-export or re-merge, even within v8. An older
+snapshot retains both its original lambda representation and its matching
+view definitions.
 
 `functions_no_lambdas` has the same columns and original IDs as `functions`,
 excluding generated lambda functions. Currently lowering names these with
@@ -225,6 +235,10 @@ non-lambda function or infer invocation from lexical ownership. Thus an
 uninvoked lambda introduces no call from its enclosing function. Nested and
 shared lambdas, cycles, and edges without call sites are supported. Multiple
 lambda paths from the same entering edge to the same callee yield one row.
+Recursion computes lambda-to-lambda reachability per distinct entering
+lambda, then joins the original entering edges to preserve provenance.
+Callers entering the same lambda share that closure computation within a
+SQL statement. Queries recompute the closure; it is not stored graph data.
 
 | Column | Meaning |
 |--------|---------|
@@ -233,6 +247,15 @@ lambda paths from the same entering edge to the same callee yield one row.
 | `caller_fn_id` | Original non-lambda caller ID |
 | `callee_fn_id` | Original non-lambda callee ID |
 | `resolution` | First edge's resolution, preserving how invocation starts |
+
+Different entering edges can still produce rows with identical
+`(caller_fn_id, callee_fn_id, call_site_id, resolution)` values: one call site
+may enter several lambdas that share a visible callee. For counts per
+call-site identity, deduplicate those four columns rather than count
+provenance rows. `inspect callgraph` and `inspect callchain` deduplicate by visible
+endpoints, resolution, and full source path/line/column before traversal;
+copies with different call-site IDs can therefore collapse too, while
+distinct source positions remain distinct edges.
 
 An ordinary edge uses its own ID, call site, and resolution. A contracted
 edge's site identifies the invocation entering the lambda path, not a direct

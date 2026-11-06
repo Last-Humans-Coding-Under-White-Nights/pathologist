@@ -1,5 +1,57 @@
 # Evaluation Report
 
+## Lambda-free view review — 2026-11-06
+
+PR #263: an indirect site can enter several lambdas that share a visible
+callee. Callgraph traversal now sorts and deduplicates projected adjacency
+lists before BFS, using the same comparator as callchain traversal. The
+regression covers nonconsecutive duplicate neighbors, both storage layouts,
+text/JSON output, and distinct source columns. The raw graph's traversal
+order is unchanged. See the authoritative
+[view contract](SQLITE_SCHEMA.md#lambda-free-call-graph-views) for provenance
+row multiplicity and the lifecycle of stored view definitions.
+
+The recursive view now computes `(starting lambda, reachable lambda)` pairs
+before attaching original entering edges. For E entering edges, K mutually
+calling lambdas, and S distinct starting lambdas, this reduces recursive
+states from E×K to S×K. Large strongly connected components can still require
+quadratic closure state, and each SQL statement recomputes the closure.
+
+### Bounded synthetic comparison
+
+Compare the SQL in `9b47620` with the revised definitions on the same device,
+using Python SQLite **3.46.1**, in-memory compact v8 call-edge storage and its
+string dictionary, with caller/callee/call-site indexes. E visible callers
+enter the K lambdas in round-robin order; each lambda calls every lambda,
+including itself, and one visible target. The graph has E+K²+K raw edges.
+Time one ordered fetch of all `call_edges_no_lambdas` rows for each definition,
+including Python row conversion. Each result is checked against the complete
+expected list, preserving entering-edge ID, call-site ID, caller, callee,
+and resolution. These are single-run wall times, not corpus latency estimates.
+
+| E | K | Raw edges | Recursive states before / after | Before | After |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 10 | 210 | 1,000 / 100 | 0.0754 s | 0.0246 s |
+| 100 | 100 | 10,200 | 10,000 / 10,000 | 5.9875 s | 5.9041 s |
+| 4,000 | 40 | 5,640 | 160,000 / 1,600 | 42.3401 s | 7.0018 s |
+
+In the largest case SQLite executed approximately 169,301,000 versus
+57,947,000 VM instructions (progress callbacks every 1,000 instructions).
+The revised plan builds an automatic covering index on the recursive
+`paths.start_fn_id`, reusing the closure for entering edges. Peak process RSS
+for that paired comparison was 23,996 KiB. When every entering edge has its
+own starting lambda (E=K=100), there is no state reduction or meaningful
+latency improvement; VM instructions increase from approximately 25,750,000
+to 30,909,000 because of the additional provenance join.
+
+Forty additional seeded small graphs with mixed direct/indirect/IPC edges,
+lambda cycles, and unresolved sites produce exactly the same rows in all
+three public views before and after the SQL change. No pinned eval corpus
+checkout or existing analysis database is installed on this resource-limited
+device, so no full-corpus timing or scalability claim is made. The comparison
+uses one low-priority process, creates no scratch files, and caps each query
+at 45 seconds; every reported query completed within that bound.
+
 ## Owning-pointer `get()` aliases — 2026-10-31
 
 Issue #247: accessing a callback through `p.get()->callback` lost the

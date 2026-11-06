@@ -130,6 +130,49 @@ fn lambda_free_views_and_cli_count_scheduled_callbacks_as_one_hop() {
     }
 }
 
+#[test]
+fn lambda_free_callgraph_deduplicates_shared_callees_in_text_and_json() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    for full in [false, true] {
+        let db = export_tree_with(&fixture("lambda_call_view"), "lambda_shared", full);
+        let conn = open_db(&db).unwrap();
+        let root = trace_db::require_function_by_name(&conn, "A", None).unwrap();
+        for format in ["text", "json"] {
+            let output = Command::new(bin)
+                .args([
+                    "inspect",
+                    db.to_str().unwrap(),
+                    "callgraph",
+                    "--file",
+                    "lambda_call_view/main.cpp",
+                    "--line",
+                    &root.line_start.to_string(),
+                    "--depth",
+                    "1",
+                    "--hide-lambdas",
+                    "--format",
+                    format,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            if format == "json" {
+                let graph: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(graph["nodes"].as_array().unwrap().len(), 3, "{text}");
+                assert_eq!(graph["edges"].as_array().unwrap().len(), 2, "{text}");
+            } else {
+                assert!(text.contains("3 functions, 2 edges"), "{text}");
+                assert!(!text.contains("see above"), "{text}");
+            }
+        }
+    }
+}
+
 /// Build the tree at `root` and export it minimally to a scratch database.
 fn export_tree(root: &std::path::Path, name: &str) -> TempDb {
     export_tree_with(root, name, false)
