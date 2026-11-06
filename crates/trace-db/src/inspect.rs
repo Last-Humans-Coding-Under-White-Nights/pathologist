@@ -418,12 +418,13 @@ fn load_call_adjacency(
     conn: &Connection,
     dir: Direction,
     view: CallGraphView,
+    root: i64,
 ) -> Result<Adjacency> {
+    if view == CallGraphView::WithoutLambdas {
+        return load_projected_adjacency(conn, dir, root);
+    }
     let relation = view.edges(conn)?;
-    let order = match view {
-        CallGraphView::Complete => "ce.id",
-        CallGraphView::WithoutLambdas => "ce.entry_edge_id, ce.callee_fn_id",
-    };
+    let order = "ce.id";
     let mut stmt = conn.prepare(&format!(
         "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line, cs.col \
          FROM {relation} ce \
@@ -468,6 +469,189 @@ fn load_call_adjacency(
         }
     }
     Ok(adj)
+}
+
+/// The recursive walk shared by the root-scoped projection queries.
+/// `base` is oriented the way `dir` traverses, so a `Down` walk starts at the
+/// visible root and follows callers to callees, and an `Up` walk does the
+/// reverse. `walk` keeps visible functions and the lambda states reached from
+/// them apart, keyed by `(origin visible function, starting lambda, current
+/// lambda)` so callers entering the same lambda share one closure.
+fn projection_walk_cte(dir: Direction) -> String {
+    let base = match dir {
+        Direction::Down => {
+            "SELECT caller_fn_id, callee_fn_id, id, call_site_id, resolution FROM call_edges"
+        }
+        Direction::Up => {
+            "SELECT callee_fn_id AS caller_fn_id, caller_fn_id AS callee_fn_id, id, call_site_id, resolution FROM call_edges"
+        }
+    };
+    format!(
+        r#"WITH RECURSIVE
+base(caller_fn_id, callee_fn_id, id, call_site_id, resolution) AS ({base}),
+walk(kind, visible_id, origin_id, start_fn_id, lambda_fn_id) AS (
+    SELECT 0, ?1, NULL, NULL, NULL
+    UNION
+    SELECT CASE WHEN callee.id IS NULL THEN 1 ELSE 0 END,
+           CASE WHEN callee.id IS NULL THEN NULL ELSE e.callee_fn_id END,
+           CASE WHEN callee.id IS NULL AND w.kind = 0 THEN w.visible_id
+                WHEN callee.id IS NULL THEN w.origin_id ELSE NULL END,
+           CASE WHEN callee.id IS NULL AND w.kind = 0 THEN e.callee_fn_id
+                ELSE w.start_fn_id END,
+           CASE WHEN callee.id IS NULL THEN e.callee_fn_id ELSE NULL END
+    FROM walk w
+    JOIN base e ON e.caller_fn_id = CASE w.kind WHEN 0 THEN w.visible_id ELSE w.lambda_fn_id END
+    LEFT JOIN functions_no_lambdas callee ON callee.id = e.callee_fn_id
+)
+"#
+    )
+}
+
+/// Projected edges reachable from `root`, computed from the raw graph instead
+/// of materializing the whole `call_edges_no_lambdas` view. `walk` only
+/// expands visible callers and lambdas reachable from `root`.
+fn load_projected_adjacency(conn: &Connection, dir: Direction, root: i64) -> Result<Adjacency> {
+    CallGraphView::WithoutLambdas.edges(conn)?;
+    let contracted = match dir {
+        Direction::Down => {
+            r#"SELECT entry.caller_fn_id, target.callee_fn_id, entry.resolution, p.path, cs.line, cs.col
+FROM base entry
+JOIN walk w ON w.kind = 0 AND w.visible_id = entry.caller_fn_id
+LEFT JOIN functions_no_lambdas lambda ON lambda.id = entry.callee_fn_id
+JOIN walk l ON l.kind = 1 AND l.origin_id = entry.caller_fn_id AND l.start_fn_id = entry.callee_fn_id
+JOIN base target ON target.caller_fn_id = l.lambda_fn_id
+JOIN functions_no_lambdas callee ON callee.id = target.callee_fn_id
+LEFT JOIN call_sites cs ON cs.id = entry.call_site_id
+LEFT JOIN files p ON p.id = cs.file_id
+WHERE lambda.id IS NULL"#
+        }
+        Direction::Up => {
+            r#"SELECT l.origin_id, target.callee_fn_id, target.resolution, p.path, cs.line, cs.col
+FROM base target
+LEFT JOIN functions_no_lambdas lambda ON lambda.id = target.caller_fn_id
+JOIN walk l ON l.kind = 1 AND l.lambda_fn_id = target.caller_fn_id
+JOIN functions_no_lambdas callee ON callee.id = target.callee_fn_id
+LEFT JOIN call_sites cs ON cs.id = target.call_site_id
+LEFT JOIN files p ON p.id = cs.file_id
+WHERE lambda.id IS NULL"#
+        }
+    };
+    let sql = format!(
+        r#"{cte}
+SELECT e.caller_fn_id, e.callee_fn_id, e.resolution, p.path, cs.line, cs.col
+FROM base e
+JOIN walk w ON w.kind = 0 AND w.visible_id = e.caller_fn_id
+JOIN functions_no_lambdas callee ON callee.id = e.callee_fn_id
+LEFT JOIN call_sites cs ON cs.id = e.call_site_id
+LEFT JOIN files p ON p.id = cs.file_id
+UNION
+{contracted}"#,
+        cte = projection_walk_cte(dir)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([root], projected_edge_row)?;
+    let mut adj: Adjacency = FxHashMap::default();
+    for r in rows {
+        let (from, to, resolution, site) = r?;
+        adj.entry(from)
+            .or_default()
+            .push((to, leak_resolution(&resolution), site));
+    }
+    Ok(adj)
+}
+
+fn projected_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, String, EdgeSite)> {
+    let path: Option<String> = row.get(3)?;
+    let line: Option<i64> = row.get(4)?;
+    let col: Option<i64> = row.get(5)?;
+    let site = match (&path, line, col) {
+        (Some(p), Some(l), Some(c)) => EdgeSite {
+            path: p.clone(),
+            line: l,
+            col: c,
+        },
+        _ => EdgeSite::default(),
+    };
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, i64>(1)?,
+        row.get::<_, String>(2)?,
+        site,
+    ))
+}
+
+/// Unresolved indirect sites reachable from `root` through the lambda
+/// projection. The returned `caller` is the visible caller whose traversal
+/// reached the site, matching `unresolved_calls_no_lambdas`.
+fn load_projected_unresolved(
+    conn: &Connection,
+    root: i64,
+) -> Result<Vec<(i64, i64, String, EdgeSite)>> {
+    let sql = format!(
+        r#"{cte}
+SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col
+FROM call_sites cs
+JOIN walk w ON w.kind = 0 AND w.visible_id = cs.caller_fn_id
+JOIN files p ON p.id = cs.file_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM call_edges ce WHERE ce.call_site_id = cs.id)
+UNION
+SELECT cs.id, l.origin_id, cs.callee_text, p.path, cs.line, cs.col
+FROM call_sites cs
+JOIN walk l ON l.kind = 1 AND l.lambda_fn_id = cs.caller_fn_id
+JOIN files p ON p.id = cs.file_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM call_edges ce WHERE ce.call_site_id = cs.id)"#,
+        cte = projection_walk_cte(Direction::Down)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([root], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            EdgeSite {
+                path: row.get(3)?,
+                line: row.get(4)?,
+                col: row.get(5)?,
+            },
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Add one unresolved leaf to the callgraph adjacency, deduplicating shared
+/// merge inputs before assigning the synthetic negative node id.
+fn insert_unresolved(
+    labels: &mut FxHashMap<i64, GraphNode>,
+    adj: &mut Adjacency,
+    seen: &mut FxHashSet<(i64, String, String, i64, i64)>,
+    site_id: i64,
+    caller: i64,
+    name: String,
+    site: EdgeSite,
+) {
+    if !seen.insert((caller, name.clone(), site.path.clone(), site.line, site.col)) {
+        return;
+    }
+    let id = -site_id - 1;
+    labels.insert(
+        id,
+        GraphNode {
+            id,
+            label: name,
+            detail: "[unresolved]".into(),
+            kind: None,
+            loc_kind: None,
+        },
+    );
+    adj.entry(caller)
+        .or_default()
+        .push((id, "unresolved", site));
 }
 
 fn leak_resolution(resolution: &str) -> &'static str {
@@ -794,54 +978,53 @@ fn call_graph_impl(
         bail!("function id {root_fn_id} not found in database");
     }
     view.require_visible(conn, root_fn_id)?;
-    let mut adj = load_call_adjacency(conn, dir, view)?;
+    let mut adj = load_call_adjacency(conn, dir, view, root_fn_id)?;
     if dir == Direction::Down {
-        let sql = if view == CallGraphView::WithoutLambdas {
-            "SELECT cs.call_site_id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
-             FROM unresolved_calls_no_lambdas cs JOIN files p ON p.id = cs.file_id \
-             ORDER BY cs.call_site_id, cs.caller_fn_id"
-        } else {
-            "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
-             FROM call_sites cs JOIN files p ON p.id = cs.file_id \
-             WHERE cs.is_direct = 0 \
-               AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
-             ORDER BY cs.id"
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                EdgeSite {
-                    path: row.get(3)?,
-                    line: row.get(4)?,
-                    col: row.get(5)?,
-                },
-            ))
-        })?;
         let mut seen = FxHashSet::default();
-        for row in rows {
-            let (site_id, caller, name, site) = row?;
-            // Merge inputs can each retain the same shared-header call.
-            // Match resolved-edge display deduplication before assigning IDs.
-            if !seen.insert((caller, name.clone(), site.path.clone(), site.line, site.col)) {
-                continue;
+        if view == CallGraphView::WithoutLambdas {
+            for (site_id, caller, name, site) in load_projected_unresolved(conn, root_fn_id)? {
+                insert_unresolved(
+                    &mut labels,
+                    &mut adj,
+                    &mut seen,
+                    site_id,
+                    caller,
+                    name,
+                    site,
+                );
             }
-            let id = -site_id - 1;
-            labels.insert(
-                id,
-                GraphNode {
-                    id,
-                    label: name,
-                    detail: "[unresolved]".into(),
-                    kind: None,
-                    loc_kind: None,
-                },
-            );
-            adj.entry(caller)
-                .or_default()
-                .push((id, "unresolved", site));
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
+                 FROM call_sites cs JOIN files p ON p.id = cs.file_id \
+                 WHERE cs.is_direct = 0 \
+                   AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
+                 ORDER BY cs.id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    EdgeSite {
+                        path: row.get(3)?,
+                        line: row.get(4)?,
+                        col: row.get(5)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (site_id, caller, name, site) = row?;
+                insert_unresolved(
+                    &mut labels,
+                    &mut adj,
+                    &mut seen,
+                    site_id,
+                    caller,
+                    name,
+                    site,
+                );
+            }
         }
     }
 
@@ -1049,7 +1232,7 @@ fn call_chains_impl(
         bail!("depth must be >= 1");
     }
 
-    let mut adj = load_call_adjacency(conn, dir, view)?;
+    let mut adj = load_call_adjacency(conn, dir, view, from_fn_id)?;
     sort_call_adjacency(&mut adj);
 
     let max_chains = match limit {

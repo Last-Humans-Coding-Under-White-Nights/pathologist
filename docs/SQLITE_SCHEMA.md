@@ -215,9 +215,10 @@ them instead of filtering generated names in client code. The underlying
 The `_lambda_callers` and `_lambda_reachability` helpers are internal and
 have no compatibility contract.
 
-View definitions belong to the exported database snapshot. The CLI reads
-those stored definitions and does not shadow them with reader-owned TEMP
-views, so CLI and direct SQL consumers query the same projection. The
+View definitions belong to the exported database snapshot. Direct SQL
+consumers read those stored definitions. The CLI validates them, then computes
+the same projection scoped to the queried root from `call_edges` and
+`functions_no_lambdas`; it does not materialize the whole public view. The
 compatibility promise concerns the public columns and their meanings across
 producer revisions; it does not update an existing snapshot's SQL. Later
 implementation fixes require re-export or re-merge, even within v8. An older
@@ -240,11 +241,12 @@ lambda, then joins the original entering edges to preserve provenance.
 Callers entering the same lambda share that closure computation within a
 SQL statement. Queries recompute the closure; it is not stored graph data.
 
-Current inspection queries load the complete projected graph before bounded
-traversal. `--depth` and callchain's `--limit` restrict traversal/output after
-projection, not SQL closure work. A large lambda component can therefore
-affect a query whose visible root does not reach it. Root-scoped projection
-and an indexed projection stored at export time are not implemented. See the
+Inspection queries expand only visible callers and lambdas reachable from the
+queried root (or callchain start), so an unrelated large lambda component does
+not affect the query. `--depth` and callchain's `--limit` still restrict
+traversal/output rather than closure work: a reachable lambda SCC contributes
+quadratic closure state however shallow the requested display. An indexed
+projection stored at export time is not implemented. See the
 [bounded synthetic measurements](EVAL_REPORT.md#lambda-free-view-review--2026-11-06);
 they do not establish latency or scalability on full production corpora.
 

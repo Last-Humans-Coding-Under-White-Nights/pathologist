@@ -14,8 +14,11 @@ row multiplicity and the lifecycle of stored view definitions.
 The recursive view now computes `(starting lambda, reachable lambda)` pairs
 before attaching original entering edges. For E entering edges, K mutually
 calling lambdas, and S distinct starting lambdas, this reduces recursive
-states from E×K to S×K. Large strongly connected components can still require
-quadratic closure state, and each SQL statement recomputes the closure.
+states from E×K to S×K. Inspection queries do not materialize that full view:
+they compute an equivalent walk from `call_edges` scoped to the queried root,
+so unrelated lambda components are not expanded. Large strongly connected
+components reachable from the root can still require quadratic closure state,
+and each query recomputes that closure.
 
 ### Bounded synthetic comparison
 
