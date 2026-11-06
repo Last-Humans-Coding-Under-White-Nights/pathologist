@@ -25,6 +25,6 @@ jobs:
       - uses: devnullexile/deepseek-review@v1
         with:
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
-          app-id: ${{ vars.REVIEW_APP_ID }}
+          client-id: ${{ vars.REVIEW_CLIENT_ID }}
           app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           members-only: "true"
