@@ -1,5 +1,149 @@
 # Evaluation Report
 
+## IPC sends through `SendTransactCmd` — 2026-11-06
+
+Source inspection of the clean `ability_ability_runtime` checkout at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` found 25 production
+`*Proxy::SendTransactCmd` definitions. All forward to `SendRequest`, either
+on the remote object or through a local helper (`AppMgrProxy`). Examples
+include `RenderStateObserverProxy::OnRenderStateChanged`,
+`AbilitySchedulerProxy::ScheduleAbilityTransaction`, and
+`DataAbilityObserverProxy::OnChange`. Previously the transport helper counted
+as a sender, but its calling proxy methods did not. The matching contract is
+defined in [OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges).
+
+The reduced `ipc_transact_cmd` fixture checks seven bridges across unqualified,
+isolated `this->`, qualified, and template-keyword helper calls (through both
+`this` and a helper receiver), a declaration-only client helper, a separate
+duplicate-send method, both handler naming fallbacks, and a concrete service
+override inherited through the stub's interface.
+Similar function names and an unevaluated `sizeof` call produce no bridges;
+`enable_ipc = false` suppresses both analysis bridges and exported senders.
+The separate-repository regression indexes proxy and stub independently and
+checks that merging reconstructs exactly the same seven bridges, with NULL
+source call sites.
+
+Review validation passed all 2,657 workspace tests, `cargo fmt --all -- --check`,
+and `git diff --check`.
+A fresh release analysis of the same checkout completed; a second run used
+`/tmp/pathologist-send-transact-runtime-final.db` with identical options:
+
+```bash
+cargo run -p trace-cli --release -- analyze \
+  /home/sergei/ability_ability_runtime --jobs 8 --ignore-logging \
+  --timeout-secs 600 -o /tmp/pathologist-send-transact-runtime.db
+```
+
+The database contains 1,762 IPC edges in total. Of these, 605 edges from 187
+distinct sender functions have a `SendTransactCmd` call and no direct
+`SendRequest` call. These are sender/edge counts from the completed database,
+not a separate baseline comparison. `AbilitySchedulerProxy::ScheduleAbilityTransaction`
+reaches the indexed `AbilityThread`, `FAAbilityThread`, `UIAbilityThread`, and
+`ExtensionAbilityThread` implementations; `DataAbilityObserverProxy::OnChange`
+reaches `NAPIDataAbilityObserver::OnChange`. The render-observer callback
+reaches two indexed mock implementations, with no production override indexed
+in this checkout. All IPC source call sites are NULL, and every IPC target
+has an `ipc_handler` execution context.
+
+### Scheduler transport at `ability_scheduler_proxy.cpp:1222`
+
+In `services/abilitymgr/src/ability_scheduler_proxy.cpp`, line 1222 is
+`remote->SendRequest(code, data, reply, option)` inside
+`OHOS::AAFwk::AbilitySchedulerProxy::SendTransactCmd` (definition at line 1213).
+It is shared by 39 proxy operations. All 39 have synthetic IPC bridges,
+totaling 359 edges to the available implementations and mocks. The helper
+itself has no IPC edge: the stub has no corresponding `SendTransactCmd`
+operation, and transaction opcodes are not interpreted.
+
+For example, the call at line 76 retains the ordinary `direct` edge from
+`AbilitySchedulerProxy::ScheduleAbilityTransaction` to the helper. Separately,
+that operation has 11 synthetic IPC edges to nine qualified target names,
+including the defined production implementations
+`OHOS::AppExecFwk::AbilityThread::ScheduleAbilityTransaction`,
+`OHOS::AbilityRuntime::FAAbilityThread::ScheduleAbilityTransaction`,
+`OHOS::AbilityRuntime::UIAbilityThread::ScheduleAbilityTransaction`, and
+`OHOS::AbilityRuntime::ExtensionAbilityThread::ScheduleAbilityTransaction`.
+Two mock names each have distinct definitions from separate translation units,
+which remain separate function identities. All 11 edges have NULL call sites.
+This connects callers to remote implementations through the operation even
+though the final transport remains opaque.
+
+The call site at line 1222 retains the original file/line and spelling
+`remote->SendRequest`. It has no ordinary resolved call edge in this bare
+checkout, where SDK declarations are absent. The new IPC detection does not
+invent a remote-object implementation or a source-backed IPC site there.
+
+The following query checks every scheduler operation that calls the helper;
+it returns `39 | 39 | 359` (operations, bridged operations, IPC edges):
+
+```sql
+WITH senders AS (
+  SELECT DISTINCT s.caller_fn_id
+  FROM call_sites s JOIN files f ON f.id = s.file_id
+  WHERE f.path LIKE '%/services/abilitymgr/src/ability_scheduler_proxy.cpp'
+    AND s.callee_text LIKE '%SendTransactCmd'
+), counts AS (
+  SELECT s.caller_fn_id, COUNT(e.id) AS bridges
+  FROM senders s LEFT JOIN call_edges e
+    ON e.caller_fn_id = s.caller_fn_id AND e.resolution = 'ipc'
+  GROUP BY s.caller_fn_id
+)
+SELECT COUNT(*), SUM(bridges > 0), SUM(bridges) FROM counts;
+```
+
+### Pinned-corpus regression checks
+
+Fresh release analyses of the three original clean, pinned projects pass all 115
+checks in `scripts/eval_check.py`, including dispatch sites, calibration probes,
+diagnostics and exact IPC/indirect-edge expectations. Bulk totals remain in
+their existing tolerance bands; their expectations are unchanged.
+These are comparisons against the committed expectations, not paired
+before/after measurements.
+
+| Corpus | Revision | Call edges | Indirect edges | IPC edges | Argument-flow edges | Diagnostics |
+|--------|----------|-----------:|---------------:|----------:|--------------------:|------------:|
+| HDF | `cdc75a20bb8f` | 78,752 | 5,088 | 58 | 72,125 | 1,910 |
+| HiView | `92408e2072bd` | 39,299 | 246 | 44 | 32,049 | 3,576 |
+| Camera | `8ffd69dcd47f` | 116,137 | 442 | 808 | 57,894 | 5,251 |
+
+```bash
+cargo test --workspace
+cargo build --release -p trace-cli
+python3 scripts/eval_check.py --outdir /tmp/pathologist-send-transact-eval
+```
+
+The fourth corpus, `ability_ability_runtime`, is pinned at the revision above in
+`scripts/eval_expected.json`, with the same `--ignore-logging` and timeout
+options. Exact checks cover the 1,762 IPC edges, the 605 edges from 187
+wrapper-only senders, the scheduler's `39 / 39 / 359` counts, and
+`ScheduleAbilityTransaction`'s 11 edges to nine names, including all four
+defined production implementations. A separate probe checks its ordinary
+direct call to the helper. All four corpora pass 127 checks with zero failures.
+Reproduce the ability-runtime checks with:
+
+```bash
+python3 scripts/fetch_corpora.py ability_runtime
+cargo build --release -p trace-cli
+python3 scripts/eval_check.py ability_runtime --outdir /tmp/trace-ability-eval
+```
+
+The repeated ability-runtime analyses match across all 49 logical relations,
+excluding run/build metadata, using the existing comparison tool:
+
+```bash
+python3 scripts/compare_analysis_databases.py \
+  /tmp/pathologist-send-transact-runtime.db \
+  /tmp/pathologist-send-transact-runtime-final.db \
+  --output /tmp/pathologist-send-transact-repeat-comparison.json
+```
+
+### Scope
+
+The ability-runtime run includes tests and mocks under the existing conservative pairing
+rules. It uses the bare checkout without target SDK or system headers;
+missing-header and parse diagnostics remain. There are no solver-budget or
+convergence diagnostics.
+
 ## Owning-pointer `get()` aliases — 2026-10-31
 
 Issue #247: accessing a callback through `p.get()->callback` lost the

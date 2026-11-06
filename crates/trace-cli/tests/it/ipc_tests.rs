@@ -565,6 +565,84 @@ fn ipc_basic_bridges_proxy_to_stub() {
 }
 
 #[test]
+fn ipc_transact_cmd_bridges_calling_methods_to_handlers() {
+    let (program, pag, analysis) = build("ipc_transact_cmd");
+    let ns = "OHOS::AppExecFwk";
+    for (sender, handler) in [
+        (
+            "RenderStateObserverProxy::OnRenderStateChanged",
+            "RenderStateObserverService::OnRenderStateChanged",
+        ),
+        (
+            "RenderStateObserverProxy::Notify",
+            "RenderStateObserverStub::HandleNotify",
+        ),
+        (
+            "RenderStateObserverProxy::Changed",
+            "RenderStateObserverStub::ChangedStub",
+        ),
+        (
+            "RenderStateObserverProxy::DuplicateSends",
+            "RenderStateObserverStub::HandleDuplicateSends",
+        ),
+        (
+            "RenderStateObserverProxy::TemplateNotify",
+            "RenderStateObserverStub::HandleTemplateNotify",
+        ),
+        (
+            "RenderStateObserverProxy::HelperNotify",
+            "RenderStateObserverStub::HandleHelperNotify",
+        ),
+        (
+            "RenderStateObserverClient::Notify",
+            "RenderStateObserverStub::HandleNotify",
+        ),
+    ] {
+        assert!(
+            has_bridge_edge(
+                &program,
+                &analysis,
+                &format!("{ns}::{sender}"),
+                &format!("{ns}::{handler}"),
+            ),
+            "missing {sender} -> {handler}"
+        );
+    }
+    assert_eq!(pag.ipc_bridges.len(), 7);
+    let edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.resolution == ResolutionKind::IpcBridge)
+        .collect();
+    assert_eq!(edges.len(), 7, "no bridges for similar names or sizeof");
+    assert!(edges
+        .iter()
+        .all(|e| e.call_site == trace_analysis::SYNTHETIC_CALL_SITE));
+
+    for bridge in &pag.ipc_bridges {
+        assert!(analysis.execution_contexts.iter().any(|c| {
+            c.entry == bridge.stub_handler && c.kind == trace_analysis::ContextKind::IpcHandler
+        }));
+    }
+
+    let (pag, disabled) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            enable_ipc: false,
+            ..Default::default()
+        },
+    );
+    assert!(pag.ipc_bridges.is_empty());
+    assert!(disabled
+        .call_edges
+        .iter()
+        .all(|e| e.resolution != ResolutionKind::IpcBridge));
+    assert!(trace_ir::LinkingFacts::collect(&program, false)
+        .senders
+        .is_empty());
+}
+
+#[test]
 fn ipc_if_else_bridges_proxy_to_stub() {
     let (program, pag, analysis) = build("ipc_if_else");
 

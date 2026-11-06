@@ -298,11 +298,7 @@ impl LinkingFacts {
             .symbols
             .call_sites
             .iter()
-            .filter(|c| {
-                ipc_enabled
-                    && !c.unevaluated
-                    && c.callee_name.rsplit([':', '>', '.']).next() == Some("SendRequest")
-            })
+            .filter(|c| ipc_enabled && !c.unevaluated && crate::is_ipc_send(&c.callee_name))
             .map(|c| c.caller)
             .collect();
         senders.sort();

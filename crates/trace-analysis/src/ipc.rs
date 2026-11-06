@@ -10,7 +10,8 @@
 //!
 //! - A **stub** class is identified by its name ending in `Stub`.
 //! - A **proxy** class is identified by its name ending in `Proxy` or `Client` plus
-//!   the presence of a call whose final callable segment is `SendRequest`.
+//!   the presence of an IPC send call (see docs/ANALYSIS.md,
+//!   "OpenHarmony IPC bridges").
 //! - Bridges pair proxy methods to stub handlers by interface class name +
 //!   method name correspondence (e.g. `FooProxy::Bar` → `FooStub::Bar`).
 //! - A proxy/stub pair named by an `.idl` interface (`Program::idl_interfaces`)
@@ -19,7 +20,7 @@
 //!   from a bodyless sender to implementations of its named target member.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use trace_ir::{FnId, IpcBridge, Program, TypeKind};
+use trace_ir::{is_ipc_send, FnId, IpcBridge, Program, TypeKind};
 
 use crate::summaries::{class_may_be, Effect, EffectGroup, FnModelSet, ModelLookup};
 
@@ -320,7 +321,7 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
         .symbols
         .call_sites
         .iter()
-        .filter(|cs| !cs.unevaluated && final_callable_segment(&cs.callee_name) == "SendRequest")
+        .filter(|cs| !cs.unevaluated && is_ipc_send(&cs.callee_name))
         .map(|cs| cs.caller)
         .collect();
 
@@ -361,7 +362,7 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
                 stubs.push((class.clone(), handlers));
             }
         } else if is_proxy_class(class) {
-            // A proxy class: its methods that call SendRequest are IPC sends.
+            // A proxy class: its methods that call an IPC send are senders.
             for (method, id) in methods {
                 if senders.contains(id) {
                     proxies.push((class.clone(), method.clone(), *id));
@@ -375,7 +376,7 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
     }
     // IDL-generated pairs (docs/ANALYSIS.md, "IDL-generated interfaces"): the
     // synthesized proxy and stub are declarations only, so neither shows a
-    // `SendRequest` call or a handler body. The IDL itself declares them a
+    // recognized IPC send call or a handler body. The IDL itself declares them a
     // pair; its stub has no handlers, so pairing takes the interface fallback.
     let mut known_stubs: FxHashSet<String> = stubs.iter().map(|(c, _)| c.clone()).collect();
     let mut known_senders: FxHashSet<FnId> = proxies.iter().map(|(_, _, id)| *id).collect();
@@ -819,13 +820,6 @@ fn is_proxy_class(class: &str) -> bool {
     class.ends_with("Proxy") || class.ends_with("Client")
 }
 
-/// Final callable segment of either a qualified name or a member expression.
-/// Lowering may retain `remote->` / `remote.` when the receiver type cannot
-/// be resolved, so those separators have to be handled alongside `::`.
-fn final_callable_segment(name: &str) -> &str {
-    name.rsplit([':', '>', '.']).next().unwrap_or(name)
-}
-
 /// Split a qualified C++ function name into `(class, method)`.
 /// Returns `None` for plain/non-member functions and destructors.
 fn split_qualified(name: &str) -> Option<(String, String)> {
@@ -982,17 +976,6 @@ mod tests {
         assert_eq!(
             remote_interface_candidates("svc::Wrapper<IFoo>", "svc", "IRemoteStub"),
             Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn send_request_match_uses_exact_member_name() {
-        assert_eq!(final_callable_segment("remote->SendRequest"), "SendRequest");
-        assert_eq!(final_callable_segment("Remote::SendRequest"), "SendRequest");
-        assert_eq!(final_callable_segment("remote.SendRequest"), "SendRequest");
-        assert_ne!(
-            final_callable_segment("remote->SendRequestAsync"),
-            "SendRequest"
         );
     }
 }

@@ -3604,6 +3604,87 @@ fn named_edges(db: &std::path::Path) -> std::collections::BTreeSet<(String, Stri
 }
 
 #[test]
+fn separate_repositories_restore_send_transact_cmd_bridges() {
+    let tmp = tempdir().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/ipc_transact_cmd");
+    let inputs: Vec<_> = ["proxy", "stub"]
+        .iter()
+        .map(|part| {
+            let db = tmp.path().join(format!("{part}.db"));
+            analyze_repo(&root.join(part), &db);
+            db
+        })
+        .collect();
+    assert!(inputs
+        .iter()
+        .all(|db| !named_edges(db).iter().any(|(_, _, r)| r == "ipc")));
+    let output = tmp.path().join("merged.db");
+    let report = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.ipc_bridges_added, 7);
+    let edges: std::collections::BTreeSet<_> = named_edges(&output)
+        .into_iter()
+        .filter(|(_, _, r)| r == "ipc")
+        .collect();
+    let expected = [
+        (
+            "RenderStateObserverProxy::OnRenderStateChanged",
+            "RenderStateObserverService::OnRenderStateChanged",
+        ),
+        (
+            "RenderStateObserverProxy::Notify",
+            "RenderStateObserverStub::HandleNotify",
+        ),
+        (
+            "RenderStateObserverProxy::Changed",
+            "RenderStateObserverStub::ChangedStub",
+        ),
+        (
+            "RenderStateObserverProxy::DuplicateSends",
+            "RenderStateObserverStub::HandleDuplicateSends",
+        ),
+        (
+            "RenderStateObserverProxy::TemplateNotify",
+            "RenderStateObserverStub::HandleTemplateNotify",
+        ),
+        (
+            "RenderStateObserverProxy::HelperNotify",
+            "RenderStateObserverStub::HandleHelperNotify",
+        ),
+        (
+            "RenderStateObserverClient::Notify",
+            "RenderStateObserverStub::HandleNotify",
+        ),
+    ]
+    .into_iter()
+    .map(|(from, to)| {
+        (
+            format!("OHOS::AppExecFwk::{from}"),
+            format!("OHOS::AppExecFwk::{to}"),
+            "ipc".to_string(),
+        )
+    })
+    .collect();
+    assert_eq!(edges, expected);
+    let c = Connection::open(&output).unwrap();
+    let invalid: i64 = c
+        .query_row(
+            "SELECT count(*) FROM call_edges WHERE resolution='ipc' AND call_site_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid, 0);
+}
+
+#[test]
 fn separate_repositories_restore_ipc_and_virtual_provider_path() {
     let tmp = tempdir().unwrap();
     let inputs: Vec<_> = ["app", "proxy", "stub"]

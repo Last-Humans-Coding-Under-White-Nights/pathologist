@@ -4,6 +4,20 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Bridge IPC operations through `SendTransactCmd`
+
+OpenHarmony proxy methods that call `SendTransactCmd` now connect to the
+corresponding stub handlers, including concrete service overrides. Previously
+only the transport helper's `SendRequest` call counted as a send, leaving its
+calling operations without IPC edges. Declaration-only helpers are supported.
+
+`trace-merge` reconstructs these bridges across independently indexed proxy
+and stub repositories. Re-index proxy-side databases created before this
+change to include `SendTransactCmd` senders.
+
+See [IPC bridge rules](docs/ANALYSIS.md#openharmony-ipc-bridges) and
+[production evaluation](docs/EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
+
 ### Preserve pointee aliases through owning-pointer `get()` (#247)
 
 Bodyless `std::shared_ptr<T>::get()` and `std::unique_ptr<T>::get()` retain

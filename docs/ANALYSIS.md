@@ -1790,8 +1790,32 @@ When `retain_points_to` is false (default), points-to sets are discarded after s
 ### OpenHarmony IPC bridges
 
 For an in-tree OpenHarmony proxy/stub pair, analysis adds a synthetic call
-edge from a proxy method that calls `SendRequest` to the corresponding stub
-handler. Classes are paired by their qualified `*Proxy`/`*Client` and `*Stub`
+edge from a proxy method that calls `SendRequest` or `SendTransactCmd` to the
+corresponding stub handler. The final callable name segment must match exactly;
+qualified, unqualified, `remote->` and `remote.` spellings are accepted, including
+explicit template arguments and the member `template` keyword, while
+names such as `SendTransactCmdAsync` and `LogSendTransactCmdResult` are not.
+Unevaluated calls do not count. `SendTransactCmd` is the OpenHarmony proxy
+helper that forwards a transaction to `SendRequest`; recognizing it marks the
+calling proxy method as a sender even when the helper body is unavailable.
+Other helper names are intentionally not recognized: sender status does not
+propagate through calls to arbitrary transport wrappers.
+The same predicate records IPC senders in exported linking facts, so
+`trace-merge` can reconstruct pairs indexed in separate repositories.
+Proxy-side databases indexed before `SendTransactCmd` support must be
+re-indexed to export those senders; the linking-facts format remains compatible
+and merging an older database does not warn about missing senders.
+
+For `FooProxy::Run() -> FooProxy::SendTransactCmd() -> remote->SendRequest()`,
+the synthetic bridge connects `FooProxy::Run` to its matching stub handler.
+The operation's name supplies the handler correspondence; a shared transport
+helper does not identify which handler processes a transaction. Ordinary
+calls to the helper remain, and resolving the final remote-object call still
+requires sufficient receiver/declaration information. This does not add
+opcode dispatch or parcel-flow analysis. Production verification of this
+pattern is recorded in the [evaluation report](EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
+
+Classes are paired by their qualified `*Proxy`/`*Client` and `*Stub`
 names; methods match exactly, with `HandleX` and `XStub` handler fallbacks.
 For a stub with interface-only declarations, defined overrides in classes
 deriving from that stub are preferred; otherwise matching methods on the
@@ -5969,11 +5993,11 @@ Measured indexing, storage and query cost:
   report none (e.g. stub-side `super->X` calls behind an opaque IPC
   boundary in HDF — their baseline targets were cross-object pollution, not
   real resolutions).
-- **IPC / process boundaries are only partly modeled**: OpenHarmony
-  `SendRequest` proxy methods connect to same-tree, conventionally named stub
-  handlers through synthetic `ipc` call edges. Opcode dispatch, parcel flow,
-  cross-repository services, and `HdfRemoteServiceObtain`-style registrations
-  remain unmodeled.
+- **IPC / process boundaries are only partly modeled**: OpenHarmony proxy
+  operations connect to conventionally named stub handlers through synthetic
+  `ipc` call edges, including reconstruction from separately indexed repositories;
+  see [OpenHarmony IPC bridges](#openharmony-ipc-bridges). Opcode dispatch,
+  parcel flow and `HdfRemoteServiceObtain`-style registrations remain unmodeled.
 - **`memcpy` / `memmove`**: modeled through function models (see above);
   unmodeled copier names remain invisible.
 - Macro-generated identifiers may be skipped when classified as macro-like callees.
