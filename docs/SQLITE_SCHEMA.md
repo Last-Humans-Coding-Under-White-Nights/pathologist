@@ -240,6 +240,14 @@ lambda, then joins the original entering edges to preserve provenance.
 Callers entering the same lambda share that closure computation within a
 SQL statement. Queries recompute the closure; it is not stored graph data.
 
+Current inspection queries load the complete projected graph before bounded
+traversal. `--depth` and callchain's `--limit` restrict traversal/output after
+projection, not SQL closure work. A large lambda component can therefore
+affect a query whose visible root does not reach it. Root-scoped projection
+and an indexed projection stored at export time are not implemented. See the
+[bounded synthetic measurements](EVAL_REPORT.md#lambda-free-view-review--2026-11-06);
+they do not establish latency or scalability on full production corpora.
+
 | Column | Meaning |
 |--------|---------|
 | `entry_edge_id` | Original `call_edges.id` of the first edge in the path; **not unique** in this view (one entering edge may reach several callees) |
