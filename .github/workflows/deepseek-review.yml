@@ -1,20 +1,23 @@
 name: DeepSeek PR Review
 
 on:
+  # Retargeting a stacked PR is an "edited" event that changes the reviewed diff
+  # without a new commit, so it is reviewed again; other edits start no review.
   pull_request_target:
-    types: [opened, reopened, ready_for_review, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize, edited]
 
 # The action works with the reviewer GitHub App token only.
 permissions: {}
 
 concurrency:
-  group: deepseek-review-${{ github.event.pull_request.number }}
+  # A title or body edit gets its own group, so it never cancels a running review.
+  group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: true
 
 jobs:
   review:
     # Forks of this repository have no reviewer secrets.
-    if: github.repository_owner == 'LHCWN'
+    if: github.repository_owner == 'LHCWN' && (github.event.action != 'edited' || github.event.changes.base)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
