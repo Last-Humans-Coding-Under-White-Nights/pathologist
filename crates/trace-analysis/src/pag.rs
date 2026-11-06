@@ -81,6 +81,8 @@ pub struct Pag {
     /// Synthetic null values with no other producer; excludes mutable variables.
     pub(crate) null_temps: FxHashSet<PagNodeId>,
     pub fn_locations: IndexMap<FnId, LocId, FxBuildHasher>,
+    pub(crate) reinterpret_nodes: FxHashSet<PagNodeId>,
+    reinterpret_locations: FxHashMap<LocId, LocId>,
     pub var_location: IndexMap<VarId, LocId, FxBuildHasher>,
     /// Interned `StringConst` locations keyed by literal contents.
     pub string_locs: FxHashMap<String, LocId>,
@@ -183,7 +185,10 @@ impl Pag {
             if is_static && !named.contains(&var.id) {
                 continue;
             }
-            self.var_node_id(var.id);
+            let node = self.var_node_id(var.id);
+            if var.temp == Some(trace_ir::TempKind::Reinterpret) {
+                self.reinterpret_nodes.insert(node);
+            }
             if !is_static {
                 continue;
             }
@@ -600,6 +605,29 @@ impl Pag {
         }
     }
 
+    /// A cast-qualified function value has its own location, preserving the
+    /// original FnId while leaving ordinary locations' storage guards intact.
+    pub(crate) fn reinterpret_location(&mut self, original: LocId) -> LocId {
+        if self.locations[original.0 as usize].kind != LocKind::Function {
+            return original;
+        }
+        if let Some(&loc) = self.reinterpret_locations.get(&original) {
+            return loc;
+        }
+        let mut location = self.locations[original.0 as usize].clone();
+        let id = LocId(self.locations.len() as u32);
+        location.id = id;
+        self.alloc_loc(location);
+        self.set_location_target(id, self.location_target(original));
+        self.reinterpret_locations.insert(original, id);
+        self.reinterpret_locations.insert(id, id);
+        id
+    }
+
+    pub(crate) fn is_reinterpreted_location(&self, loc: LocId) -> bool {
+        self.reinterpret_locations.get(&loc) == Some(&loc)
+    }
+
     fn build_function_locations(&mut self, program: &Program) {
         for func in &program.symbols.functions {
             if self.fn_locations.contains_key(&func.id) {
@@ -641,6 +669,11 @@ impl Pag {
                     // remapped at merge; a global name lookup here could bind
                     // an unrelated same-name function (e.g. file-`static`s).
                     if let Some(&fn_loc) = self.fn_locations.get(callee) {
+                        let fn_loc = if self.reinterpret_nodes.contains(&dst_n) {
+                            self.reinterpret_location(fn_loc)
+                        } else {
+                            fn_loc
+                        };
                         let loc_n = self.loc_node[&fn_loc];
                         self.add_addr_of(dst_n, loc_n);
                     }

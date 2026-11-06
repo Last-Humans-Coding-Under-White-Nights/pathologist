@@ -1,5 +1,165 @@
 # Evaluation Report
 
+## Explicit instantiations and member-pointer calls: #246 — 2026-10-30
+
+The corpus measurements and 119-check/34-table validation claims in this section
+are the historical report recorded in `6d3485f`, before the #257 using-directive
+and later review fixes. They do **not** validate the final reviewed code. The
+pinned corpus checkouts are unavailable locally for this follow-up, so no final
+corpus counts or expectation centers have been recaptured. The PR description's
+older validation paragraph likewise applies to that historical snapshot.
+
+Fresh macOS release builds compared against `d23d70e`, with the clean revisions
+in `scripts/eval_expected.json`, minimal export, jobs 8 and a solver budget of
+800,000 pops. The custom preprocessor is used throughout, without SDK headers.
+Rules and deliberate approximations live in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+**Parser recovery.** Independent reductions cover explicit class and member
+instantiations (declarations and definitions, qualified names, pointer and
+reference returns), nested SFINAE pointer defaults, and `.*` / `->*` calls.
+Raw-parser tests establish which forms the pinned grammar rejects; adapted
+inputs parse without errors, while malformed neighbors still report errors.
+The shared-header fixtures retain template members, defaults and original
+positions, without phantom definitions or duplicate instantiation identities.
+Header and macro member-call spelling/expansion positions are checked separately.
+
+| Corpus | Parse-stage diagnostics before → after | Preprocess diagnostics before → after |
+|---|---:|---:|
+| HDF | unchanged | unchanged |
+| HiView | 81 → 64 | 2,908 → 2,908 |
+| Camera | 417 → 358 | 4,395 → 4,395 |
+
+HiView's `encoded_param.h` and `raw_data_builder.h` lose their parse warnings.
+`sys_event.h`'s explicit member instantiations recover, but unrelated syntax
+still leaves a warning in that header. Camera's five `camera_napi_adaptor.h`
+member invocations and the named `dps.h` form no longer cause production parse
+warnings. The standalone `parse_failures` helper can select C for an orphan
+`.h`; its `*` errors in such a reparse are not a C++ member-call recovery
+measurement. No parse-error suppression was added.
+
+**Calls and value flow.** The two-TU fixture checks local copies, named member
+pointer declarations and parameters, object/reference/pointer receivers, callback
+argument positions and invocation, return pointees, wrong-owner/signature
+exclusion, and shared virtual-dispatch behavior including a final receiver.
+Template-dependent receiver/signature tests remain conservative, including
+parameter packs whose final arity is unknown.
+
+Camera gains exactly 12 indirect edges, all at the named adaptor sites:
+`SetArgImpl:97` and `SetArg:120` each reach
+`CaptureSession::EnableCompositionEffectPreview` and
+`CaptureSession::SetRecommendedInfoLanguage`; `GetArg:151` reaches
+`CaptureSession::GetSupportedRecommendedInfoLanguage` and
+`CaptureSession::IsCompositionEffectPreviewSupported`; `RegCallback:172`
+reaches the four `StitchingPhotoSession::SetStitching*Callback` members and
+`CaptureSession::SetCompositionEffectReceiveCallback`; and
+`UnregCallback:195` reaches
+`CaptureSession::UnSetCompositionEffectReceiveCallback`. No pre-existing
+indirect edge is lost. Parsing `(server.get()->*func)(cmd)` in `dps.h` does not
+supply the missing `get()` alias/value flow; that remains a separate gap.
+Grouped callback-map operands such as Camera's `this->*((...))` now parse;
+resolving their standard-library iterator/map values remains a separate gap.
+
+**Review follow-up — 2026-11-02.** Keeping a lexical dependent class instance
+conservative in a member-pointer signature recovers the twelfth adaptor edge,
+`RegCallback:172 -> CaptureSession::SetCompositionEffectReceiveCallback`.
+The call at `camera_session_napi.cpp:5379` supplies that exact member address;
+its declared argument is `std::shared_ptr<NativeInfoCallback<CompositionEffectInfo>>`,
+while the adaptor spells `std::shared_ptr<NativeInfoCallback<T>>`. Against
+`b8d307f`, Camera gains one indirect/total edge and two argument-flow rows;
+no indirect edge is lost, and HDF and HiView metrics are unchanged. The focused
+regressions also check base-typed receivers after explicit member-pointer
+conversion, unrelated-owner exclusion, and contextual overload selection for
+declarations, assignments and arrays, including known concrete template
+arguments and reinterpretation barriers. The workspace suite passes all 2,608
+tests. Both jobs 1 and jobs 8 pass all 118 pinned-corpus checks, and all 34
+analysis tables match row for row for each corpus (excluding run metadata).
+
+**Review follow-up — 2026-11-03.** Instance-member callback operands now load
+through the shared implicit-field machinery, including inherited field summaries
+and local shadowing. Defined member-pointer targets preserve the address-taking
+TU's identity; direct calls still select their own TU's body. An unresolved
+virtual receiver uses the bound member's owner as its dispatch root, while a
+known final receiver retains its boundary. Three regressions reproduce the
+previous failures independently. All 2,611 workspace tests pass, as do all 118
+pinned-corpus checks with both jobs 1 and 8. All 34 analysis tables match across
+job counts in each corpus. Global metrics are unchanged from `ef423b7`, so the
+expectations and tolerances are unchanged. The only exported data changes are
+`variables_data.type_id` for typed callback-load temporaries (HDF 4, HiView 6,
+Camera 55 rows) and the corresponding database identity; call edges are unchanged.
+
+**RHS grouping follow-up — 2026-11-03.** Binary parse placeholders keep array
+subscripts, field chains, parentheses and casts in the callable operand for
+both `->*` and `.*`. Regressions cover local-pointer equivalence, unknown-index
+array and field summaries, macro expansion, original byte/CRLF offsets, and
+C++14/C++17 operand sequencing. Compared with `d4f4a09`, all call edges and
+non-diagnostic global metrics are unchanged on the three pinned corpora.
+Camera has 19 fewer parse-diagnostic rows (10 distinct paths, including reused
+header variants): parse 377 → 358, total 5,211 → 5,192. The recovered spellings
+include `(this->*((ExecuteFunc)it->second))(...)` in `camera_ability_builder.cpp`
+and grouped register/unregister casts in both callback emitter headers; their
+includers account for the other recovered paths. No diagnostic is added.
+The exact diagnostic expectation is updated, without widening a tolerance;
+an exact probe requires both callback emitter headers to remain free of parse
+diagnostics. Iterator/map callback value flow still limits those call targets.
+All 2,614 workspace tests pass. Both jobs 1 and 8 pass all 119 pinned-corpus
+checks; all 34 analysis tables match across job counts for each corpus, and
+semantic call-edge identities match the parent.
+
+**Inline member-address follow-up — 2026-11-03.** The regression for
+`(b->*&B::f)()` now reaches both `B::f` and its `D::f` override, matching a
+local member-pointer value. It also checks grouped/dot operands, cast-selected
+overloads, final receivers, returned pointer values and a field hiding a global
+function. All 2,615 workspace tests and all 119 pinned-corpus checks pass with
+jobs 1 and 8. All 34 analysis tables match row for row across job counts and
+against `cdd75de` on HDF, HiView and Camera (excluding run metadata), so corpus
+expectations and tolerances are unchanged.
+
+HiView loses one phantom defined function whose name consumed
+`std::string TAG;...EventParamInfo` after the malformed instantiations in
+`raw_data_builder.h`. The test class and its generated test methods now have
+the correct `OHOS::HiviewDFX` ownership, instead of the leaked `EventRaw`
+namespace. This exposes the existing coarse treatment of receiver class names
+available only through `using namespace EventRaw`: some formerly direct/CHA
+edges become external stubs, while concrete base-member edges remain. This
+is receiver-type imprecision, distinct from parser recovery and from missing
+SDK declarations; the relevant policy is documented under C++ support in
+`ANALYSIS.md`. The namespace correction and phantom removal have exact probes.
+
+| Metric | HiView before → after | Camera before → after |
+|---|---:|---:|
+| Functions (defined / external) | 9,971 (7,993 / 1,978) → 9,994 (7,992 / 2,002) | unchanged at 23,722 |
+| Direct edges | 23,319 → 23,062 | 68,819 → 68,836 |
+| Indirect edges | unchanged at 246 | 442 → 454 |
+| External edges | 15,690 → 15,872 | 46,066 → 46,071 |
+| Total edges | 39,299 → 39,224 | 116,135 → 116,169 |
+| Argument-flow edges | 31,924 → 31,760 | 57,894 → 57,930 |
+| All diagnostics | 3,576 → 3,559 | 5,251 → 5,192 |
+
+HDF's metrics and existing dispatch/calibration probes are unchanged. Reviewed
+metric centers are re-captured without widening tolerances. All analysis tables
+(excluding run metadata) match across jobs 1 and 8 on all three corpora; fixture
+minimal and full exports also match across jobs 1 and 4. The focused regressions
+and `cargo test --workspace` pass.
+
+Follow-up review (#257): receiver type lookup now resolves class names introduced
+by active using-directives. Focused regressions retain the declared EventRaw
+base member without leaking its namespace into the test class; moving an
+overload definition between TUs still selects the imported class's compatible
+overload. The table above records the earlier measured revision. The pinned
+corpora were unavailable for this follow-up, so these changes have no new
+corpus counts or updated expectation centers.
+
+**Parser scaling follow-up (#257).** A release parser-only probe on this macOS
+workspace parsed the review's left-deep `x * 2 + ...` expression in approximately
+22 ms for 4,000 terms and 52 ms for 16,000 terms (one run; normalization included,
+lowering and solving excluded). The grouping walk carries parent state on its
+stack, removing depth-dependent root searches. Clean named and unnamed
+member-pointer parameter lists each use one full-source parse, verified by a
+parser test; ambiguous declarations still receive their required repair parse.
+Reproduce with `cargo test --release -p trace-parse deep_expression_scaling_probe
+-- --ignored --nocapture`. These are microbenchmark results, not corpus timings.
+
 ## Owning-pointer `get()` aliases — 2026-10-31
 
 Issue #247: accessing a callback through `p.get()->callback` lost the

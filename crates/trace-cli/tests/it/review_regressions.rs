@@ -51,15 +51,14 @@ fn recovery_keeps_distinct_overload_families_when_a_definition_moves() {
                     && p.symbols.function(e.callee).is_defined
             })
             .collect();
-        assert_eq!(targets.len(), 2, "local={local}: {targets:?}");
+        assert_eq!(targets.len(), 1, "local={local}: {targets:?}");
         assert!(
-            analysis
+            !analysis
                 .call_edges
                 .iter()
                 .any(|e| p.symbols.function(e.caller).name == "missing::use"
-                    && p.symbols.function(e.callee).name == "missing::Widget::Run"
                     && e.resolution == ResolutionKind::External),
-            "this case must exercise undeclared-receiver recovery"
+            "using-directive lookup must resolve the declared class"
         );
         assert!(targets.iter().any(|e| p.symbols.files
             [p.symbols.function(e.callee).file.0 as usize]
@@ -83,7 +82,7 @@ fn recovery_prefers_local_copies_only_within_the_same_signature() {
                 && p.symbols.function(e.callee).is_defined
         })
         .collect();
-    assert_eq!(targets.len(), 2);
+    assert_eq!(targets.len(), 1);
     assert!(targets.iter().all(
         |e| p.symbols.files[p.symbols.function(e.callee).file.0 as usize]
             .path

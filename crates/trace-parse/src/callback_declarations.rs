@@ -226,6 +226,7 @@ fn template_type_name(ctx: &LowerContext, source: &str, node: Node, name: &str) 
 
 fn pointer_name(node: Node) -> bool {
     match node.cached_kind() {
+        "subscript_expression" => node.cached_field("argument").is_some_and(pointer_name),
         "identifier" => true,
         "pointer_expression" => {
             node.cached_field("operator")

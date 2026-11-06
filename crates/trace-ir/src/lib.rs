@@ -2,6 +2,7 @@
 
 mod call_name;
 mod cfg;
+mod cpp_type_names;
 mod flow;
 mod ids;
 pub mod ipc;
@@ -14,6 +15,7 @@ mod types;
 
 pub use call_name::CallName;
 pub use cfg::*;
+pub use cpp_type_names::*;
 pub use flow::*;
 pub use ids::*;
 pub use ipc::*;

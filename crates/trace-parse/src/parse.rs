@@ -74,6 +74,7 @@ fn parse_source(
     lang: SourceLang,
     incremental: bool,
 ) -> Result<ParseResult, String> {
+    let original = Arc::clone(&source);
     let source = if lang == SourceLang::Cpp {
         normalize_cpp_parse_syntax(&source)
     } else {
@@ -127,13 +128,388 @@ fn parse_source(
         parse(&mut None)
     };
     let tree = tree.ok_or_else(|| "tree-sitter returned no tree".to_string())?;
+    let insertions = if lang == SourceLang::Cpp {
+        pointer_declaration_insertions(&original)
+            .into_iter()
+            .filter(|(offset, text)| {
+                if text != " __trace_param" {
+                    return true;
+                }
+                let end = original[..*offset].trim_end().len();
+                let Some(leaf) = tree
+                    .root_node()
+                    .named_descendant_for_byte_range(end.saturating_sub(1), end)
+                else {
+                    return true;
+                };
+                // Clean parameter declarations already carry the intended type.
+                // Only expression/declaration ambiguities need a virtual name.
+                !std::iter::successors(Some(tree.root_node()), |n| n.child_with_descendant(leaf))
+                    .take_while(|n| n.id() != leaf.id())
+                    .any(|n| {
+                        matches!(
+                            n.kind(),
+                            "parameter_declaration" | "optional_parameter_declaration"
+                        )
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let tree = if lang == SourceLang::Cpp {
+        if insertions.is_empty() {
+            tree
+        } else {
+            parse_with_insertions(&source, &insertions)
+                .ok_or_else(|| "tree-sitter returned no declaration tree".to_string())?
+        }
+    } else {
+        tree
+    };
+    // Edited grouping trees contain virtual punctuation and must never seed
+    // incremental reuse. The cached tree above is the ordinary placeholder
+    // parse; repair it again from the current original spelling on each use.
+    let tree = if lang == SourceLang::Cpp {
+        if let Some(groups) = member_pointer_grouping(&original, &tree) {
+            parse_member_pointer_grouping(&source, &groups, &insertions)
+                .ok_or_else(|| "tree-sitter returned no grouping tree".to_string())?
+        } else {
+            tree
+        }
+    } else {
+        tree
+    };
     Ok(ParseResult { tree, source })
 }
 
+#[cfg(test)]
+thread_local! { static FULL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn parse_tree(parser: &mut Parser, source: &str, previous: Option<&Tree>) -> Option<Tree> {
+    #[cfg(test)]
+    FULL_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     let tree = parser.parse(source, previous);
     parser.reset();
     tree
+}
+
+/// Repair the binary placeholder's precedence without changing the source
+/// offsets exposed to lowering. Flatten each binary region, then reduce it
+/// using the original C++ precedences to find the member-pointer bindings.
+fn member_pointer_grouping(source: &str, tree: &Tree) -> Option<Vec<(usize, usize)>> {
+    if !source.contains("->*") && !source.contains(".*") {
+        return None;
+    }
+    fn precedence(operator: &str) -> u8 {
+        match operator {
+            "||" | "or" => 1,
+            "&&" | "and" => 2,
+            "|" | "bitor" => 3,
+            "^" | "xor" => 4,
+            "&" | "bitand" => 5,
+            "==" | "!=" | "not_eq" => 6,
+            "<" | ">" | "<=" | ">=" => 7,
+            "<=>" => 8,
+            "<<" | ">>" => 9,
+            "+" | "-" => 10,
+            "*" | "/" | "%" => 11,
+            _ => 0,
+        }
+    }
+    #[derive(Clone, Copy)]
+    struct Operator {
+        precedence: u8,
+        member: bool,
+        right_associative: bool,
+        extent: (usize, usize),
+    }
+    enum Part<'t> {
+        Node(Node<'t>),
+        Op(Operator),
+    }
+    fn reduce(
+        values: &mut Vec<(usize, usize)>,
+        op: Operator,
+        groups: &mut Vec<(usize, usize)>,
+        changed: &mut bool,
+    ) {
+        let right = values.pop().unwrap();
+        let left = values.pop().unwrap();
+        let extent = (left.0, right.1);
+        if op.member {
+            *changed |= extent != op.extent;
+            groups.push(extent);
+        }
+        values.push(extent);
+    }
+    let mut groups = Vec::new();
+    let mut changed = false;
+    let mut nodes = vec![(tree.root_node(), false)];
+    while let Some((node, inside_binary)) = nodes.pop() {
+        let binary = matches!(node.kind(), "binary_expression" | "assignment_expression");
+        nodes.extend(
+            node.named_children(&mut node.walk())
+                .map(|child| (child, binary)),
+        );
+        if !binary || inside_binary {
+            continue;
+        }
+        let mut parts = Vec::new();
+        let mut pending = vec![Part::Node(node)];
+        let mut has_member = false;
+        while let Some(part) = pending.pop() {
+            match part {
+                Part::Node(n)
+                    if matches!(n.kind(), "binary_expression" | "assignment_expression") =>
+                {
+                    let (Some(left), Some(right), Some(op)) = (
+                        n.child_by_field_name("left"),
+                        n.child_by_field_name("right"),
+                        n.child_by_field_name("operator"),
+                    ) else {
+                        return None;
+                    };
+                    let member = member_pointer_operator_at(source, op.start_byte()).is_some();
+                    has_member |= member;
+                    pending.push(Part::Node(right));
+                    pending.push(Part::Op(Operator {
+                        precedence: if member { 12 } else { precedence(op.kind()) },
+                        member,
+                        right_associative: n.kind() == "assignment_expression",
+                        extent: (n.start_byte(), n.end_byte()),
+                    }));
+                    pending.push(Part::Node(left));
+                }
+                part => parts.push(part),
+            }
+        }
+        if !has_member {
+            continue;
+        }
+        let mut values = Vec::new();
+        let mut operators: Vec<Operator> = Vec::new();
+        for part in parts {
+            match part {
+                Part::Node(n) => values.push((n.start_byte(), n.end_byte())),
+                Part::Op(op) => {
+                    while operators.last().is_some_and(|p| {
+                        p.precedence > op.precedence
+                            || (p.precedence == op.precedence && !op.right_associative)
+                    }) {
+                        reduce(
+                            &mut values,
+                            operators.pop().unwrap(),
+                            &mut groups,
+                            &mut changed,
+                        );
+                    }
+                    operators.push(op);
+                }
+            }
+        }
+        while let Some(op) = operators.pop() {
+            reduce(&mut values, op, &mut groups, &mut changed);
+        }
+    }
+    changed.then_some(groups)
+}
+
+/// Parentheses exist only for this fresh parse. Remove their bytes from the
+/// completed tree, keeping zero-width punctuation and the corrected grouping.
+fn parse_member_pointer_grouping(
+    source: &str,
+    groups: &[(usize, usize)],
+    declarations: &[(usize, String)],
+) -> Option<Tree> {
+    let mut groups: Vec<_> = groups
+        .iter()
+        .flat_map(|&(start, end)| [(start, '('), (end, ')')])
+        .collect();
+    // At a shared boundary close the preceding binding before opening one.
+    groups.sort_by_key(|&(offset, byte)| (offset, byte == '('));
+    let mut insertions: Vec<_> = groups
+        .into_iter()
+        .map(|(offset, byte)| (offset, byte.to_string()))
+        .collect();
+    insertions.extend_from_slice(declarations);
+    parse_with_insertions(source, &insertions)
+}
+
+fn parse_with_insertions(source: &str, insertions: &[(usize, String)]) -> Option<Tree> {
+    let mut insertions = insertions.to_vec();
+    insertions.sort_by_key(|(offset, _)| *offset);
+    // Equal insertions can be distinct nested grouping tokens. Preserve them.
+    let mut input = String::with_capacity(source.len() + insertions.len() * 24);
+    let mut edits = Vec::new();
+    let (mut previous, mut row, mut column) = (0, 0, 0);
+    for (offset, text) in insertions {
+        let chunk = &source[previous..offset];
+        input.push_str(chunk);
+        for byte in chunk.bytes() {
+            if byte == b'\n' {
+                row += 1;
+                column = 0;
+            } else {
+                column += 1;
+            }
+        }
+        edits.push((input.len(), text.len(), Point::new(row, column)));
+        input.push_str(&text);
+        column += text.len();
+        previous = offset;
+    }
+    input.push_str(&source[previous..]);
+    let mut tree = PARSER_CPP.with(|p| parse_tree(&mut p.borrow_mut(), &input, None))?;
+    for (offset, len, point) in edits.into_iter().rev() {
+        tree.edit(&InputEdit {
+            start_byte: offset,
+            old_end_byte: offset + len,
+            new_end_byte: offset,
+            start_position: point,
+            old_end_position: Point::new(point.row, point.column + len),
+            new_end_position: point,
+        });
+    }
+    Some(tree)
+}
+
+fn pointer_declaration_insertions(source: &str) -> Vec<(usize, String)> {
+    if !source.contains("template") && (!source.contains("::") || !source.contains('*')) {
+        return Vec::new();
+    }
+    let bytes = source.as_bytes();
+    let mut insertions = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let next = skip_ws_and_comments(bytes, i);
+        if next != i {
+            i = next;
+            continue;
+        }
+        if let Some(end) = literal_end(bytes, i) {
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'(' {
+            if let Some(shape) = member_fn_pointer_shape(bytes, i) {
+                if shape.named {
+                    let open = skip_ws_and_comments(bytes, shape.declarator_end);
+                    for (start, end) in comma_parts(bytes, open + 1, shape.params_end - 1) {
+                        let text = source[start..end].trim();
+                        if text != "void"
+                            && !text.contains(['(', '[', '='])
+                            && !text.contains("...")
+                            && cpp_type_operand_parses(text)
+                        {
+                            insertions.push((end, " __trace_param".into()));
+                        }
+                    }
+                }
+            }
+        }
+        if keyword_at(bytes, i, b"template") {
+            let open = skip_ws_and_comments(bytes, i + 8);
+            if bytes.get(open) == Some(&b'<') {
+                if let Some(end) = template_args_end(bytes, open) {
+                    for (start, end) in comma_parts(bytes, open + 1, end - 1) {
+                        if let Some(eq) = parameter_default_at(bytes, start, end) {
+                            let default = source[eq + 1..end].trim();
+                            let head = source[start..eq].trim_start();
+                            if (head.starts_with("class ") || head.starts_with("typename "))
+                                && default.contains('*')
+                                && cpp_type_operand_parses(default)
+                            {
+                                let begin = eq + 1 + source[eq + 1..end].len()
+                                    - source[eq + 1..end].trim_start().len();
+                                let finish = end - source[eq + 1..end].len()
+                                    + source[eq + 1..end].trim_end().len();
+                                insertions.push((begin, "decltype(static_cast<".into()));
+                                insertions.push((finish, ">(nullptr))".into()));
+                            }
+                            let text = source[start..eq].trim_end();
+                            let mut tail = text;
+                            loop {
+                                let before = tail;
+                                tail = tail
+                                    .trim_end()
+                                    .strip_suffix("const")
+                                    .or_else(|| tail.trim_end().strip_suffix("volatile"))
+                                    .unwrap_or(tail)
+                                    .trim_end();
+                                if tail == before {
+                                    break;
+                                }
+                            }
+                            if tail.ends_with('*') && cpp_type_operand_parses(text) {
+                                insertions.push((eq, " __trace_sfinae ".into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    insertions
+}
+
+fn parameter_default_at(bytes: &[u8], mut at: usize, end: usize) -> Option<usize> {
+    while at < end {
+        let skipped = skip_ws_and_comments(bytes, at);
+        if skipped != at {
+            at = skipped;
+            continue;
+        }
+        if bytes[at] == b'(' {
+            at = parenthesized_end(bytes, at)?;
+            continue;
+        }
+        if bytes[at] == b'<' {
+            at = template_args_end(bytes, at)?;
+            continue;
+        }
+        if bytes[at] == b'=' && bytes.get(at + 1) != Some(&b'=') {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+fn comma_parts(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let (mut at, mut first) = (start, start);
+    let mut parts = Vec::new();
+    while at < end {
+        let skipped = skip_ws_and_comments(bytes, at);
+        if skipped != at {
+            at = skipped;
+            continue;
+        }
+        if let Some(after) = literal_end(bytes, at) {
+            at = after;
+            continue;
+        }
+        if bytes[at] == b'(' {
+            if let Some(after) = parenthesized_end(bytes, at) {
+                at = after;
+                continue;
+            }
+        }
+        if bytes[at] == b'<' {
+            if let Some(after) = template_args_end(bytes, at) {
+                at = after;
+                continue;
+            }
+        }
+        if bytes[at] == b',' {
+            parts.push((first, at));
+            first = at + 1;
+        }
+        at += 1;
+    }
+    parts.push((first, end));
+    parts
 }
 
 fn cacheable_source(source: &str) -> bool {
@@ -353,6 +729,24 @@ mod incremental_tests {
         (0..800)
             .map(|i| format!("struct Header{i} {{ int field; }};\n"))
             .collect()
+    }
+
+    #[test]
+    fn member_pointer_precedence_repairs_match_fresh_parses_after_reuse() {
+        let prefix = prefix();
+        for expression in [
+            "1 + v->*0",
+            "v->*0 * v->*1",
+            "v->*(a + b)",
+            "1 + v->*0->*1",
+            "1 + v->*0",
+        ] {
+            let source: Arc<str> = format!("{prefix}\nstruct V {{ int operator->*(int); }};\ntemplate<int * = nullptr> struct S {{}};\nint f(V v) {{ return {expression}; }}\n").into();
+            let reused = parse_index_source(Arc::clone(&source), SourceLang::Cpp).unwrap();
+            let fresh = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert!(!fresh.tree.root_node().has_error());
+            assert_same_nodes(reused.tree.root_node(), fresh.tree.root_node());
+        }
     }
 
     #[test]
@@ -739,21 +1133,28 @@ fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// additionally loses the trailing function qualifiers (`const`, `&`,
 /// `noexcept(...)`) that the grammar rejects on a named ordinary pointer.
 ///
+/// Member-pointer expression operators use an unambiguous binary placeholder
+/// so RHS postfix operations stay in the operand rather than on the receiver.
+/// The original operator remains the identity used by lowering and sequencing.
+///
 /// Must not run while `PARSER_CPP` is borrowed: candidate validation parses a
 /// scratch declaration on the same thread-local parser.
 pub(crate) fn normalize_cpp_parse_syntax(source: &Arc<str>) -> Arc<str> {
     let friend_candidates = source.contains("friend") && source.contains("[[");
-    let member_pointer_candidates =
-        source.contains("::") && source.contains('*') && source.contains('(');
+    let member_pointer_candidates = source.contains("::") && source.contains('*');
     let computed_base_candidates = source.contains("decltype");
     let typeof_candidates = source.contains("__typeof");
     let linkage_attribute_candidates =
         source.contains("__attribute__") && source.contains("extern");
+    let instantiation_candidates = source.contains("template");
+    let member_call_candidates = source.contains("->*") || source.contains(".*");
     if !friend_candidates
         && !member_pointer_candidates
         && !computed_base_candidates
         && !typeof_candidates
         && !linkage_attribute_candidates
+        && !instantiation_candidates
+        && !member_call_candidates
     {
         return Arc::clone(source);
     }
@@ -833,7 +1234,140 @@ pub(crate) fn normalize_cpp_parse_syntax(source: &Arc<str>) -> Arc<str> {
                 }
             }
         }
+        // Consume preprocessing-number and ellipsis tokens before looking for
+        // operators: the dot in 3.*p or ...*xs is not a member access.
         let at_token = i == 0 || !is_cpp_ident(bytes[i - 1]);
+        if at_token
+            && (bytes[i].is_ascii_digit()
+                || (bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)))
+        {
+            i += 1;
+            while i < bytes.len()
+                && (is_cpp_ident(bytes[i])
+                    || matches!(bytes[i], b'.' | b'\'')
+                    || (matches!(bytes[i], b'+' | b'-')
+                        && matches!(bytes[i - 1], b'e' | b'E' | b'p' | b'P')))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"...") {
+            i += 3;
+            continue;
+        }
+        if at_token && keyword_at(bytes, i, b"operator") {
+            if let Some(amp) = source[..i].rfind('&') {
+                let scope = source[amp + 1..i].trim();
+                if scope.ends_with("::") && !scope.contains([';', '{', '}', '(', ')', '=']) {
+                    let target = skip_ws_and_comments(bytes, i + 8);
+                    if ident_starts(bytes, target)
+                        && !keyword_at(bytes, target, b"new")
+                        && !keyword_at(bytes, target, b"delete")
+                    {
+                        let mut end = target;
+                        let mut depth = 0;
+                        while end < bytes.len() {
+                            match bytes[end] {
+                                b'<' => depth += 1,
+                                b'>' if depth == 0 => break,
+                                b'>' => depth -= 1,
+                                b';' | b',' | b')' | b'}' | b'(' if depth == 0 => break,
+                                _ => {}
+                            }
+                            end += 1;
+                        }
+                        if bytes.get(end) != Some(&b'(') && !source[i..end].contains(['\r', '\n']) {
+                            let end = source[..end].trim_end().len();
+                            let out = changed.get_or_insert_with(|| bytes.to_vec());
+                            for byte in &mut out[i..end] {
+                                if !is_cpp_ident(*byte) {
+                                    *byte = b'_';
+                                }
+                            }
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if member_call_candidates && at_token && keyword_at(bytes, i, b"operator") {
+            let name = skip_ws_and_comments(bytes, i + b"operator".len());
+            if bytes[name..].starts_with(b"->*") {
+                // An operator-function name is already accepted by the
+                // grammar, including declarations, addresses and explicit
+                // calls. Its star is part of the function's identity.
+                i = name + 3;
+                continue;
+            }
+        }
+        if member_call_candidates {
+            let width = if bytes[i..].starts_with(b"->*") {
+                3
+            } else if bytes[i..].starts_with(b".*") {
+                2
+            } else {
+                0
+            };
+            if width != 0 {
+                // A field-expression placeholder binds RHS postfix operators
+                // to the receiver (`p->callbacks[0]`). A binary `+` keeps the
+                // callable operand whole, including subscripts and parentheses.
+                // Offsets are unchanged; lowering reads the original operator.
+                let output = changed.get_or_insert_with(|| bytes.to_vec());
+                output[i] = b'+';
+                output[i + 1..i + width].fill(b' ');
+                i += width;
+                continue;
+            }
+        }
+        if at_token && instantiation_candidates {
+            if keyword_at(bytes, i, b"extern") {
+                let next = skip_ws_and_comments(bytes, i + 6);
+                if keyword_at(bytes, next, b"template")
+                    && bytes.get(skip_ws_and_comments(bytes, next + 8)) != Some(&b'<')
+                {
+                    blank_preserving_lines(
+                        &mut changed.get_or_insert_with(|| bytes.to_vec())[i..i + 6],
+                    );
+                }
+            }
+            if keyword_at(bytes, i, b"template") {
+                let next = skip_ws_and_comments(bytes, i + 8);
+                let len = if keyword_at(bytes, next, b"class") {
+                    5
+                } else if keyword_at(bytes, next, b"struct") {
+                    6
+                } else {
+                    0
+                };
+                // Preserve the native template_instantiation node. Its class
+                // key otherwise makes the grammar demand a second declarator.
+                if len != 0 {
+                    let mut end = skip_ws_and_comments(bytes, next + len);
+                    loop {
+                        let attr = if bytes[end..].starts_with(b"[[") {
+                            find_attribute_end(bytes, end)
+                        } else if keyword_at(bytes, end, b"__attribute__") {
+                            let open = skip_ws_and_comments(bytes, end + 13);
+                            (bytes.get(open) == Some(&b'('))
+                                .then(|| parenthesized_end(bytes, open))
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        match attr {
+                            Some(after) => end = skip_ws_and_comments(bytes, after),
+                            None => break,
+                        }
+                    }
+                    blank_preserving_lines(
+                        &mut changed.get_or_insert_with(|| bytes.to_vec())[next..end],
+                    );
+                }
+            }
+        }
         if at_token && keyword_at(bytes, i, b"__attribute__") {
             let mut end = i;
             while let Some(next) = visibility_attribute_end(bytes, end) {
@@ -943,6 +1477,29 @@ pub(crate) fn normalize_cpp_parse_syntax(source: &Arc<str>) -> Arc<str> {
                 // arguments and base list are scanned for the other shapes
                 // (`struct traits<R (C::*)(A...)> : base`), reading original
                 // bytes, so an edit computed above is never disturbed.
+            }
+        }
+        if bytes[i] == b'*' {
+            if let Some(owner) = member_data_pointer_owner(source, i) {
+                let start = owner.as_ptr() as usize - source.as_ptr() as usize;
+                // An incomplete parenthesized function-pointer declaration
+                // must not fall back to the data-member adaptation.
+                let function_tail = source[..start].trim_end().ends_with('(')
+                    && bytes[i + 1..]
+                        .iter()
+                        .position(|b| matches!(b, b')' | b';' | b'{' | b'}'))
+                        .is_some_and(|close| {
+                            let close = i + 1 + close;
+                            bytes[close] == b')'
+                                && bytes.get(skip_ws_and_comments(bytes, close + 1)) == Some(&b'(')
+                        });
+                if function_tail {
+                    i += 1;
+                    continue;
+                }
+                blank_preserving_lines(
+                    &mut changed.get_or_insert_with(|| bytes.to_vec())[start..i],
+                );
             }
         }
         match bytes[i] {
@@ -1074,6 +1631,8 @@ fn cpp_type_operand_parses(type_text: &str) -> bool {
 /// `( owner :: * [cv] [name] ) ( params ) suffix` recognized at its opening
 /// parenthesis. Byte ranges index the original source.
 struct MemberFnPointerShape {
+    /// The member-function pointer star, distinct from nested data pointers.
+    star: usize,
     /// `C::` or `ns::C::`, from the first owner byte through the final `::`.
     owner: std::ops::Range<usize>,
     /// Past the `)` closing the pointer declarator.
@@ -1189,6 +1748,84 @@ fn parenthesized_end(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// The original member-pointer operator at a syntax operator's offset, with
+/// `true` for `->*`. Parser placeholders carry grouping, not this identity.
+pub(crate) fn member_pointer_operator_at(source: &str, offset: usize) -> Option<bool> {
+    let rest = source.as_bytes().get(offset..)?;
+    if rest.starts_with(b"->*") {
+        Some(true)
+    } else if rest.starts_with(b".*") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Class scope immediately preceding a pointer-declarator star.
+pub(crate) fn member_data_pointer_owner(source: &str, star: usize) -> Option<&str> {
+    let prefix = source.get(..star)?.trim_end();
+    let end = prefix.strip_suffix("::")?.trim_end().len();
+    let bytes = source.as_bytes();
+    let mut p = end;
+    loop {
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p > 0 && bytes[p - 1] == b'>' {
+            let mut depth = 1;
+            p -= 1;
+            while p > 0 && depth != 0 {
+                p -= 1;
+                match bytes[p] {
+                    b'>' => depth += 1,
+                    b'<' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+        }
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        let name_end = p;
+        while p > 0 && is_cpp_ident(bytes[p - 1]) {
+            p -= 1;
+        }
+        if p == name_end {
+            return None;
+        }
+        let start = p;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p >= 2 && &bytes[p - 2..p] == b"::" {
+            p -= 2;
+            if p == 0 {
+                return Some(&source[..star]);
+            }
+        } else {
+            return Some(&source[start..star]);
+        }
+    }
+}
+
+pub(crate) fn member_fn_pointer_owner(source: &str, open: usize) -> Option<&str> {
+    if source.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    let shape = member_fn_pointer_shape(source.as_bytes(), open)?;
+    Some(&source[shape.owner])
+}
+
+pub(crate) fn member_fn_pointer_star(source: &str, open: usize) -> Option<usize> {
+    if source.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    Some(member_fn_pointer_shape(source.as_bytes(), open)?.star)
+}
+
 fn member_fn_pointer_shape(bytes: &[u8], open: usize) -> Option<MemberFnPointerShape> {
     debug_assert_eq!(bytes[open], b'(');
     let owner_start = skip_ws_and_comments(bytes, open + 1);
@@ -1203,7 +1840,9 @@ fn member_fn_pointer_shape(bytes: &[u8], open: usize) -> Option<MemberFnPointerS
         }
         p = ident_end(bytes, p);
         p = skip_ws_and_comments(bytes, p);
-        // Template-qualified owners (`W<int>::C::*`) are not approximated.
+        if bytes.get(p) == Some(&b'<') {
+            p = skip_ws_and_comments(bytes, template_args_end(bytes, p)?);
+        }
         if !bytes[p..].starts_with(b"::") {
             return None;
         }
@@ -1222,6 +1861,22 @@ fn member_fn_pointer_shape(bytes: &[u8], open: usize) -> Option<MemberFnPointerS
     let named = ident_starts(bytes, p);
     if named {
         p = skip_ws_and_comments(bytes, ident_end(bytes, p));
+    }
+    while bytes.get(p) == Some(&b'[') {
+        let mut q = p + 1;
+        let mut depth = 1;
+        while q < bytes.len() && depth != 0 {
+            match bytes[q] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            q += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        p = skip_ws_and_comments(bytes, q);
     }
     if bytes.get(p) != Some(&b')') {
         return None;
@@ -1264,6 +1919,7 @@ fn member_fn_pointer_shape(bytes: &[u8], open: usize) -> Option<MemberFnPointerS
         p = end;
     }
     Some(MemberFnPointerShape {
+        star,
         owner,
         declarator_end,
         params_end,
@@ -2014,7 +2670,10 @@ mod dependency_cpp_tests {
         let source: Arc<str> =
             Arc::from("template<class T, class C> struct Traits { using Member = T C::*; };\n");
         let raw = parse_source_with_lang(Arc::clone(&source), SourceLang::Cpp).unwrap();
-        assert!(has_parse_errors(&raw.tree));
+        assert!(
+            !has_parse_errors(&raw.tree),
+            "project aliases use the same recovery"
+        );
         let normalized = normalize_dependency_cpp_syntax(
             &source,
             &LineMap::new(),
@@ -2460,5 +3119,299 @@ int main() { return 0; }
             parse_source_with_lang("void f(Wrapper& w) { w.operator?->(); }", SourceLang::Cpp)
                 .unwrap();
         assert!(has_parse_errors(&malformed_q.tree));
+    }
+}
+
+#[cfg(test)]
+mod instantiation_member_call_tests {
+    use super::*;
+
+    #[test]
+    fn clean_member_pointer_parameters_need_no_reparse() {
+        assert!(!cpp_type_operand_parses("int event"));
+        assert!(!cpp_type_operand_parses("N event"));
+        for source in [
+            "struct C {}; typedef void (C::*Handler)(int event); void set(void (C::*cb)(int value));",
+            "struct C {}; typedef void (C::*Handler)(int); void set(void (C::*cb)(int));",
+            "using N=int; struct C {}; typedef void (C::*Handler)(N event);",
+        ] {
+            let before = FULL_PARSE_COUNT.with(|count| count.get());
+            let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert!(!has_parse_errors(&parsed.tree), "{}", parsed.tree.root_node().to_sexp());
+            assert_eq!(FULL_PARSE_COUNT.with(|count| count.get()) - before, 1, "{source}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual parser scaling probe"]
+    fn deep_expression_scaling_probe() {
+        for terms in [4000, 16000] {
+            let expression = std::iter::repeat_n("x * 2", terms)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let source = format!("struct V{{int f;}}; int h(V*p,int V::*m){{return p->*m;}} int g(int x){{return {expression};}}");
+            let start = std::time::Instant::now();
+            let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert!(!has_parse_errors(&parsed.tree));
+            eprintln!("{terms} terms: {:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    fn grouping_insertions_preserve_shared_closing_offsets() {
+        let source = "int f() { return a+b*c; }";
+        let start = source.find("a+b*c").unwrap();
+        let insertions = [
+            (start, "(".into()),
+            (start + 2, "(".into()),
+            (start + 5, ")".into()),
+            (start + 5, ")".into()),
+        ];
+        let tree = parse_with_insertions(source, &insertions).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(tree.root_node().end_byte(), source.len());
+        let mut pending = vec![tree.root_node()];
+        let mut parentheses = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "parenthesized_expression" {
+                parentheses.push(node.byte_range());
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+        parentheses.sort_by_key(|r| r.start);
+        assert_eq!(parentheses, vec![start..start + 5, start + 2..start + 5]);
+    }
+
+    #[test]
+    fn arrow_star_operator_names_keep_their_spelling() {
+        let source: Arc<str> = "struct C { void operator->*(int); };\r\n\
+void C::operator /* declaration */ ->*(int) {}\r\n\
+void direct(C *p) { p->operator /* call */ ->*(1); auto f = &C::operator->*; }\r\n\
+void indirect(C *p, F f) { (p->*f)(); }"
+            .into();
+        let expected = source.replace("(p->*f)", "(p+  f)");
+        assert_eq!(normalize_cpp_parse_syntax(&source).as_ref(), expected);
+    }
+
+    fn raw(source: &str) -> Tree {
+        PARSER_CPP.with(|p| parse_tree(&mut p.borrow_mut(), source, None).unwrap())
+    }
+
+    #[test]
+    fn member_pointer_grouping_preserves_precedence_and_original_offsets() {
+        for (expression, operands) in [
+            ("1 + v->*0", vec![("v", "0", "->*")]),
+            ("v->*0 * 2", vec![("v", "0", "->*")]),
+            ("2 * v->*0", vec![("v", "0", "->*")]),
+            (
+                "1 + v->*0 * w->*1",
+                vec![("v", "0", "->*"), ("w", "1", "->*")],
+            ),
+            ("v->*a->*b", vec![("v", "a", "->*"), ("v->*a", "b", "->*")]),
+            (
+                "1 + v->*0->*1",
+                vec![("v", "0", "->*"), ("v->*0", "1", "->*")],
+            ),
+            (
+                "2 * (*p)->*callbacks[index()]",
+                vec![("(*p)", "callbacks[index()]", "->*")],
+            ),
+            ("1 + c.*field", vec![("c", "field", ".*")]),
+            ("c.*field * 2", vec![("c", "field", ".*")]),
+            ("1 + v->*(a + b)", vec![("v", "(a + b)", "->*")]),
+        ] {
+            let source = format!("int f() {{\r\n return {expression};\r\n}}");
+            let parsed = parse_source_with_lang(source.as_str(), SourceLang::Cpp).unwrap();
+            assert!(
+                !parsed.tree.root_node().has_error(),
+                "{expression}: {}",
+                parsed.tree.root_node().to_sexp()
+            );
+            assert_eq!(parsed.source.len(), source.len());
+            let mut actual = Vec::new();
+            let mut pending = vec![parsed.tree.root_node()];
+            while let Some(node) = pending.pop() {
+                pending.extend(node.named_children(&mut node.walk()));
+                if node.kind() != "binary_expression" {
+                    continue;
+                }
+                let op = node.child_by_field_name("operator").unwrap();
+                if member_pointer_operator_at(&source, op.start_byte()).is_none() {
+                    continue;
+                }
+                let left = node.child_by_field_name("left").unwrap();
+                let right = node.child_by_field_name("right").unwrap();
+                let width = if source[op.start_byte()..].starts_with("->*") {
+                    3
+                } else {
+                    2
+                };
+                actual.push((
+                    &source[left.byte_range()],
+                    &source[right.byte_range()],
+                    &source[op.start_byte()..op.start_byte() + width],
+                ));
+                assert_eq!(op.start_position().row, 1);
+                assert_eq!(
+                    op.start_position().column,
+                    op.start_byte() - source.find('\n').unwrap() - 1
+                );
+            }
+            actual.sort();
+            let mut operands = operands;
+            operands.sort();
+            assert_eq!(actual, operands, "{expression}");
+        }
+    }
+
+    #[test]
+    fn member_pointer_normalization_respects_number_and_ellipsis_tokens() {
+        let source: Arc<str> = "double f(double p) { return 3.*p + 0x3.*p; } template<class... T> auto prod(T... xs) { return (...*xs); }".into();
+        assert_eq!(normalize_cpp_parse_syntax(&source), source);
+    }
+
+    #[test]
+    fn member_pointer_operators_keep_postfix_rhs_and_offsets() {
+        for (expression, rhs, operator) in [
+            ("p->*callbacks[0]", "callbacks[0]", "->*"),
+            ("obj1e->*callbacks[0]", "callbacks[0]", "->*"),
+            ("obj2E->*callbacks[0]", "callbacks[0]", "->*"),
+            ("obj3p->*callbacks[0]", "callbacks[0]", "->*"),
+            ("obj4P->*callbacks[0]", "callbacks[0]", "->*"),
+            ("obj.*callbacks[index()]", "callbacks[index()]", ".*"),
+            ("p->*h->callbacks[index]", "h->callbacks[index]", "->*"),
+            ("p->*(callbacks[0])", "(callbacks[0])", "->*"),
+            (
+                "this->*((ExecuteFunc)it->second)",
+                "((ExecuteFunc)it->second)",
+                "->*",
+            ),
+        ] {
+            let source = format!("void invoke() {{\r\n  ({expression})(value);\r\n}}");
+            let parsed = parse_source_with_lang(source.as_str(), SourceLang::Cpp).unwrap();
+            assert!(
+                !parsed.tree.root_node().has_error(),
+                "{expression}: {}",
+                parsed.tree.root_node().to_sexp()
+            );
+            assert_eq!(source.len(), parsed.source.len());
+            for (before, after) in source.bytes().zip(parsed.source.bytes()) {
+                if matches!(before, b'\r' | b'\n') {
+                    assert_eq!(before, after);
+                }
+            }
+            let body = parsed
+                .tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("body")
+                .unwrap();
+            let call = body.named_child(0).unwrap().named_child(0).unwrap();
+            let member = call
+                .child_by_field_name("function")
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            assert_eq!(member.kind(), "binary_expression", "{expression}");
+            let right = member.child_by_field_name("right").unwrap();
+            assert_eq!(&source[right.byte_range()], rhs, "{expression}");
+            assert_eq!(
+                right.start_byte(),
+                source.find(rhs).unwrap(),
+                "{expression}"
+            );
+            let op = member.child_by_field_name("operator").unwrap();
+            assert!(
+                source[op.start_byte()..].starts_with(operator),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_grammar_limits_and_offset_preserving_recovery() {
+        for source in [
+            "extern template class ns::Box<int>;",
+            "template struct ns::Box<long>;",
+            "extern template int *ns::Box<int>::data();",
+            "template<class T, std::enable_if_t<true>* = nullptr> struct Enabled { void run() {} };",
+            "template<class T, std::enable_if_t<ok<T>::value, Box<T>>* = nullptr, int N = 3> struct Enabled { void run(int a = 7) {} };",
+            "void invoke(Worker *p, Callback f) { (p->*f)(); }",
+        ] {
+            assert!(has_parse_errors(&raw(source)), "pinned grammar changed: {source}");
+            let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert!(!parsed.tree.root_node().has_error(), "{source}: {}\n{}", parsed.source, parsed.tree.root_node().to_sexp());
+            assert_eq!(source.len(), parsed.source.len());
+            let again = parse_source_with_lang(Arc::clone(&parsed.source), SourceLang::Cpp).unwrap();
+            assert_eq!(parsed.source, again.source);
+            for (a, b) in source.bytes().zip(parsed.source.bytes()) {
+                if matches!(a, b'\r' | b'\n') { assert_eq!(a, b); }
+            }
+        }
+        for source in [
+            "template int *ns::Box<int>::data();",
+            "void invoke(Worker &obj, Callback f) { (obj.*f)(); }",
+            "template<class T, std::enable_if_t<true>* p = nullptr> struct Enabled {};",
+        ] {
+            assert!(!raw(source).root_node().has_error(), "{source}");
+        }
+    }
+
+    #[test]
+    fn malformed_neighbors_still_report_errors() {
+        for source in [
+            "extern template class Box<int;",
+            "extern template void ns::Box<int>::run(;",
+            "template<class T, std::enable_if_t<true>* = > struct Enabled {};",
+            "template<class T, std::enable_if_t<true>* = nullptr> struct Enabled { void run( {} };",
+            "void invoke(Worker *p, Callback f) { (p->*)(); }",
+            "void invoke(Worker *p, Callback f) { (p->*f)(; }",
+            "extern template class Box<int>; int bad = ;",
+        ] {
+            assert!(
+                has_parse_errors(
+                    &parse_source_with_lang(source, SourceLang::Cpp)
+                        .unwrap()
+                        .tree
+                ),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pointer_default_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_names_keep_pointer_types_and_original_crlf_coordinates() {
+        let source = "// é\r\ntemplate<class T, et<sizeof(T) == 4, int> ** = nullptr, class U = T *> void f(T);\r\n";
+        let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+        assert!(!parsed.tree.root_node().has_error());
+        assert_eq!(parsed.source.as_ref(), source);
+        assert_eq!(parsed.tree.root_node().end_byte(), source.len());
+        assert_eq!(parsed.tree.root_node().end_position(), Point::new(2, 0));
+        let mut nodes = vec![parsed.tree.root_node()];
+        let mut pointers = 0;
+        let mut synthetic = 0;
+        while let Some(node) = nodes.pop() {
+            assert_ne!(node.kind(), "abstract_reference_declarator");
+            assert_ne!(node.kind(), "reference_declarator");
+            if node.kind() == "pointer_declarator" {
+                pointers += 1;
+            }
+            if node.kind() == "identifier" && node.byte_range().is_empty() {
+                synthetic += 1;
+            }
+            nodes.extend(node.named_children(&mut node.walk()));
+        }
+        assert_eq!(pointers, 2);
+        assert!(synthetic >= 1);
     }
 }

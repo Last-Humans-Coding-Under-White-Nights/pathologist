@@ -198,11 +198,7 @@ fn alias_desc(program: &Program, alias: &str) -> TypeDesc {
 }
 
 fn assert_coarse_function_pointer(desc: &TypeDesc, context: &str) {
-    let inner = match desc {
-        TypeDesc::Ptr(inner) => inner.as_ref(),
-        TypeDesc::FnPtr { .. } => desc,
-        other => panic!("{context}: not a pointer shape: {other:?}"),
-    };
+    let inner = desc.innermost().0;
     match inner {
         TypeDesc::FnPtr { ret, .. } => {
             assert!(
@@ -215,7 +211,7 @@ fn assert_coarse_function_pointer(desc: &TypeDesc, context: &str) {
 }
 
 #[test]
-fn member_function_pointer_shape_matches_approximation() {
+fn member_function_pointer_shape_retains_owner_and_parameters() {
     let (_scratch, program) = project(
         "struct C { int m(double) const; int n(double); };\n\
          using Plain = int (*)(double);\n\
@@ -236,7 +232,26 @@ fn member_function_pointer_shape_matches_approximation() {
     ] {
         let desc = alias_desc(&program, alias);
         assert_coarse_function_pointer(&desc, alias);
-        assert_eq!(desc, plain, "{alias}");
+        assert!(desc.is_member_function_pointer());
+        assert_ne!(desc, plain, "{alias}");
+        assert_eq!(
+            desc,
+            TypeDesc::Ptr(Box::new(TypeDesc::MemberPointer {
+                owner: "C".into(),
+                is_function: true,
+                member: Box::new(TypeDesc::FnPtr {
+                    ret: Box::new(TypeDesc::Int),
+                    params: vec![
+                        TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+                            name: "C".into(),
+                            fields: Vec::new()
+                        })),
+                        TypeDesc::Double
+                    ],
+                })
+            })),
+            "{alias}"
+        );
     }
     assert_eq!(function(&program, "after_shapes").span.line, 7);
 }
@@ -400,28 +415,43 @@ int after();\n";
 }
 
 #[test]
+fn data_and_template_qualified_member_owners_are_recovered() {
+    let data = "struct C { int v; };\nint C::* dm = &C::v;\nusing DM = int C::*;\n";
+    assert_eq!(
+        normalized(data),
+        "struct C { int v; };\nint    * dm = &C::v;\nusing DM = int    *;\n"
+    );
+    assert_parses_cleanly(data);
+    let templated = "template<class T> struct W { struct C {}; };\nusing M = int (W<int>::C::*)(double) const;\n";
+    let output = normalized(templated);
+    assert_eq!(output.len(), templated.len());
+    assert!(!output.contains("W<int>::C::"));
+    assert_parses_cleanly(templated);
+}
+
+#[test]
 fn unrelated_syntax_is_unchanged() {
     let sources = [
         // Ordinary function pointers and qualified names.
         "struct C { static int s(double); };\nusing F = int (*)(double);\nint (*fp)(double) = &C::s;\nint x = C::s(1.0);\n",
-        // Project data-member pointers keep their owner (the project rule
-        // only covers the parenthesized function-pointer shape).
-        "struct C { int v; };\nint C::* dm = &C::v;\nusing DM = int C::*;\n",
         // Literals and comments.
         "const char *s = \"int (C::*)(double) const\";\nconst char *r = R\"x(int (C::*)(double) const)x\";\n// typedef int (C::*M)(double) const;\n/* using M = int (C::*)(double) const; */\n",
-        // Template-qualified owners are outside the supported shape.
-        "template<class T> struct W { struct C {}; };\nusing M = int (W<int>::C::*)(double) const;\n",
         // Malformed declarations stay malformed.
         "struct C {};\nusing M = int (C::*)(double const;\ntypedef int (C::*N)(double) noexcept(;\n",
     ];
     for source in sources {
         assert_eq!(normalized(source), source);
     }
-    // Expression contexts spelling `.*` / `->*` are untouched; only the
-    // parameter's owner is approximated.
+    // Both invocation operators retain their widths and RHS grouping (#246).
     let call = "struct C { int m(double); };\nint call(C &c, int (C::*pm)(double)) { return (c.*pm)(1.0) + ((&c)->*pm)(2.0); }\n";
-    let output = assert_only_ranges_blanked(call, &["C::"]);
-    assert!(output.contains("(c.*pm)(1.0) + ((&c)->*pm)(2.0)"));
+    let output = normalized(call);
+    assert_eq!(
+        output,
+        call.replacen("C::", "   ", 1)
+            .replace("->*", "+  ")
+            .replace(".*", "+ ")
+    );
+    assert_parses_cleanly(call);
 }
 
 /// Parameter and pointer-level qualifiers are not function qualifiers.

@@ -33,6 +33,7 @@ use trace_ir::{
     FieldId, FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span,
     StorageClass, TempKind, TypeDesc, VarId, Variable,
 };
+use trace_ir::{is_template_literal, split_pointer_suffix, strip_trailing_cv};
 use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
 
@@ -163,6 +164,8 @@ struct DeclarationSyntaxCache {
 }
 
 struct LowerContext {
+    /// Preprocessed spelling before offset-preserving parser adaptations.
+    parse_spelling: Arc<str>,
     /// Closest operation attribution wins for each emitted constraint occurrence.
     recorded_flow_origins: Vec<bool>,
     flow_origin_indices: FlowOriginBindings,
@@ -226,7 +229,7 @@ struct LowerContext {
     /// Elided class expressions already constructed into an initializer subobject.
     handled_constructor_exprs: RefCell<HashSet<usize>>,
     /// Cache for `resolve_callee_with_loads`: maps the `func` node id of a
-    /// field-expression callee to the whole answer it gave.
+    /// field-expression or inline member-pointer callee to its whole answer.
     /// `emit_field_value_store` (via `resolve_callee_var`) and the later
     /// `collect_call_at_node` (via `resolve_callee_with_loads`) reach the same
     /// node, and recomputing would create *two different* load variables for
@@ -2484,102 +2487,7 @@ fn expand_virtual_overrides(program: &mut Program) {
         let Some(fid) = cs.callee_fn_id.filter(|_| !cs.exact_receiver) else {
             continue;
         };
-        let f = program.symbols.function(fid);
-        if !f.is_cpp {
-            continue;
-        }
-        let Some((cls, kind)) = method_kind_of_function(&f.name) else {
-            continue;
-        };
-        if matches!(kind, trace_ir::MethodKind::Ctor) {
-            continue;
-        }
-        // Every file's anonymous namespace spells a class the same, so a
-        // member the call cannot see (in neither its file nor a header that
-        // file includes) is another class's: it does not make the callee
-        // virtual, never stops dispatch as `final`, and is no target when its
-        // class is the receiver's. When the receiver is itself such a class
-        // seen here, so is its whole hierarchy, since a subclass names it: a
-        // member of a class in that hierarchy is a target only where the call
-        // sees it, not a same-named external class's or its subclasses'. A
-        // base declared outside an anonymous namespace still dispatches to the
-        // overrides in every file.
-        //
-        // A callee bound to such a member was looked up where its class is
-        // seen, which a header can make another file than the call's.
-        let bound_in = (f.linkage == trace_ir::Linkage::Internal).then_some(f.file);
-        let call_file = cs.scope_file();
-        let sees = |file: trace_ir::FileId| {
-            program.symbols.file_sees(call_file, file)
-                || bound_in.is_some_and(|b| program.symbols.file_sees(b, file))
-        };
-        let visible = |t: FnId| {
-            let t = program.symbols.function(t);
-            t.linkage != trace_ir::Linkage::Internal || sees(t.file)
-        };
-        let virtual_dispatch = kind.is_destructor()
-            || f.is_virtual
-            || program
-                .symbols
-                .functions_named(&kind.name_on(&cls))
-                .into_iter()
-                .any(|t| program.symbols.function(t).is_virtual && visible(t));
-        if !virtual_dispatch {
-            continue;
-        }
-        let root = cs.receiver_class.as_deref().unwrap_or(&cls);
-        let expected_arity = method_explicit_arity(program, fid);
-        let mut targets = if bound_in.is_some() || program.class_is_anonymous_in(root, sees) {
-            let hierarchy: Vec<String> = program
-                .subclass_closure(root)
-                .iter()
-                .map(|c| kind.name_on(c))
-                .collect();
-            let seen_here = |t: FnId| {
-                let target = program.symbols.function(t);
-                visible(t) && (sees(target.file) || !hierarchy.contains(&target.name))
-            };
-            program.method_targets_among(root, &kind, &sees, &seen_here)
-        } else {
-            let own_name = kind.name_on(root);
-            let mut targets = program.method_targets_among(root, &kind, &sees, &|_| true);
-            // A member the call cannot see is a member of another file's
-            // anonymous class: a target only when, as its own file sees it,
-            // that class derives from the receiver's class or an external
-            // class under it, not merely shares a name with one of them.
-            let hierarchy = std::cell::OnceCell::new();
-            targets.retain(|&t| {
-                let target = program.symbols.function(t);
-                if visible(t) {
-                    return true;
-                }
-                target.name != own_name
-                    && method_kind_of_function(&target.name).is_some_and(|(owner, _)| {
-                        let hierarchy: &Vec<String> =
-                            hierarchy.get_or_init(|| program.subclass_closure(root));
-                        program.anonymous_class_derives_from(
-                            &owner,
-                            &|file| program.symbols.file_sees(target.file, file),
-                            &|base| hierarchy.iter().any(|c| c == base),
-                        )
-                    })
-            });
-            targets
-        };
-        // An override of the overload the site was bound to, not of every
-        // overload its arity allows: ranking chose `On(int)` for `b->On(5)`,
-        // and `On(double)`'s overrides are not dispatched to.
-        targets.retain(|&t| {
-            let target = program.symbols.function(t);
-            target.target == f.target
-                && arity_compatible(expected_arity, method_explicit_arity(program, t))
-                && program.symbols.explicit_params_alike(
-                    target,
-                    f,
-                    &program.types,
-                    trace_ir::SpellingTolerance::Override,
-                ) != Some(false)
-        });
+        let targets = program.virtual_call_targets(&cs, fid);
         for t in targets {
             let occurrence = cs.occurrence();
             let key = (
@@ -2621,24 +2529,6 @@ fn expand_virtual_overrides(program: &mut Program) {
         }
     }
     program.attach_alternative_sites(&alternatives);
-}
-
-fn method_kind_of_function(name: &str) -> Option<(String, trace_ir::MethodKind)> {
-    let segs: Vec<&str> = name.split("::").collect();
-    if segs.len() < 2 {
-        return None;
-    }
-    let short = *segs.last()?;
-    let cls = segs[..segs.len() - 1].join("::");
-    let last_cls = last_segment_of(&cls);
-    let kind = if short.starts_with('~') {
-        trace_ir::MethodKind::Dtor
-    } else if short == last_cls {
-        trace_ir::MethodKind::Ctor
-    } else {
-        trace_ir::MethodKind::Named(short.to_string())
-    };
-    Some((cls, kind))
 }
 
 fn add_warnings(program: &mut Program, stage: &str, messages: &[String]) {
@@ -3937,6 +3827,7 @@ fn lower_prepared_source(
     let is_cpp = lang == crate::parse::SourceLang::Cpp;
     let tree = Arc::new(parsed.tree);
     let mut ctx = LowerContext {
+        parse_spelling: Arc::clone(&pre.text),
         recorded_flow_origins: Vec::new(),
         flow_origin_indices: HashMap::default(),
         original_sources: HashMap::default(),
@@ -4356,11 +4247,28 @@ fn declared_alias(
     } else {
         node
     };
-    Some((
-        name,
-        desc,
-        declaration_is_reference(program, ctx, source, declaration),
-    ))
+    // A reference in a callback's result belongs to the callable signature,
+    // rather than making every variable of this alias a reference binding.
+    let reference = declaration_is_reference(program, ctx, source, declaration)
+        && !declaration.cached_field("declarator").is_some_and(|decl| {
+            if !matches!(desc.innermost().0, TypeDesc::FnPtr { .. }) {
+                return false;
+            }
+            let mut cur = Some(decl);
+            while let Some(node) = cur {
+                if matches!(
+                    node.cached_kind(),
+                    "function_declarator" | "abstract_function_declarator"
+                ) {
+                    return true;
+                }
+                cur = node
+                    .cached_field("declarator")
+                    .or_else(|| node.named_child(0));
+            }
+            false
+        });
+    Some((name, desc, reference))
 }
 
 /// The name a `typedef` declares and the type it stands for.
@@ -4433,12 +4341,13 @@ fn using_alias(
         return None;
     }
     let base = type_desc_from_node(program, ctx, source, ty);
-    let desc = abstract_declarator_shape(
+    let mut desc = abstract_declarator_shape(
         base,
         ty.cached_field("declarator"),
         true,
         ReferenceLayer::Pointer,
     );
+    refine_callable_pointer(program, ctx, source, ty, &mut desc);
     Some((alias, desc))
 }
 
@@ -4560,6 +4469,9 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
             }
             ctx.step_template(-1);
         }
+        // Instantiations request code generation for an existing template;
+        // they declare neither a new function identity nor a function body.
+        "template_instantiation" => {}
         "type_definition" | "alias_declaration" => {
             lower_class_defined_in(program, ctx, source, node);
             lower_alias(program, ctx, source, node);
@@ -7111,12 +7023,13 @@ fn parameter_type(
     // An unnamed parameter's declarator (`const T &`, `void (*)(int)`,
     // `const char *const []`) is an abstract one, shaped as any other.
     if let Some(abstract_decl) = declarator.filter(|d| d.cached_kind().starts_with("abstract_")) {
-        let type_desc = abstract_declarator_shape(
+        let mut type_desc = abstract_declarator_shape(
             base_desc,
             Some(abstract_decl),
             true,
             ReferenceLayer::Parameter,
         );
+        refine_callable_pointer(program, ctx, source, node, &mut type_desc);
         let is_ptr = type_desc.is_pointer_like();
         return Some(Parameter {
             type_id: program.types.intern(type_desc),
@@ -7143,11 +7056,12 @@ fn parameter_type(
         .unwrap_or_else(|| base_desc.clone());
     let declared_address = is_ptr && !matches!(shape, TypeDesc::Ptr(_) | TypeDesc::Array { .. });
     let address = declared_address || alias_reference;
-    let type_desc = if declared_address {
+    let mut type_desc = if declared_address {
         TypeDesc::Ptr(Box::new(base_desc))
     } else {
         shape
     };
+    refine_callable_pointer(program, ctx, source, node, &mut type_desc);
     Some(Parameter {
         type_id: program.types.intern(type_desc),
         name,
@@ -7245,6 +7159,13 @@ fn definition_signature(
 /// (`Mode`, `const Foo &`): a signature records what it does not know, so
 /// an overload set is not ranked on a guess. A real `int` (a keyword, a
 /// typedef of one, a known enum) is kept.
+fn is_unresolved_integral_name(name: &str) -> bool {
+    let name = name.strip_prefix("std::").unwrap_or(name);
+    trace_ir::is_fundamental_type_name(name)
+        && (name.ends_with("_t") || name == "size_t")
+        && !matches!(name, "nullptr_t")
+}
+
 fn stand_in_parameter(
     program: &mut Program,
     ctx: &LowerContext,
@@ -7294,6 +7215,18 @@ fn lower_parameter(
         address,
         reference,
     } = parameter_type(program, ctx, source, node)?;
+    // A dependent by-value parameter can instantiate as either kind of
+    // member pointer. Preserve its incoming pointer value until use resolves it.
+    let (type_id, is_ptr) = if node.cached_field("type").is_some_and(|ty| {
+        spelling_is_dependent(ctx, source, node, node_text(source, &ty), Spelling::Source)
+    }) {
+        (
+            stand_in_parameter(program, ctx, source, node, type_id).unwrap_or(type_id),
+            true,
+        )
+    } else {
+        (type_id, is_ptr)
+    };
     let declarator = node.cached_field("declarator");
     if name.is_empty() {
         name = format!("$arg{index}");
@@ -8103,7 +8036,10 @@ fn receiver_type(program: &Program, ctx: &LowerContext, desc: TypeDesc) -> Optio
             });
             (!ambiguous).then_some(desc)
         }
-        TypeDesc::Struct { .. } | TypeDesc::Union { .. } | TypeDesc::FnPtr { .. } => Some(desc),
+        TypeDesc::Struct { .. }
+        | TypeDesc::Union { .. }
+        | TypeDesc::FnPtr { .. }
+        | TypeDesc::MemberPointer { .. } => Some(desc),
         _ => None,
     }
 }
@@ -8453,7 +8389,12 @@ fn receiver_value(
     receiver: Node,
     type_id: trace_ir::TypeId,
 ) -> Option<VarId> {
-    let receiver = peel_casts(source, receiver);
+    // Callable casts carry signature selection and reinterpretation metadata.
+    let receiver = if callable_cast_type(program, ctx, source, receiver).is_some() {
+        peel_expression(receiver)
+    } else {
+        peel_casts(source, receiver)
+    };
     if receiver.cached_kind() == "identifier" {
         if let Some(var) = lookup_var(ctx, program, node_text(source, &receiver)) {
             // Reference bindings can hold the wrapper value or its address.
@@ -8739,6 +8680,7 @@ fn emit_factory_construction(
     let first = program.symbols.call_sites.len();
     emit_member_targets(
         program,
+        ctx,
         caller,
         &cls,
         &trace_ir::MethodKind::Ctor,
@@ -8812,6 +8754,7 @@ fn lower_new_object(
     let first_site = program.symbols.call_sites.len();
     construct_on_heap(
         program,
+        ctx,
         ctx.current_fn.filter(|_| !aggregate),
         &cls,
         alloc_tmp,
@@ -8832,6 +8775,7 @@ fn lower_new_object(
 #[allow(clippy::too_many_arguments)]
 fn construct_on_heap(
     program: &mut Program,
+    ctx: &LowerContext,
     caller: Option<FnId>,
     cls: &str,
     heap: VarId,
@@ -8843,6 +8787,7 @@ fn construct_on_heap(
     if let Some(caller) = caller {
         emit_member_targets(
             program,
+            ctx,
             caller,
             cls,
             &trace_ir::MethodKind::Ctor,
@@ -9326,6 +9271,15 @@ fn without_fields(desc: &TypeDesc) -> TypeDesc {
             fields: Vec::new(),
         },
         TypeDesc::Ptr(inner) => TypeDesc::Ptr(Box::new(without_fields(inner))),
+        TypeDesc::MemberPointer {
+            owner,
+            is_function,
+            member,
+        } => TypeDesc::MemberPointer {
+            owner: owner.clone(),
+            is_function: *is_function,
+            member: Box::new(without_fields(member)),
+        },
         TypeDesc::Array { elem, size } => TypeDesc::Array {
             elem: Box::new(without_fields(elem)),
             size: *size,
@@ -9475,6 +9429,18 @@ fn declared_return_type(
     name: &str,
     param_types: FactParams,
 ) -> trace_ir::TypeId {
+    if let Some(decl) = node.cached_field("declarator") {
+        let mut shaped = walk_declarator_shape(decl, program.types.get(base).desc.as_ref().clone());
+        refine_callable_pointer(program, ctx, source, decl, &mut shaped);
+        if let TypeDesc::FnPtr { ret, .. } = shaped.innermost().0 {
+            if matches!(
+                ret.innermost().0,
+                TypeDesc::FnPtr { .. } | TypeDesc::Array { .. }
+            ) {
+                return program.types.intern(ret.as_ref().clone());
+            }
+        }
+    }
     let depth = node
         .cached_field("declarator")
         .and_then(fn_decl_under_pointer)
@@ -9531,7 +9497,10 @@ fn local_type(
     let inferred = value
         .filter(|_| is_placeholder_type(ctx, type_node))
         .and_then(|value| auto_initializer_type(program, ctx, source, value));
-    deduced_local_type(program, type_id, decl, inferred)
+    let ty = deduced_local_type(program, type_id, decl, inferred);
+    let mut desc = program.types.get(ty).desc.as_ref().clone();
+    refine_callable_pointer(program, ctx, source, decl, &mut desc);
+    program.types.intern(desc)
 }
 
 /// A local's type: the type a placeholder deduced, when the declarator's `*`s
@@ -9727,7 +9696,7 @@ fn lower_declaration(
                                             source,
                                             fdecl.cached_field("parameters"),
                                         )
-                                        .for_callee(program, None);
+                                        .for_callee(program, ctx, None);
                                         let call_id = program.symbols.alloc_call_id();
                                         let expansion_span =
                                             node_expansion_span(program, ctx, node);
@@ -9796,9 +9765,13 @@ fn lower_declaration(
             // declarator is the bare qualified name (not the declaration's
             // type, which may be spelled qualified too).
             "qualified_identifier"
-                if ctx.current_fn.is_none()
-                    && node.cached_field("type").map(|t| t.id()) != Some(child.id()) =>
+                if node.cached_field("type").map(|t| t.id()) != Some(child.id())
+                    && (ctx.current_fn.is_none()
+                        || child
+                            .cached_field("name")
+                            .is_some_and(|n| n.cached_kind() == "pointer_type_declarator")) =>
             {
+                let type_id = local_type(program, ctx, source, type_node, type_id, child, None);
                 lower_one_declarator(
                     program,
                     ctx,
@@ -10095,6 +10068,7 @@ fn lower_direct_init(
     let first_site = program.symbols.call_sites.len();
     emit_member_sites(
         program,
+        ctx,
         caller,
         &cls,
         &trace_ir::MethodKind::Ctor,
@@ -10351,6 +10325,7 @@ fn emit_automatic_lifecycle(
             for (owner, targets) in groups {
                 emit_member_targets(
                     program,
+                    ctx,
                     caller,
                     &owner,
                     &kind,
@@ -10425,7 +10400,15 @@ fn lower_one_declarator(
         );
         return None;
     }
-    let is_fn_ptr = is_function_pointer_declarator(decl);
+    let mut is_fn_ptr = is_function_pointer_declarator(decl);
+    let type_id = {
+        // local_type / the declaration walk already applied this shape.
+        let mut desc = program.types.get(type_id).desc.as_ref().clone();
+        if refine_callable_pointer(program, ctx, source, decl, &mut desc) {
+            is_fn_ptr = true;
+        }
+        program.types.intern(desc)
+    };
     let (name, is_ptr) = parse_declarator_name(source, decl);
     if name.is_empty() {
         return None;
@@ -10556,6 +10539,7 @@ fn lower_one_declarator(
                 let first_site = program.symbols.call_sites.len();
                 emit_member_sites(
                     program,
+                    ctx,
                     ctx.current_fn.unwrap(),
                     &cls,
                     &trace_ir::MethodKind::Ctor,
@@ -11121,9 +11105,14 @@ fn push_array_fn_member(
 ) {
     if let Some(callee) = resolve_call_fn_arg(program, ctx, source, elem) {
         let first_flow = program.flow.len();
-        program
-            .flow
-            .push(FlowConstraint::ArrayFnMember { array, callee });
+        let destination = program.symbols.variable(array).type_id;
+        for callee in
+            function_value_candidates(program, ctx, source, elem, callee, Some(destination))
+        {
+            program
+                .flow
+                .push(FlowConstraint::ArrayFnMember { array, callee });
+        }
         let span = node_span(program, ctx, elem);
         let expression = operation_expression(ctx, source, elem);
         record_flow_origins(program, ctx, first_flow, span, &expression);
@@ -11291,6 +11280,13 @@ fn walk_function_body(
             extract_flow_from_expr(program, ctx, source, node, None);
         }
         "call_expression" => collect_call_at_node(program, ctx, source, node, caller),
+        "binary_expression" if !node_is_from_ignored_macro(ctx, node) => {
+            if let Some((object, member, arrow)) = member_pointer_access(ctx, source, node) {
+                if arrow_star_overload(program, ctx, source, object, member, arrow).is_some() {
+                    resolve_callee_with_loads(program, ctx, source, node);
+                }
+            }
+        }
         "lambda_expression" if ctx.is_cpp => {
             if node_is_from_ignored_macro(ctx, node) {
                 ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
@@ -11323,6 +11319,7 @@ fn walk_function_body(
                     let expansion_span = node_expansion_span(program, ctx, node);
                     emit_member_sites(
                         program,
+                        ctx,
                         caller,
                         &cls,
                         &trace_ir::MethodKind::Dtor,
@@ -11381,7 +11378,16 @@ fn walk_function_body(
         if statement_body.is_some_and(|body| body.id() == child.id()) {
             lower_statement_local(program, ctx, source, node);
         }
-        let never_runs = unevaluated_operand(ctx.is_cpp, source, node, child);
+        let never_runs = unevaluated_operand(
+            ctx.is_cpp,
+            if ctx.parse_spelling.is_empty() {
+                source
+            } else {
+                &ctx.parse_spelling
+            },
+            node,
+            child,
+        );
         walk_function_body(program, ctx, source, child, caller);
         if never_runs {
             // As for loops: a lambda written in the operand is a function of
@@ -11477,6 +11483,18 @@ pub(crate) fn unevaluated_operand(is_cpp: bool, source: &str, node: Node, child:
             }
         }
         inner.cached_kind() == "call_expression"
+            || (is_cpp
+                && inner.cached_kind() == "binary_expression"
+                && inner.cached_field("operator").is_some_and(|op| {
+                    crate::parse::member_pointer_operator_at(source, op.start_byte()).is_some()
+                }))
+            || (inner.cached_kind() == "comma_expression"
+                && inner.cached_field("right").is_some_and(|last| {
+                    matches!(
+                        peel_expression(last).cached_kind(),
+                        "number_literal" | "call_expression"
+                    )
+                }))
     };
     match node.cached_kind() {
         "sizeof_expression" | "alignof_expression" | "decltype" => {
@@ -11619,8 +11637,20 @@ fn collect_call_at_node(
     }
     let occurrence_node = node
         .cached_field("function")
-        .filter(|func| func.cached_kind() == "field_expression")
-        .and_then(member_access_token)
+        .map(peel_expression)
+        .and_then(|func| {
+            if let Some((object, member, arrow)) = member_pointer_access(ctx, source, func) {
+                if arrow_star_overload(program, ctx, source, object, member, arrow).is_some() {
+                    node.cached_field("arguments")
+                } else {
+                    func.cached_field("operator")
+                }
+            } else if func.cached_kind() == "field_expression" {
+                member_access_token(func)
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             if ctx.is_cpp {
                 explicit_member_operator_call(node, source).map(|op| op.punct_node)
@@ -11633,6 +11663,42 @@ fn collect_call_at_node(
     let first_flow = program.flow.len();
     let first_pending = ctx.pending.borrow().len();
     collect_call_at_node_inner(program, ctx, source, node, caller);
+    // Receiver/result recovery can emit a member call before the ordinary
+    // expression walk reaches its enclosing unevaluated operand or loop.
+    if node
+        .cached_field("function")
+        .is_some_and(|f| member_pointer_access(ctx, source, f).is_some())
+    {
+        let mut child = node;
+        let mut in_loop = false;
+        let mut unevaluated = false;
+        for parent in ancestors(ctx, node).collect::<Vec<_>>().into_iter().rev() {
+            if matches!(
+                parent.cached_kind(),
+                "lambda_expression" | "function_definition"
+            ) {
+                break;
+            }
+            in_loop |= repeats_in_loop(parent, child);
+            unevaluated |= unevaluated_operand(
+                ctx.is_cpp,
+                if ctx.parse_spelling.is_empty() {
+                    source
+                } else {
+                    &ctx.parse_spelling
+                },
+                parent,
+                child,
+            );
+            child = parent;
+        }
+        for site in &mut program.symbols.call_sites[first_site..] {
+            if site.caller == caller {
+                site.in_loop |= in_loop;
+                site.unevaluated |= unevaluated;
+            }
+        }
+    }
     if program.symbols.call_sites[first_site..]
         .iter()
         .any(|site| site.receiver_class.is_some() && site.callee_fn_id.is_none())
@@ -11764,7 +11830,7 @@ fn collect_call_at_node(
         expansion_id: node_expansion_id(ctx, occurrence_node),
     };
     for site in &mut program.symbols.call_sites[first_site..] {
-        site.details_mut().occurrence = Some(occurrence);
+        site.details_mut().occurrence.get_or_insert(occurrence);
     }
 }
 
@@ -11775,6 +11841,9 @@ fn collect_call_at_node_inner(
     node: Node,
     caller: FnId,
 ) {
+    if is_named_cast(source, node) {
+        return;
+    }
     let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
     if let Some(op) = (ctx.is_cpp)
         .then(|| explicit_member_operator_call(node, source))
@@ -11808,6 +11877,7 @@ fn collect_call_at_node_inner(
                     let recv_text = normalize_qualified(node_text(source, &op.receiver));
                     emit_unresolved_site(
                         program,
+                        ctx,
                         caller,
                         format!("{recv_text}->{op_norm}"),
                         Some(recv_cls),
@@ -11828,6 +11898,7 @@ fn collect_call_at_node_inner(
             if !targets.is_empty() {
                 emit_member_targets(
                     program,
+                    ctx,
                     caller,
                     &cls,
                     &kind,
@@ -11842,6 +11913,7 @@ fn collect_call_at_node_inner(
             }
             emit_unresolved_site(
                 program,
+                ctx,
                 caller,
                 kind.name_on(&cls),
                 Some(cls),
@@ -11858,6 +11930,7 @@ fn collect_call_at_node_inner(
         let callee_text = format!("{recv_text}{op_sym}{op_norm}");
         emit_unresolved_site(
             program,
+            ctx,
             caller,
             callee_text,
             None,
@@ -11877,10 +11950,27 @@ fn collect_call_at_node_inner(
     // a replacement list, display that token so a macro-argument receiver
     // cannot hide its provenance. `CallSite::occurrence` independently keeps
     // repeated calls distinct when this token came from a shared argument.
-    let source_node = if func.cached_kind() == "field_expression" {
-        let field = func.cached_field("field").unwrap_or(func);
+    let member_pointer = member_pointer_access(ctx, source, func);
+    let position_func = if member_pointer.is_some() {
+        peel_expression(func)
+    } else {
+        func
+    };
+    let member_pointer_token = member_pointer
+        .and_then(|_| position_func.cached_field("operator"))
+        .filter(|token| node_has_expansion_location(ctx, *token));
+    let source_node = if let Some(token) = member_pointer_token {
+        token
+    } else if let Some((object, member, _)) = member_pointer {
+        if node_has_expansion_location(ctx, member) || receiver_contains_call(object) {
+            member
+        } else {
+            node
+        }
+    } else if position_func.cached_kind() == "field_expression" {
+        let field = position_func.cached_field("field").unwrap_or(position_func);
         if node_has_expansion_location(ctx, field)
-            || func
+            || position_func
                 .cached_field("argument")
                 .is_some_and(receiver_contains_call)
         {
@@ -11899,6 +11989,114 @@ fn collect_call_at_node_inner(
     }
     let span = node_call_span(program, ctx, source_node);
     let expansion_span = node_expansion_span(program, ctx, source_node);
+
+    if let Some((object, member, arrow)) = member_pointer {
+        let binds_this = arrow_star_overload(program, ctx, source, object, member, arrow).is_none()
+            && !callable_data_member(program, ctx, source, member);
+        let (name, _, callee_var) = resolve_callee_with_loads(program, ctx, source, func);
+        if !binds_this {
+            if let Some((cls, kind)) = callee_var.and_then(|v| callable_operator(program, v)) {
+                let args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
+                emit_member_sites(
+                    program,
+                    ctx,
+                    caller,
+                    &cls,
+                    &kind,
+                    callee_var.map_or(Receiver::Unnamed, Receiver::Bound),
+                    args,
+                    span,
+                    expansion_span,
+                    return_dst,
+                );
+                return;
+            }
+        }
+        let receiver_class = binds_this
+            .then(|| member_receiver_class(program, ctx, source, object, arrow))
+            .flatten()
+            .map(|c| receiver_lookup_name(&c).into_owned());
+        let receiver = binds_this
+            .then(|| member_pointer_receiver(program, ctx, source, object, arrow))
+            .flatten();
+        let args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
+        let args = if binds_this {
+            args.bind_past_this(receiver)
+        } else {
+            args
+        };
+        let args = args.for_callee(program, ctx, None);
+        let id = program.symbols.alloc_call_id();
+        let callee_name = program.symbols.intern_call_name(&name);
+        program.symbols.call_sites.push(CallSite {
+            id,
+            caller,
+            callee_name,
+            callee_var,
+            callee_fn_id: None,
+            var_args: args.var_args,
+            details: CallSiteDetails::boxed(
+                args.fn_args,
+                args.addr_of_member_args,
+                args.addr_of_args,
+                None,
+            ),
+            args_bound_past_this: binds_this,
+            span,
+            expansion_span,
+            is_direct: false,
+            in_loop: false,
+            unevaluated: false,
+            receiver_class,
+            exact_receiver: false,
+            return_dst,
+            receiver,
+            tu: Some(ctx.current_file),
+        });
+        if binds_this
+            && receiver_desc(program, ctx, source, member)
+                .is_some_and(|desc| matches!(desc.innermost().0, TypeDesc::Int | TypeDesc::Unknown))
+        {
+            if let Some(cell) = callee_var {
+                let unknown = program.types.unknown();
+                let value = emit_load(program, ctx, func, cell, unknown);
+                let mut alternative = program.symbols.call_sites.last().unwrap().clone();
+                alternative.id = program.symbols.alloc_call_id();
+                alternative.callee_var = Some(value);
+                alternative.callee_name = program
+                    .symbols
+                    .intern_call_name(&operation_expression(ctx, source, func));
+                alternative.args_bound_past_this = false;
+                alternative.receiver_class = None;
+                alternative.receiver = None;
+                alternative.var_args.retain_mut(|(index, _)| {
+                    if *index == 0 {
+                        false
+                    } else {
+                        *index -= 1;
+                        true
+                    }
+                });
+                let details = alternative.details_mut();
+                details.fn_args.retain_mut(|(index, _)| {
+                    if *index == 0 {
+                        false
+                    } else {
+                        *index -= 1;
+                        true
+                    }
+                });
+                for index in &mut details.addr_of_member_args {
+                    *index = index.saturating_sub(1);
+                }
+                for index in &mut details.addr_of_args {
+                    *index = index.saturating_sub(1);
+                }
+                program.symbols.call_sites.push(alternative);
+            }
+        }
+        return;
+    }
 
     // ---- C++ member calls with statically-typed receivers ----
     // `recv.method(args)` / `p->method(args)` / explicit `x.~T()` /
@@ -11939,6 +12137,7 @@ fn collect_call_at_node_inner(
                                 );
                                 emit_unresolved_site(
                                     program,
+                                    ctx,
                                     caller,
                                     field_callee_text(source, func),
                                     Some(recv_cls),
@@ -11976,6 +12175,7 @@ fn collect_call_at_node_inner(
                             );
                             emit_member_targets(
                                 program,
+                                ctx,
                                 caller,
                                 &cls,
                                 &kind,
@@ -12003,6 +12203,7 @@ fn collect_call_at_node_inner(
                                 );
                                 emit_member_targets(
                                     program,
+                                    ctx,
                                     caller,
                                     &field_cls,
                                     &op,
@@ -12033,6 +12234,7 @@ fn collect_call_at_node_inner(
                             );
                             emit_unresolved_site(
                                 program,
+                                ctx,
                                 caller,
                                 kind.name_on(&cls),
                                 Some(cls),
@@ -12071,6 +12273,7 @@ fn collect_call_at_node_inner(
                         collect_call_args(program, ctx, source, node.cached_field("arguments"));
                     emit_member_targets(
                         program,
+                        ctx,
                         caller,
                         &cls,
                         &kind,
@@ -12091,6 +12294,7 @@ fn collect_call_at_node_inner(
         let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
         emit_member_sites(
             program,
+            ctx,
             caller,
             &cls,
             &kind,
@@ -12124,6 +12328,7 @@ fn collect_call_at_node_inner(
             let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
             emit_member_sites(
                 program,
+                ctx,
                 caller,
                 &cls,
                 &kind,
@@ -12249,7 +12454,7 @@ fn collect_call_at_node_inner(
     };
 
     if chosen.is_empty() {
-        let args = args.for_callee(program, None);
+        let args = args.for_callee(program, ctx, None);
         let call_id = program.symbols.alloc_call_id();
         let interned_name = program.symbols.intern_call_name(&callee_name);
         program.symbols.call_sites.push(CallSite {
@@ -12292,7 +12497,7 @@ fn collect_call_at_node_inner(
         } else {
             site_args
         };
-        let site_args = site_args.for_callee(program, Some(t));
+        let site_args = site_args.for_callee(program, ctx, Some(t));
         let call_id = program.symbols.alloc_call_id();
         let interned_name = program.symbols.intern_call_name(
             &(if t != chosen[0] {
@@ -12425,7 +12630,12 @@ impl CallArgs {
     /// The arguments for a site reaching `callee`, positions bound, or for
     /// a site no callee is known at (`None`): each C++ `*x` passes what
     /// [`DerefArg::passed`] gives the parameter it binds.
-    fn for_callee(mut self, program: &mut Program, callee: Option<FnId>) -> Self {
+    fn for_callee(
+        mut self,
+        program: &mut Program,
+        ctx: &LowerContext,
+        callee: Option<FnId>,
+    ) -> Self {
         for deref in &self.deref_args {
             // A position past the declared list takes the variadic tail's.
             let reference = callee.and_then(|callee| {
@@ -12437,6 +12647,45 @@ impl CallArgs {
             if let Some(arg) = self.var_args.iter_mut().find(|(i, _)| *i == deref.index) {
                 arg.1 = deref.passed(program, arg.1, reference);
             }
+        }
+        if let Some(callee) = callee {
+            let shift = usize::from(has_this_param(program, callee));
+            let mut selected = Vec::new();
+            for &(index, fid) in &self.fn_args {
+                let f = program.symbols.function(fid);
+                let signature = program
+                    .symbols
+                    .explicit_params(program.symbols.function(callee))
+                    .and_then(|params| params.get((index as usize).saturating_sub(shift)))
+                    .map(|ty| program.types.get(ty).desc.as_ref());
+                if let Some(signature) = signature
+                    .filter(|d| {
+                        matches!(d.innermost().0, TypeDesc::FnPtr { .. })
+                            && !d.is_member_function_pointer()
+                    })
+                    .filter(|_| f.is_static_member)
+                {
+                    for candidate in program
+                        .symbols
+                        .resolve_function_candidates(&f.name, Some(f.file))
+                    {
+                        if program.symbols.function(candidate).is_static_member
+                            && program.symbols.function_pointer_signature_admits(
+                                candidate,
+                                signature,
+                                &program.types,
+                                ctx.reference_returns.contains(&candidate),
+                            )
+                            && !selected.contains(&(index, candidate))
+                        {
+                            selected.push((index, candidate));
+                        }
+                    }
+                } else if !selected.contains(&(index, fid)) {
+                    selected.push((index, fid));
+                }
+            }
+            self.fn_args = selected;
         }
         self
     }
@@ -12584,6 +12833,15 @@ fn collect_call_arg_nodes<'t>(
                 address_reference_args.push(arg_index);
             }
             null_constants.push(is_null_constant(source, arg));
+            if let Some(desc) = callable_cast_type(program, ctx, source, arg) {
+                let ty = program.types.intern(desc);
+                if let Some(value) = receiver_value(program, ctx, source, arg, ty) {
+                    var_args.push((arg_index, value));
+                    arg_desc.push(adesc);
+                    arg_index += 1;
+                    continue;
+                }
+            }
             // Parameter positions are syntactic: every argument slot
             // advances the index even when the expression yields no IR
             // variable (literals, sizeof, casts). Compressing indices
@@ -12688,6 +12946,18 @@ fn collect_call_arg_nodes<'t>(
                 if is_addr_of_member(source, arg) {
                     addr_of_member_args.push(arg_index);
                 }
+            } else if member_pointer_access(ctx, source, value).is_some_and(
+                |(object, member, arrow)| {
+                    arrow_star_overload(program, ctx, source, object, member, arrow).is_some()
+                },
+            ) {
+                if let Some(temp) =
+                    receiver_value(program, ctx, source, value, program.types.unknown())
+                {
+                    var_args.push((arg_index, temp));
+                }
+            } else if let Some((cell, ty)) = bound_data_member_cell(program, ctx, source, value) {
+                var_args.push((arg_index, emit_load(program, ctx, value, cell, ty)));
             } else if value.cached_kind() == "call_expression" {
                 if let Some(temp) = lower_nested_call_arg(program, ctx, source, value) {
                     var_args.push((arg_index, temp));
@@ -12713,7 +12983,9 @@ fn collect_call_arg_nodes<'t>(
                 });
                 var_args.push((arg_index, temp));
             } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
-                fn_args.push((arg_index, fn_id));
+                for target in function_value_candidates(program, ctx, source, arg, fn_id, None) {
+                    fn_args.push((arg_index, target));
+                }
             }
             arg_desc.push(adesc);
             arg_index += 1;
@@ -13058,14 +13330,31 @@ fn narrow_overloads(
     null_constants: &[bool],
     choice: OverloadChoice,
 ) -> Vec<FnId> {
+    narrow_overloads_with_offsets(program, candidates, arg_desc, null_constants, choice, |_| 0)
+}
+
+fn narrow_overloads_with_offsets(
+    program: &Program,
+    candidates: Vec<FnId>,
+    arg_desc: &[TypeDesc],
+    null_constants: &[bool],
+    choice: OverloadChoice,
+    parameter_offset: impl Fn(FnId) -> usize + Copy,
+) -> Vec<FnId> {
     if candidates.len() <= 1 {
         return candidates;
     }
-    let viable = viable_overloads(program, candidates, arg_desc, null_constants);
+    let viable = viable_overloads(
+        program,
+        candidates,
+        arg_desc,
+        null_constants,
+        parameter_offset,
+    );
     if choice == OverloadChoice::Result && arg_desc.contains(&TypeDesc::Unknown) {
         viable
     } else {
-        rank_overloads(program, &viable, arg_desc)
+        rank_overloads(program, &viable, arg_desc, parameter_offset)
     }
 }
 
@@ -13081,6 +13370,7 @@ fn viable_overloads(
     candidates: Vec<FnId>,
     arg_desc: &[TypeDesc],
     null_constants: &[bool],
+    parameter_offset: impl Fn(FnId) -> usize,
 ) -> Vec<FnId> {
     let class = TypeDesc::is_class_like;
     // `T **` may be a decayed array (`const char *[]`), so only a pointer to
@@ -13091,11 +13381,15 @@ fn viable_overloads(
         let Some(params) = program.symbols.explicit_params(function) else {
             return true;
         };
+        let offset = parameter_offset(*f);
         arg_desc.iter().enumerate().all(|(i, arg)| {
-            let Some(param) = params.get(i).map(|ty| program.types.get(ty).desc.as_ref()) else {
+            let Some(param) = params
+                .get(i + offset)
+                .map(|ty| program.types.get(ty).desc.as_ref())
+            else {
                 return true;
             };
-            let reference = function.reference_params.get(i) == Some(&true);
+            let reference = function.reference_params.get(i + offset) == Some(&true);
             // A scalar such as an enum value is no pointer, but a literal
             // `0` converts to one; a class is a value only where it is
             // declared with no conversion operator, its own or a base's
@@ -13147,51 +13441,11 @@ fn class_may_convert(program: &Program, arg: &TypeDesc) -> bool {
         .any(|f| prefixes.iter().any(|p| f.name.starts_with(p.as_str())))
 }
 
-/// Pick among same-arity C++ candidates using argument-type ranking. Exact
-/// matches (score 0) beat every conversion; a unique best winner is chosen.
-/// Any ambiguity (ties, no exact match, unresolvable args) keeps the whole
-/// arity-set — the may-approximation — rather than guessing.
-fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc]) -> Vec<FnId> {
-    let class = TypeDesc::is_class_like;
-    // Each candidate's explicit parameters, read once.
-    let signatures: Vec<_> = candidates
-        .iter()
-        .map(|&f| {
-            let function = program.symbols.function(f);
-            (function, program.symbols.explicit_params(function))
-        })
-        .collect();
-    let param_desc = |c: usize, i: usize| {
-        signatures[c]
-            .1
-            .as_ref()
-            .and_then(|params| params.get(i))
-            .map(|ty| program.types.get(ty).desc.as_ref())
-    };
-    // The class a reference parameter binds (`const Base &` reads as a
-    // pointer to `Base`); a pointer parameter (`Base *`) binds no class value.
-    let class_referent = |c: usize, i: usize| {
-        (signatures[c].0.reference_params.get(i) == Some(&true))
-            .then(|| param_desc(c, i)?.pointee().filter(|p| class(p)))
-            .flatten()
-    };
-    let class_reference = |c: usize, i: usize| {
-        signatures[c].0.reference_params.get(i) == Some(&true)
-            && param_desc(c, i)
-                .and_then(TypeDesc::pointee)
-                // A class lowering could not resolve reads as `int` here
-                // too: `const Foo &` with `Foo` out of view is `int &`.
-                .is_some_and(|pointee| class(pointee) || matches!(pointee, TypeDesc::Int))
-    };
-    // A class the index does not declare is a guess (an out-of-tree class,
-    // or the enum-shaped `E::VALUE`): it may convert to anything, so it
-    // decides nothing and leaves the other arguments to rank.
-    let guessed_class = |arg: &TypeDesc| program.types.is_undeclared_class(arg);
-    // A class argument meeting another class, by value or reference, may
-    // bind it through a base (`Take(const Base &)` for a `Derived`) or a
-    // converting constructor (`sptr<Impl>` for `const sptr<IListener> &`);
-    // two unrelated in-tree classes (`select(A)`, `select(B)`) cannot.
-    let converts_to_class = |arg: &TypeDesc, param: &TypeDesc| match (arg, param) {
+/// Whether distinct class spellings may bind through inheritance or an
+/// unresolved instantiation. Ranking keeps these conversions undecided;
+/// receiver lookup must also retain them rather than demand an exact name.
+fn class_conversion_possible(program: &Program, arg: &TypeDesc, param: &TypeDesc) -> bool {
+    match (arg, param) {
         (
             TypeDesc::Struct { name: from, .. } | TypeDesc::Union { name: from, .. },
             TypeDesc::Struct { name: to, .. } | TypeDesc::Union { name: to, .. },
@@ -13207,7 +13461,58 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
                 || program.derives_from(&receiver_lookup_name(from), &receiver_lookup_name(to)))
         }
         _ => false,
+    }
+}
+
+/// Pick among same-arity C++ candidates using argument-type ranking. Exact
+/// matches (score 0) beat every conversion; a unique best winner is chosen.
+/// Any ambiguity (ties, no exact match, unresolvable args) keeps the whole
+/// arity-set — the may-approximation — rather than guessing.
+fn rank_overloads(
+    program: &Program,
+    candidates: &[FnId],
+    arg_desc: &[TypeDesc],
+    parameter_offset: impl Fn(FnId) -> usize,
+) -> Vec<FnId> {
+    let class = TypeDesc::is_class_like;
+    // Each candidate's explicit parameters, read once.
+    let signatures: Vec<_> = candidates
+        .iter()
+        .map(|&f| {
+            let function = program.symbols.function(f);
+            (
+                function,
+                program.symbols.explicit_params(function),
+                parameter_offset(f),
+            )
+        })
+        .collect();
+    let param_desc = |c: usize, i: usize| {
+        signatures[c]
+            .1
+            .as_ref()
+            .and_then(|params| params.get(i + signatures[c].2))
+            .map(|ty| program.types.get(ty).desc.as_ref())
     };
+    // The class a reference parameter binds (`const Base &` reads as a
+    // pointer to `Base`); a pointer parameter (`Base *`) binds no class value.
+    let class_referent = |c: usize, i: usize| {
+        (signatures[c].0.reference_params.get(i + signatures[c].2) == Some(&true))
+            .then(|| param_desc(c, i)?.pointee().filter(|p| class(p)))
+            .flatten()
+    };
+    let class_reference = |c: usize, i: usize| {
+        signatures[c].0.reference_params.get(i + signatures[c].2) == Some(&true)
+            && param_desc(c, i)
+                .and_then(TypeDesc::pointee)
+                // A class lowering could not resolve reads as `int` here
+                // too: `const Foo &` with `Foo` out of view is `int &`.
+                .is_some_and(|pointee| class(pointee) || matches!(pointee, TypeDesc::Int))
+    };
+    // A class the index does not declare is a guess (an out-of-tree class,
+    // or the enum-shaped `E::VALUE`): it may convert to anything, so it
+    // decides nothing and leaves the other arguments to rank.
+    let guessed_class = |arg: &TypeDesc| program.types.is_undeclared_class(arg);
     // A position decides nothing where a guess could be the answer: a
     // candidate records its type there as unknown (an unresolved class or
     // enum, `SetMode(Mode)`); an `int` argument meets a reference to a class
@@ -13227,7 +13532,11 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
                 };
                 guessed
                     || matches!(param.innermost().0, TypeDesc::Unknown)
-                    || converts_to_class(arg, class_referent(c, i).unwrap_or(param))
+                    || class_conversion_possible(
+                        program,
+                        arg,
+                        class_referent(c, i).unwrap_or(param),
+                    )
                     || (matches!(arg, TypeDesc::Int) && class_reference(c, i))
                     || arg.pointee().is_some_and(|pointee| {
                         class(pointee)
@@ -13243,18 +13552,19 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
         })
         .collect();
     let score = |c: usize| -> usize {
-        let (function, params) = &signatures[c];
+        let (function, params, offset) = &signatures[c];
         let Some(params) = params else {
             return 0;
         };
-        (0..params.len())
+        (0..params.len().saturating_sub(*offset))
             .filter(|&i| !undecidable.get(i).copied().unwrap_or(false))
             .map(|i| {
                 let pdesc = param_desc(c, i).unwrap_or(&TypeDesc::Unknown);
                 let adesc = arg_desc.get(i).unwrap_or(&TypeDesc::Unknown);
                 // A reference parameter is lowered one pointer layer deeper:
                 // a class argument binds `f(T &)` exactly.
-                let binds_reference = function.reference_params.get(i) == Some(&true)
+                let binds_reference = function.reference_params.get(i + signatures[c].2)
+                    == Some(&true)
                     && class(adesc)
                     && pdesc.pointee().is_some_and(|pointee| {
                         trace_ir::spelled_alike(
@@ -13468,39 +13778,42 @@ fn inherited_static_members(
 /// (dropped). Pointer/array/element layers are peeled. May-analysis:
 /// whenever an argument's struct type is visible in multiple namespaces, all
 /// of them are candidates.
-fn adl_namespaces(arg_desc: &[TypeDesc]) -> Vec<String> {
+fn adl_namespaces(program: &Program, arg_desc: &[TypeDesc]) -> Vec<String> {
     let mut namespaces: Vec<String> = Vec::new();
-    fn collect(desc: &TypeDesc, out: &mut Vec<String>) {
-        let inner = match desc {
-            TypeDesc::Ptr(i) | TypeDesc::Array { elem: i, .. } => i.as_ref(),
-            TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
-                // Derive the enclosing namespace from the qualified tag.
-                // A leading `::` (e.g. `::kit::Widget`) is the global-scope
-                // marker, not part of the namespace name, so strip it before
-                // querying (`functions_in_namespace` treats `kit` and `::kit`
-                // as interchangeable, so ADL must too).
-                // For nested qualified tags like `N::Outer::Inner`, add every
-                // prefix (`N::Outer` and `N`): the intermediate segments may
-                // be classes (not namespaces), and in real C++ only enclosing
-                // namespaces contribute to ADL — but without type information
-                // we conservatively add all prefixes (sound over-approximation).
-                let stripped = name.trim_start_matches("::");
-                let mut prefix_end = stripped.find("::");
-                while let Some(sep) = prefix_end {
-                    let ns = stripped[..sep].to_string();
-                    if !out.iter().any(|n| n == &ns) {
-                        out.push(ns);
-                    }
-                    prefix_end = stripped[sep + 2..].find("::").map(|i| i + sep + 2);
-                }
-                return;
+    fn collect_name(name: &str, out: &mut Vec<String>) {
+        // Qualified nested tags may include class scopes. Keep every prefix
+        // conservatively, and normalize a leading global-scope marker.
+        let stripped = name.trim_start_matches("::");
+        let mut prefix_end = stripped.find("::");
+        while let Some(sep) = prefix_end {
+            let ns = stripped[..sep].to_string();
+            if !out.iter().any(|n| n == &ns) {
+                out.push(ns);
             }
-            _ => return,
-        };
-        collect(inner, out);
+            prefix_end = stripped[sep + 2..].find("::").map(|i| i + sep + 2);
+        }
+    }
+    fn collect(program: &Program, desc: &TypeDesc, out: &mut Vec<String>) {
+        match desc {
+            TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => {
+                collect(program, inner, out)
+            }
+            TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
+                collect_name(name, out);
+                let lookup = receiver_lookup_name(name);
+                if program.has_bases(&lookup) {
+                    // The shared closure is cycle-safe and visits bases in
+                    // declaration order, preserving deterministic lookup.
+                    for (base, _) in program.ancestor_closure(&lookup).into_iter().skip(1) {
+                        collect_name(base, out);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     for d in arg_desc {
-        collect(d, &mut namespaces);
+        collect(program, d, &mut namespaces);
     }
     namespaces
 }
@@ -13598,7 +13911,7 @@ fn resolve_cpp_name_candidates(
         }
     }
     // Phase 4: ADL namespaces add candidates without replacing.
-    for ns in adl_namespaces(arg_desc) {
+    for ns in adl_namespaces(program, arg_desc) {
         for id in program.symbols.functions_in_namespace(&ns, base) {
             if !out.contains(&id) {
                 out.push(id);
@@ -13638,6 +13951,7 @@ fn resolve_cpp_name_candidates(
 #[allow(clippy::too_many_arguments)]
 fn emit_unresolved_site(
     program: &mut Program,
+    ctx: &LowerContext,
     caller: FnId,
     callee_name: String,
     receiver_class: Option<String>,
@@ -13658,7 +13972,7 @@ fn emit_unresolved_site(
         address_reference_args: _,
         ctor_set_complete: _,
         null_constants: _,
-    } = args.bind_past_this(None).for_callee(program, None);
+    } = args.bind_past_this(None).for_callee(program, ctx, None);
     let call_id = program.symbols.alloc_call_id();
     let interned_name = program.symbols.intern_call_name(&callee_name);
     program.symbols.call_sites.push(CallSite {
@@ -13753,6 +14067,7 @@ impl Receiver {
 #[allow(clippy::too_many_arguments)]
 fn emit_member_sites(
     program: &mut Program,
+    ctx: &LowerContext,
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
@@ -13766,6 +14081,7 @@ fn emit_member_sites(
     let targets = member_targets_upward(program, &cls, kind);
     emit_member_targets(
         program,
+        ctx,
         caller,
         &cls,
         kind,
@@ -13785,6 +14101,7 @@ fn emit_member_sites(
 #[allow(clippy::too_many_arguments)]
 fn emit_member_targets(
     program: &mut Program,
+    ctx: &LowerContext,
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
@@ -13819,7 +14136,7 @@ fn emit_member_targets(
     if targets.is_empty() {
         // Unknown method: keep an unresolved site; the solver synthesizes
         // an external entry (mirrors plain-identifier C behavior).
-        let args = args.for_callee(program, None);
+        let args = args.for_callee(program, ctx, None);
         let call_id = program.symbols.alloc_call_id();
         let interned_name = program.symbols.intern_call_name(&kind.name_on(cls));
         program.symbols.call_sites.push(CallSite {
@@ -13860,7 +14177,7 @@ fn emit_member_targets(
     for (index, t) in targets.into_iter().enumerate() {
         let site_args = args
             .take_for(index == last_index)
-            .for_callee(program, Some(t));
+            .for_callee(program, ctx, Some(t));
         let (call_id, name) = {
             let id = program.symbols.alloc_call_id();
             let nm = program.symbols.function(t).name.clone();
@@ -14360,7 +14677,7 @@ fn lower_initializer_object(
             .is_some_and(|value| string_literal_value(source, *value).is_some())
         {
             if let Some(address) = object.address {
-                emit_store_to_location(program, ctx, source, values[0], address, values[0]);
+                emit_store_to_location(program, ctx, source, values[0], address, values[0], None);
             }
             return 1;
         }
@@ -14430,7 +14747,16 @@ fn lower_initializer_object(
         if let Some(address) = object.address {
             let first_flow = program.flow.len();
             let first_pending = ctx.pending.borrow().len();
-            emit_store_to_location(program, ctx, source, value, address, value);
+            let destination = program.types.intern(object.desc.as_ref().clone());
+            emit_store_to_location(
+                program,
+                ctx,
+                source,
+                value,
+                address,
+                value,
+                Some(destination),
+            );
             let location = node_span(program, ctx, value);
             let expression = operation_expression(ctx, source, value);
             record_operation_origins(
@@ -14725,6 +15051,7 @@ fn lower_class_initializer(
         }
         emit_member_targets(
             program,
+            ctx,
             caller,
             &class,
             &kind,
@@ -15026,6 +15353,7 @@ fn lower_copy_subobject(
         if let Some(caller) = ctx.current_fn {
             emit_member_targets(
                 program,
+                ctx,
                 caller,
                 target,
                 &kind,
@@ -15211,6 +15539,7 @@ fn lower_member_initializer_expression(
         vec![Cell::new(None); ctx.line_map.as_ref().unwrap().files.len()],
     );
     let saved_tree = ctx.tree.replace(tree.clone());
+    let saved_spelling = std::mem::replace(&mut ctx.parse_spelling, Arc::clone(&source));
     let saved_declaration_syntax = ctx.declaration_syntax.take();
     let saved_locals = std::mem::take(&mut ctx.locals);
     let saved_aliases = std::mem::take(&mut ctx.local_aliases);
@@ -15277,6 +15606,7 @@ fn lower_member_initializer_expression(
     ctx.local_aliases = saved_aliases;
     ctx.using_name_imports = saved_imports;
     ctx.tree = saved_tree;
+    ctx.parse_spelling = saved_spelling;
     ctx.declaration_syntax.replace(saved_declaration_syntax);
     ctx.origin_file_ids = saved_files;
     ctx.line_map = saved_map;
@@ -15635,13 +15965,6 @@ fn same_signature_loosely(program: &Program, a: FnId, b: FnId) -> bool {
                     .as_ref(),
             )
         })
-}
-
-fn arity_compatible(expected: Option<usize>, got: Option<usize>) -> bool {
-    match (expected, got) {
-        (None, _) | (_, None) => true,
-        (Some(a), Some(b)) => a == b,
-    }
 }
 
 /// Whether `f`, declaring `declared` explicit parameters, takes `argc`
@@ -16357,6 +16680,21 @@ fn receiver_desc(
         return receiver_desc(program, ctx, source, argument);
     }
     match node.cached_kind() {
+        "binary_expression" => {
+            let (object, member, arrow) = member_pointer_access(ctx, source, node)?;
+            if let Some((_, targets)) =
+                arrow_star_overload(program, ctx, source, object, member, arrow)
+            {
+                let ty = program.symbols.function(targets[0]).return_type;
+                return targets
+                    .iter()
+                    .all(|&fid| program.symbols.function(fid).return_type == ty)
+                    .then(|| program.types.get(ty).desc.as_ref().clone());
+            }
+            let desc = receiver_desc(program, ctx, source, member)?;
+            let (_, member) = desc.member_pointer()?;
+            (!desc.is_member_function_pointer()).then(|| member.clone())
+        }
         "this" => Some(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
             name: ctx.class_ctx.as_ref()?.qual_name.clone(),
             fields: Vec::new(),
@@ -16384,8 +16722,83 @@ fn receiver_desc(
                 node_text(source, &node.cached_field("field")?),
             )
         }
+        "subscript_expression" => {
+            let array = receiver_desc(program, ctx, source, node.cached_field("argument")?)?;
+            match array {
+                TypeDesc::Array { elem, .. } | TypeDesc::Ptr(elem) => Some(*elem),
+                _ => None,
+            }
+        }
         "pointer_expression" => {
-            let desc = receiver_desc(program, ctx, source, node.named_child(0)?)?;
+            let arg = pointer_arg(node)?;
+            if pointer_op(source, node).as_deref() == Some("&")
+                && arg.cached_kind() == "qualified_identifier"
+            {
+                let name = normalize_qualified(node_text(source, &arg));
+                if let Some((owner, field)) = name.rsplit_once("::") {
+                    let owner = qualify_class_name(program, ctx, owner);
+                    if let Some(desc) = class_field_desc(program, &owner, field) {
+                        return Some(TypeDesc::MemberPointer {
+                            owner,
+                            is_function: false,
+                            member: Box::new(desc),
+                        });
+                    }
+                }
+            }
+            if pointer_op(source, node).as_deref() == Some("&") {
+                if let Some(fid) = resolve_fn_ref(program, ctx, source, arg) {
+                    let f = program.symbols.function(fid);
+                    let owner = if !f.is_static_member && is_member_function(program, fid) {
+                        Some(trace_ir::MethodKind::of_function(&f.name)?.0)
+                    } else {
+                        None
+                    };
+                    let mut params: Vec<_> = program
+                        .symbols
+                        .explicit_params(f)
+                        .map(|explicit| {
+                            (0..explicit.len())
+                                .map(|i| {
+                                    explicit.get(i).map_or(TypeDesc::Unknown, |ty| {
+                                        program.types.get(ty).desc.as_ref().clone()
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_else(|| vec![TypeDesc::Unknown]);
+                    if let Some(owner) = &owner {
+                        params.insert(
+                            0,
+                            TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+                                name: owner.clone(),
+                                fields: Vec::new(),
+                            })),
+                        );
+                    }
+                    if f.variadic && params.last() != Some(&TypeDesc::Unknown) {
+                        params.push(TypeDesc::Unknown);
+                    }
+                    let mut ret = program.types.get(f.return_type).desc.as_ref().clone();
+                    if ctx.reference_returns.contains(&fid) {
+                        ret = TypeDesc::Ptr(Box::new(ret));
+                    }
+                    let signature = TypeDesc::FnPtr {
+                        ret: Box::new(ret),
+                        params,
+                    };
+                    return Some(if let Some(owner) = owner {
+                        TypeDesc::MemberPointer {
+                            owner,
+                            is_function: true,
+                            member: Box::new(signature),
+                        }
+                    } else {
+                        TypeDesc::Ptr(Box::new(signature))
+                    });
+                }
+            }
+            let desc = receiver_desc(program, ctx, source, arg)?;
             match pointer_op(source, node).as_deref() {
                 Some("*") => deref_desc(program, desc),
                 Some("&") => Some(TypeDesc::Ptr(Box::new(desc))),
@@ -16423,6 +16836,17 @@ fn receiver_desc(
                     .insert(node.id(), desc.clone());
             }
             desc
+        }
+        "compound_literal_expression" if ctx.is_cpp => {
+            let ty = node.cached_field("type")?;
+            if ty.cached_field("declarator").is_some() {
+                return None;
+            }
+            let name = normalize_qualified(node_text(source, &ty));
+            declared_class_in_scope(program, ctx, &name).map(|name| TypeDesc::Struct {
+                name,
+                fields: Vec::new(),
+            })
         }
         "new_expression" => Some(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
             name: new_expression_class(program, ctx, source, node)?,
@@ -16649,6 +17073,11 @@ fn declared_class_in_scope(program: &Program, ctx: &LowerContext, name: &str) ->
             |candidate| program.types.declared_class(candidate),
         )
     })
+    .or_else(|| {
+        imported_by_directive(ctx, name, |candidate| {
+            program.types.declared_class(candidate)
+        })
+    })
 }
 
 /// The class tag a `class` / `struct` keyword spelling names, found through
@@ -16869,50 +17298,6 @@ fn scoped_type_desc(program: &Program, ctx: &LowerContext, name: &str) -> Option
     })
 }
 
-/// A template argument split into what names the type and the pointer /
-/// reference punctuation after it, every level kept and cv-qualifiers at any
-/// level dropped: `T * const *` is (`T`, `**`), `T &` is (`T`, `&`).
-fn split_pointer_suffix(arg: &str) -> (&str, String) {
-    let mut rest = arg.trim();
-    let mut suffix = String::new();
-    loop {
-        let bare = strip_trailing_cv(rest).trim_end();
-        match bare.strip_suffix(['*', '&']) {
-            Some(shorter) => {
-                suffix.insert(0, bare.chars().next_back().unwrap_or('*'));
-                rest = shorter;
-            }
-            None => return (bare, suffix),
-        }
-    }
-}
-
-/// A non-type template argument spelled as a literal (`4`, `-1`, `true`,
-/// `'a'`): never a class, so never qualified to a namespace.
-fn is_template_literal(arg: &str) -> bool {
-    arg.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_digit() || matches!(c, '\'' | '"' | '-'))
-        || matches!(arg, "true" | "false" | "nullptr")
-}
-
-/// `T const` / `T volatile` spelled after the type, also directly after
-/// pointer or reference punctuation (`T*const`).
-fn strip_trailing_cv(mut s: &str) -> &str {
-    loop {
-        let t = s.trim_end();
-        match t
-            .strip_suffix("const")
-            .or_else(|| t.strip_suffix("volatile"))
-        {
-            Some(rest) if rest.ends_with(|c: char| c.is_whitespace() || matches!(c, '*' | '&')) => {
-                s = rest;
-            }
-            _ => return t,
-        }
-    }
-}
-
 /// Whether a `field_expression` spells `->` rather than `.`.
 fn is_arrow_access(node: Node) -> bool {
     member_access_op(node).1
@@ -16937,7 +17322,7 @@ fn member_access_op(node: Node) -> (bool, bool) {
 /// one syntactic call occurrence.
 fn member_access_token(node: Node) -> Option<Node> {
     node.children(&mut node.walk())
-        .find(|child| matches!(child.cached_kind(), "." | "->"))
+        .find(|child| matches!(child.cached_kind(), "." | ".*" | "->"))
 }
 
 /// Static class of a receiver expression, when inferable from declared
@@ -16950,6 +17335,7 @@ fn infer_static_class(
 ) -> Option<String> {
     let node = peel_expression(node);
     match node.cached_kind() {
+        "binary_expression" => class_name_of_desc(&receiver_desc(program, ctx, source, node)?),
         "this" => ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()),
         "identifier" => {
             // Bare `plugin_->OnEvent()` inside a method is implicit
@@ -17061,6 +17447,14 @@ fn operation_expression_range(
     source: &str,
     extent: std::ops::Range<usize>,
 ) -> String {
+    // Node offsets are unchanged by parser adaptations. Presentation must
+    // keep the actual operators (`->*`) and original declaration spelling.
+    let spelling = Arc::clone(&ctx.parse_spelling);
+    let source = if spelling.is_empty() {
+        source
+    } else {
+        &spelling
+    };
     let language = if ctx.is_cpp {
         trace_preproc::Language::Cpp
     } else {
@@ -17353,7 +17747,9 @@ fn extract_flow_from_expr_inner(
                 };
                 // `*out = (f())` stores the result as `*out = f()` does.
                 let call = peel_casts(source, rhs);
-                if let Some(src) = expr_to_store_src(program, ctx, source, rhs) {
+                let destination =
+                    receiver_desc(program, ctx, source, lhs).map(|d| program.types.intern(d));
+                if let Some(src) = expr_to_store_src(program, ctx, source, rhs, destination) {
                     let dst = ptr(program, ctx);
                     program.flow.push(FlowConstraint::Store { dst, src });
                 } else if let Some(name) = fn_designator(source, rhs) {
@@ -17377,6 +17773,8 @@ fn extract_flow_from_expr_inner(
                     }
                 }
             }
+        } else if let Some((cell, ty)) = bound_data_member_cell(program, ctx, source, lhs) {
+            emit_store_to_location(program, ctx, source, node, cell, rhs, Some(ty));
         } else if lhs.cached_kind() == "field_expression"
             || implicit_this(program, ctx, source, lhs).is_some()
         {
@@ -17627,6 +18025,34 @@ fn peel_expression(mut node: Node) -> Node {
     node
 }
 
+/// The invocation type of an explicit cast, before stripping its operand.
+fn callable_cast_type(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<TypeDesc> {
+    let node = peel_expression(node);
+    let descriptor = if node.cached_kind() == "cast_expression" {
+        node.cached_field("type")
+    } else if is_named_cast(source, node) {
+        node.cached_field("function")?
+            .cached_field("arguments")?
+            .named_child(0)
+    } else {
+        None
+    }?;
+    let base = type_desc_from_node(program, ctx, source, descriptor);
+    let mut desc = abstract_declarator_shape(
+        base,
+        descriptor.cached_field("declarator"),
+        true,
+        ReferenceLayer::Pointer,
+    );
+    refine_callable_pointer(program, ctx, source, descriptor, &mut desc);
+    matches!(desc.innermost().0, TypeDesc::FnPtr { .. }).then_some(desc)
+}
+
 /// Strip parentheses and casts — C `(T)x` and C++ `static_cast<T>(x)` /
 /// `reinterpret_cast` / `const_cast` / `dynamic_cast`, which the grammar
 /// parses as calls of a template — down to the operand.
@@ -17670,12 +18096,17 @@ fn peel_derefs_and_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
 
 /// `static_cast<T>(x)` and its siblings: a call of a named-cast template.
 fn is_named_cast(source: &str, call: Node) -> bool {
+    named_cast_name(source, call).is_some()
+}
+
+fn named_cast_name<'s>(source: &'s str, call: Node) -> Option<&'s str> {
     call.cached_field("function")
         .filter(|f| f.cached_kind() == "template_function")
         .and_then(|f| f.cached_field("name"))
-        .is_some_and(|name| {
+        .map(|name| node_text(source, &name))
+        .filter(|name| {
             matches!(
-                node_text(source, &name),
+                *name,
                 "static_cast" | "reinterpret_cast" | "const_cast" | "dynamic_cast"
             )
         })
@@ -17903,8 +18334,9 @@ fn emit_store_to_location(
     span_node: Node,
     dst: VarId,
     value_node: Node,
+    destination: Option<trace_ir::TypeId>,
 ) {
-    if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
+    if let Some(src) = expr_to_store_src(program, ctx, source, value_node, destination) {
         program.flow.push(FlowConstraint::Store { dst, src });
     } else {
         let peeled_value = peel_casts(source, peel_expression(value_node));
@@ -17973,7 +18405,23 @@ fn emit_field_value_store(
         last,
         field_names[prefix.len()].clone(),
     );
-    emit_store_to_location(program, ctx, source, span_node, gep, value_node);
+    let mut owner = struct_type_for_var(program, base);
+    let mut destination = None;
+    for name in field_names {
+        destination = owner.and_then(|ty| {
+            field_in_hierarchy(program, Some(ctx), ty, name).map(|field| field.type_id)
+        });
+        owner = destination.map(|ty| peel_ptr_to_struct(program, ty));
+    }
+    emit_store_to_location(
+        program,
+        ctx,
+        source,
+        span_node,
+        gep,
+        value_node,
+        destination,
+    );
 }
 
 fn alloc_gep_temp(
@@ -18666,6 +19114,23 @@ fn addr_of_field_path(
         }
         return Some(addr_of_temp(program, ctx, peeled, member));
     }
+    if peeled.cached_kind() == "qualified_identifier" {
+        let name = normalize_qualified(node_text(source, &peeled));
+        if let Some((owner, field)) = name.rsplit_once("::") {
+            let owner = qualify_class_name(program, ctx, owner);
+            if let Some(info) = lookup_field_in_hierarchy(program, Some(ctx), &owner, field) {
+                let base = alloc_load_temp(program, ctx, peeled, info.owner_type_id);
+                return Some(alloc_gep_temp(
+                    program,
+                    ctx,
+                    peeled,
+                    base,
+                    info.field_id,
+                    field.to_string(),
+                ));
+            }
+        }
+    }
     // &field_expression → direct field path; &identifier → check for C++
     // implicit this->member
     if let Some((cell, _)) = member_cell(program, ctx, source, peeled) {
@@ -18687,11 +19152,47 @@ fn expr_to_store_src(
     ctx: &mut LowerContext,
     source: &str,
     node: Node,
+    destination: Option<trace_ir::TypeId>,
 ) -> Option<VarId> {
+    if let Some(desc) = callable_cast_type(program, ctx, source, node) {
+        let ty = program.types.intern(desc);
+        return receiver_value(program, ctx, source, node, ty);
+    }
     // `&x` stores x's address, not x's value (docs/ANALYSIS.md, "Argument
     // flow").
     if let Some(v) = addr_of_plain_var(program, ctx, source, node) {
         return Some(addr_of_temp(program, ctx, node, v));
+    }
+    // Preserve explicit overload selection before a store peels casts away.
+    if let Some(callee) = resolve_call_fn_arg(program, ctx, source, node).filter(|&id| {
+        is_member_function(program, id) || program.symbols.function(id).is_static_member
+    }) {
+        let candidates = function_value_candidates(program, ctx, source, node, callee, destination);
+        if candidates.is_empty() {
+            return None;
+        }
+        let value = if named_cast_name(source, peel_expression(node)) == Some("reinterpret_cast")
+            || peel_expression(node).cached_kind() == "cast_expression"
+        {
+            {
+                let span = node_span(program, ctx, node);
+                add_temp(
+                    program,
+                    ctx.current_fn,
+                    TempKind::Reinterpret,
+                    program.types.unknown(),
+                    span,
+                )
+            }
+        } else {
+            alloc_ret_temp(program, ctx, node)
+        };
+        for callee in candidates {
+            program
+                .flow
+                .push(FlowConstraint::AddrOfFn { dst: value, callee });
+        }
+        return Some(value);
     }
     // `(void *)&s.f` stores the member's address like `&s.f` does.
     let node = peel_casts(source, node);
@@ -18748,6 +19249,13 @@ enum RhsDst<'t> {
 }
 
 impl RhsDst<'_> {
+    fn type_id(&self, program: &Program) -> trace_ir::TypeId {
+        match self {
+            Self::Var(var) => program.symbols.variable(*var).type_id,
+            Self::Load { type_id, .. } => *type_id,
+        }
+    }
+
     /// The destination variable, allocating a load temporary on first use.
     fn var(&self, program: &mut Program, ctx: &LowerContext) -> VarId {
         match self {
@@ -18770,6 +19278,34 @@ impl RhsDst<'_> {
     }
 }
 
+fn function_value_flow(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    expression: Node,
+    callee: FnId,
+    dst: &RhsDst,
+) -> Option<FlowConstraint> {
+    let destination = dst.type_id(program);
+    let candidates =
+        function_value_candidates(program, ctx, source, expression, callee, Some(destination));
+    let callee = candidates
+        .iter()
+        .copied()
+        .find(|&id| id == callee)
+        .or_else(|| candidates.first().copied())?;
+    let dst = dst.var(program, ctx);
+    for target in candidates {
+        if target != callee {
+            program.flow.push(FlowConstraint::AddrOfFn {
+                dst,
+                callee: target,
+            });
+        }
+    }
+    Some(FlowConstraint::AddrOfFn { dst, callee })
+}
+
 /// [`expr_to_rhs_flow`] into a destination allocated on first use.
 fn rhs_flow(
     program: &mut Program,
@@ -18780,6 +19316,51 @@ fn rhs_flow(
 ) -> Option<FlowConstraint> {
     if node_is_from_ignored_macro(ctx, node) {
         return None;
+    }
+    let cast = peel_expression(node);
+    let operand = if cast.cached_kind() == "cast_expression" {
+        cast.cached_field("value").or_else(|| cast.named_child(1))
+    } else if named_cast_name(source, cast) == Some("reinterpret_cast") {
+        cast.cached_field("arguments")
+            .and_then(|args| args.named_child(0))
+    } else {
+        None
+    };
+    if let Some(operand) = operand.filter(|&operand| {
+        matches!(
+            program.types.get(dst.type_id(program)).desc.innermost().0,
+            TypeDesc::FnPtr { .. }
+        ) || receiver_desc(program, ctx, source, operand)
+            .is_some_and(|desc| matches!(desc.innermost().0, TypeDesc::FnPtr { .. }))
+            || resolve_call_fn_arg(program, ctx, source, operand).is_some()
+    }) {
+        let ty = dst.type_id(program);
+        let span = node_span(program, ctx, node);
+        let value = add_temp(program, ctx.current_fn, TempKind::Reinterpret, ty, span);
+        if let Some(callee) = resolve_call_fn_arg(program, ctx, source, operand) {
+            for callee in function_value_candidates(program, ctx, source, cast, callee, Some(ty)) {
+                program
+                    .flow
+                    .push(FlowConstraint::AddrOfFn { dst: value, callee });
+            }
+        } else if let Some(flow) = rhs_flow(program, ctx, source, operand, &RhsDst::Var(value)) {
+            program.flow.push(flow);
+        }
+        let dst = dst.var(program, ctx);
+        return Some(FlowConstraint::Copy { dst, src: value });
+    }
+    if let Some((cell, _)) = bound_data_member_cell(program, ctx, source, node) {
+        let dst = dst.var(program, ctx);
+        return Some(FlowConstraint::Load { dst, src: cell });
+    }
+    let expression = node;
+    if let Some((object, member, arrow)) = member_pointer_access(ctx, source, node) {
+        if arrow_star_overload(program, ctx, source, object, member, arrow).is_some() {
+            let (_, _, src) = resolve_callee_with_loads(program, ctx, source, node);
+            let src = src?;
+            let dst = dst.var(program, ctx);
+            return Some(FlowConstraint::Copy { dst, src });
+        }
     }
     let node = peel_casts(source, node);
     if node_is_from_ignored_macro(ctx, node) {
@@ -18822,8 +19403,7 @@ fn rhs_flow(
                 let dst = dst.var(program, ctx);
                 Some(FlowConstraint::Copy { dst, src })
             } else if let Some(callee) = resolve_function_named(program, ctx, name) {
-                let dst = dst.var(program, ctx);
-                Some(FlowConstraint::AddrOfFn { dst, callee })
+                function_value_flow(program, ctx, source, expression, callee, dst)
             } else if found.is_some() {
                 None
             } else {
@@ -18842,8 +19422,7 @@ fn rhs_flow(
                 Some(FlowConstraint::Copy { dst, src })
             } else {
                 let callee = resolve_qualified_fn(program, ctx, source, node)?;
-                let dst = dst.var(program, ctx);
-                Some(FlowConstraint::AddrOfFn { dst, callee })
+                function_value_flow(program, ctx, source, expression, callee, dst)
             }
         }
         "pointer_expression" => {
@@ -18863,8 +19442,7 @@ fn rhs_flow(
                     let dst = dst.var(program, ctx);
                     Some(FlowConstraint::Copy { dst, src: gep })
                 } else if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
-                    let dst = dst.var(program, ctx);
-                    Some(FlowConstraint::AddrOfFn { dst, callee })
+                    function_value_flow(program, ctx, source, expression, callee, dst)
                 } else if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
                     let dst = dst.var(program, ctx);
                     Some(if names_reference_binding(ctx, arg, src) {
@@ -18974,6 +19552,35 @@ fn collect_return_flow(
     node: Node,
     fn_id: FnId,
 ) {
+    if node_is_from_ignored_macro(ctx, node) {
+        return;
+    }
+    // Callable casts must publish their qualified function locations before
+    // the return is copied, just as assignments and stores do.
+    if let Some(desc) = callable_cast_type(program, ctx, source, node) {
+        let ty = program.types.intern(desc);
+        if let Some(src) = receiver_value(program, ctx, source, node, ty) {
+            program
+                .fn_returns
+                .entry(fn_id)
+                .or_default()
+                .push(ReturnFlow::Copy { src });
+        }
+        return;
+    }
+    if let Some(callee) = resolve_call_fn_arg(program, ctx, source, node).filter(|&id| {
+        (is_member_function(program, id) || program.symbols.function(id).is_static_member)
+            && implicit_this(program, ctx, source, peel_casts(source, node)).is_none()
+    }) {
+        let ty = program.symbols.function(fn_id).return_type;
+        let candidates = function_value_candidates(program, ctx, source, node, callee, Some(ty));
+        program.fn_returns.entry(fn_id).or_default().extend(
+            candidates
+                .into_iter()
+                .map(|callee| ReturnFlow::AddrOfFn { callee }),
+        );
+        return;
+    }
     if let Some(flow) = return_flow_from_expr(program, ctx, source, node, fn_id) {
         program.fn_returns.entry(fn_id).or_default().push(flow);
     }
@@ -18992,6 +19599,16 @@ fn return_flow_from_expr(
     let node = peel_casts(source, node);
     if node_is_from_ignored_macro(ctx, node) {
         return None;
+    }
+    if let Some((object, member, arrow)) = member_pointer_access(ctx, source, node) {
+        if arrow_star_overload(program, ctx, source, object, member, arrow).is_some() {
+            let (_, _, src) = resolve_callee_with_loads(program, ctx, source, node);
+            return src.map(|src| ReturnFlow::Copy { src });
+        }
+    }
+    if let Some((cell, ty)) = bound_data_member_cell(program, ctx, source, node) {
+        let src = emit_load(program, ctx, node, cell, ty);
+        return Some(ReturnFlow::Copy { src });
     }
     // `return s.ops[i];` / `return ops_[i];` returns the member's value,
     // an element of a member table being its cell.
@@ -19548,6 +20165,8 @@ fn operand_flow(
 enum Operand<'t> {
     /// A variable's own value, read through it when it names a reference.
     Var(Node<'t>, VarId),
+    /// An array summary's value, with the element's type rather than the array's.
+    Element(Node<'t>, Box<Self>, trace_ir::TypeId),
     /// A member's value, from the cell its path reaches: the cell itself
     /// for an array member, else loaded from it. `true` for an element of a
     /// member table (`h->t[i]`), always loaded, as `field_table` reads one.
@@ -19592,13 +20211,25 @@ impl<'t> Operand<'t> {
             }
             // An element of a member table is the table's cell, as in
             // `field_table`, so it holds the member's value.
-            "subscript_expression" => field_path(
-                program,
-                ctx,
-                source,
-                field_table(program, ctx, source, operand)?,
-            )
-            .map(|path| Self::Member(path, true)),
+            "subscript_expression" => {
+                if let Some(table) = field_table(program, ctx, source, operand) {
+                    if let Some(path) = field_path(program, ctx, source, table) {
+                        return Some(Self::Member(path, true));
+                    }
+                }
+                let base = operand.cached_field("argument")?;
+                let desc = receiver_desc(program, ctx, source, base)?;
+                let value = Self::resolve(program, ctx, source, base)?;
+                match desc {
+                    // Array summaries already carry their elements' values.
+                    TypeDesc::Array { elem, .. } => {
+                        let ty = program.types.intern(*elem);
+                        Some(Self::Element(operand, Box::new(value), ty))
+                    }
+                    TypeDesc::Ptr(_) => Some(Self::Deref(operand, Box::new(value), false)),
+                    _ => None,
+                }
+            }
             "pointer_expression" => {
                 let inner = deref_operand(source, operand)?;
                 let value = Self::resolve(program, ctx, source, inner)?;
@@ -19681,6 +20312,20 @@ impl<'t> Operand<'t> {
                 emit_load(program, ctx, node, var, referent)
             }
             Self::Var(_, var) => var,
+            Self::Element(node, inner, ty) => {
+                let src = inner.publish(program, ctx, source);
+                let callable = match program.types.get(ty).desc.as_ref() {
+                    TypeDesc::FnPtr { .. } => true,
+                    TypeDesc::Ptr(inner) => matches!(inner.as_ref(), TypeDesc::FnPtr { .. }),
+                    _ => false,
+                };
+                if callable {
+                    return emit_load(program, ctx, node, src, ty);
+                }
+                let dst = alloc_load_temp(program, ctx, node, ty);
+                program.flow.push(FlowConstraint::Copy { dst, src });
+                dst
+            }
             Self::Member(path, element) => {
                 let node = path.node;
                 match path.value_cell(program, ctx, source, element) {
@@ -19748,7 +20393,9 @@ fn implicit_this_field(
     source: &str,
     node: Node,
 ) -> Option<(VarId, HierarchyField)> {
-    if node.cached_kind() != "identifier" {
+    // In `p->*cb`, the normalized grammar labels the unqualified operand
+    // `cb` as a field_identifier. Its lookup still follows ordinary scope.
+    if !matches!(node.cached_kind(), "identifier" | "field_identifier") {
         return None;
     }
     this_field_named(program, ctx, node_text(source, &node))
@@ -20086,7 +20733,7 @@ fn type_desc_from_field_declarator(
         .cached_field("type")
         .map(|t| type_desc_from_node(program, ctx, source, t))
         .unwrap_or(TypeDesc::Int);
-    let desc = if is_function_pointer_declarator(inner_decl) {
+    let mut desc = if is_function_pointer_declarator(inner_decl) {
         // `void (**pcb)(void)` points to a function pointer: every pointer
         // level past the first keeps its own layer.
         let mut levels = 0;
@@ -20101,7 +20748,7 @@ fn type_desc_from_field_declarator(
         }
         let fn_ptr = TypeDesc::FnPtr {
             ret: Box::new(base),
-            params: Vec::new(),
+            params: vec![TypeDesc::Unknown],
         };
         (1..levels).fold(fn_ptr, |desc, _| TypeDesc::Ptr(Box::new(desc)))
     } else if declarator_is_pointer_to_fn(inner_decl) {
@@ -20112,13 +20759,27 @@ fn type_desc_from_field_declarator(
         // resolution for ops tables assigned outside initializers.
         TypeDesc::FnPtr {
             ret: Box::new(base),
-            params: Vec::new(),
+            params: vec![TypeDesc::Unknown],
         }
     } else if declarator_is_pointer(inner_decl) {
         TypeDesc::Ptr(Box::new(base))
     } else {
         base
     };
+    let mut member_desc = walk_declarator_shape(
+        inner_decl,
+        node.cached_field("type")
+            .map(|t| type_desc_from_node(program, ctx, source, t))
+            .unwrap_or(TypeDesc::Int),
+    );
+    if refine_callable_pointer(program, ctx, source, inner_decl, &mut member_desc)
+        || member_desc.member_pointer().is_some()
+    {
+        desc = member_desc;
+    } else {
+        // Ordinary fields keep their established FnPtr/pointer layering.
+        refine_callable_pointer(program, ctx, source, inner_decl, &mut desc);
+    }
     // An array member keeps its array-ness, as its declarator nearest the
     // name says (`int *arr[2]`, not `int (*p)[2]`): its value is its own
     // cell, so `*h->arr` is `h->arr[0]` (docs/ANALYSIS.md, "Dereferenced
@@ -20297,6 +20958,165 @@ fn resolve_fn_ref(program: &Program, ctx: &LowerContext, source: &str, node: Nod
     }
 }
 
+/// A member-function address may name an overload set. Preserve its values
+/// until the member-pointer's declared signature can select the target.
+fn function_value_candidates(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    expression: Node,
+    fid: FnId,
+    destination: Option<trace_ir::TypeId>,
+) -> Vec<FnId> {
+    let f = program.symbols.function(fid);
+    if f.is_cpp && (f.is_static_member || is_member_function(program, fid)) {
+        let initially_static = f.is_static_member;
+        let mut candidates = program
+            .symbols
+            .resolve_function_candidates(&f.name, Some(ctx.current_file));
+        let selection = member_pointer_cast_signature(program, ctx, source, expression);
+        let signature = match &selection {
+            MemberPointerSelection::Cast {
+                signature,
+                can_reinterpret,
+            } => Some((signature, *can_reinterpret)),
+            MemberPointerSelection::Contextual => destination.map(|ty| {
+                let mut desc = program.types.get(ty).desc.as_ref();
+                while let TypeDesc::Array { elem, .. } = desc {
+                    desc = elem;
+                }
+                (desc, false)
+            }),
+            MemberPointerSelection::Reinterpreted => None,
+        };
+        let member_signature =
+            signature.is_some_and(|(signature, _)| signature.is_member_function_pointer());
+        // Static members use ordinary callable signatures; only an explicit
+        // member-pointer descriptor introduces an implicit owner slot.
+        if let Some((signature, can_reinterpret)) = signature
+            .filter(|(signature, _)| matches!(signature.innermost().0, TypeDesc::FnPtr { .. }))
+        {
+            let ordinary = |candidate| {
+                program.symbols.function(candidate).is_static_member
+                    && program.symbols.function_pointer_signature_admits(
+                        candidate,
+                        signature,
+                        &program.types,
+                        ctx.reference_returns.contains(&candidate),
+                    )
+            };
+            if !member_signature
+                && candidates
+                    .iter()
+                    .any(|&id| program.symbols.function(id).is_static_member)
+            {
+                let compatible = |candidate| {
+                    ordinary(candidate)
+                        || (member_signature
+                            && !program.symbols.function(candidate).is_static_member
+                            && program.member_pointer_signature_admits(
+                                candidate,
+                                signature,
+                                ctx.reference_returns.contains(&candidate),
+                            ))
+                };
+                if !can_reinterpret || candidates.iter().copied().any(compatible) {
+                    candidates.retain(|&candidate| compatible(candidate));
+                }
+                return candidates;
+            }
+        }
+        if initially_static && !member_signature {
+            return vec![fid];
+        }
+        if let Some((signature, can_reinterpret)) = signature {
+            let compatible = |candidate| {
+                (!member_signature || !program.symbols.function(candidate).is_static_member)
+                    && program.member_pointer_signature_admits(
+                        candidate,
+                        signature,
+                        ctx.reference_returns.contains(&candidate),
+                    )
+            };
+            // A C-style cast can reinterpret an already identified function.
+            // Its type selects an overload only when a matching one exists.
+            if !can_reinterpret || candidates.iter().copied().any(compatible) {
+                candidates.retain(|&candidate| compatible(candidate));
+            }
+        }
+        candidates
+    } else {
+        vec![fid]
+    }
+}
+
+enum MemberPointerSelection {
+    Contextual,
+    Cast {
+        signature: TypeDesc,
+        can_reinterpret: bool,
+    },
+    Reinterpreted,
+}
+
+/// The cast selecting the original member overload, and whether it can also
+/// reinterpret a function value (C-style). Reinterpretation preserves values
+/// and cuts off contextual selection from outer casts; an inner static_cast
+/// can still select its own operand. Aliases and inline types share descriptors.
+fn member_pointer_cast_signature(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    mut node: Node,
+) -> MemberPointerSelection {
+    let mut selection = MemberPointerSelection::Contextual;
+    loop {
+        node = peel_expression(node);
+        let cast_name = named_cast_name(source, node);
+        if node.cached_kind() == "cast_expression" || cast_name.is_some() {
+            selection = MemberPointerSelection::Reinterpreted;
+        }
+        let descriptor = match node.cached_kind() {
+            "cast_expression" => node.cached_field("type"),
+            "call_expression" if cast_name == Some("static_cast") => node
+                .cached_field("function")
+                .and_then(|f| f.cached_field("arguments"))
+                .and_then(|args| args.named_child(0)),
+            _ => None,
+        };
+        if let Some(descriptor) = descriptor {
+            let base = type_desc_from_node(program, ctx, source, descriptor);
+            let mut signature = abstract_declarator_shape(
+                base,
+                descriptor.cached_field("declarator"),
+                true,
+                ReferenceLayer::Pointer,
+            );
+            refine_callable_pointer(program, ctx, source, descriptor, &mut signature);
+            if matches!(signature.innermost().0, TypeDesc::FnPtr { .. }) {
+                selection = MemberPointerSelection::Cast {
+                    signature,
+                    can_reinterpret: node.cached_kind() == "cast_expression",
+                };
+            }
+        }
+        let operand = match node.cached_kind() {
+            "cast_expression" => node
+                .cached_field("value")
+                .or_else(|| node.cached_field("expression"))
+                .or_else(|| node.named_child(1)),
+            "call_expression" if is_named_cast(source, node) || is_std_move(source, node) => node
+                .cached_field("arguments")
+                .and_then(|args| args.named_child(0)),
+            _ => None,
+        };
+        match operand {
+            Some(operand) => node = operand,
+            None => return selection,
+        }
+    }
+}
+
 /// The function a `qualified_identifier` spells, not asking whether it names
 /// a variable: for a caller that already has.
 fn resolve_qualified_fn(
@@ -20305,7 +21125,290 @@ fn resolve_qualified_fn(
     source: &str,
     node: Node,
 ) -> Option<FnId> {
-    resolve_function_named(program, ctx, &normalize_qualified(node_text(source, &node)))
+    let spelling = ctx
+        .parse_spelling
+        .get(node.byte_range())
+        .unwrap_or_else(|| node_text(source, &node));
+    let name = normalize_qualified(spelling);
+    resolve_function_named(program, ctx, &name).or_else(|| {
+        let (owner, kind) = trace_ir::MethodKind::of_function(&name)?;
+        let owner = qualify_class_name(program, ctx, &owner);
+        declared_members_upward(program, &owner, &kind)
+            .first()
+            .copied()
+    })
+}
+
+/// Member-pointer operators use binary placeholders in parser input so the
+/// RHS keeps its postfix grouping. Always consult the original spelling.
+fn member_pointer_access<'t>(
+    ctx: &LowerContext,
+    source: &str,
+    node: Node<'t>,
+) -> Option<(Node<'t>, Node<'t>, bool)> {
+    if !ctx.is_cpp {
+        return None;
+    }
+    let node = peel_expression(node);
+    let (object, member) = match node.cached_kind() {
+        "binary_expression" => ("left", "right"),
+        "field_expression" => ("argument", "field"),
+        _ => return None,
+    };
+    let op = node.cached_field("operator")?;
+    let spelling = if ctx.parse_spelling.is_empty() {
+        source
+    } else {
+        &ctx.parse_spelling
+    };
+    let arrow = crate::parse::member_pointer_operator_at(spelling, op.start_byte())?;
+    Some((
+        node.cached_field(object)?,
+        node.cached_field(member)?,
+        arrow,
+    ))
+}
+
+/// A class value admits member operators; a pointer with a class-valued
+/// RHS admits free operators, never its pointee's member operators.
+fn known_class_argument_viable(program: &Program, arg: &TypeDesc, param: &TypeDesc) -> bool {
+    let (arg, param) = TypeDesc::strip_common_pointers(arg, param);
+    let (TypeDesc::Struct { name: from, .. }, TypeDesc::Struct { name: to, .. }) = (arg, param)
+    else {
+        return true;
+    };
+    if !program.types.declares_class(from)
+        || !program.types.declares_class(to)
+        || trace_ir::may_name_same_type(arg, param)
+        || class_conversion_possible(program, arg, param)
+    {
+        return true;
+    }
+    // Converting constructors and recorded conversion operators can explain
+    // a class mismatch; an unrelated conversion target cannot.
+    if program
+        .types
+        .constructor_signatures(to)
+        .iter()
+        .any(|signature| {
+            signature.parameters.first().is_some_and(|p| {
+                let p = p.pointee().unwrap_or(p);
+                matches!(p, TypeDesc::Unknown)
+                    || trace_ir::may_name_same_type(arg, p)
+                    || class_conversion_possible(program, arg, p)
+            })
+        })
+    {
+        return true;
+    }
+    program.ancestor_closure(from).iter().any(|(owner, _)| {
+        let prefix = format!("{owner}::operator ");
+        program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name.starts_with(&prefix))
+            .any(|f| {
+                let result = program.types.get(f.return_type).desc.as_ref();
+                matches!(result, TypeDesc::Unknown)
+                    || trace_ir::may_name_same_type(result, param)
+                    || class_conversion_possible(program, result, param)
+            })
+    })
+}
+
+fn arrow_star_overload(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    object: Node,
+    member: Node,
+    arrow: bool,
+) -> Option<(String, Vec<FnId>)> {
+    if !arrow {
+        return None;
+    }
+    let desc = receiver_desc(program, ctx, source, object)?;
+    let mut rhs = receiver_desc(program, ctx, source, member)
+        .unwrap_or_else(|| known_arg_type(program, ctx, source, member));
+    if matches!(rhs, TypeDesc::Unknown)
+        && peel_expression(member).cached_kind() == "qualified_identifier"
+    {
+        if let Some((scope, _)) =
+            normalize_qualified(node_text(source, &peel_expression(member))).rsplit_once("::")
+        {
+            if !program.namespaces.contains(scope) && !program.types.declares_class(scope) {
+                rhs = TypeDesc::Struct {
+                    name: qualify_class_name(program, ctx, scope),
+                    fields: Vec::new(),
+                };
+            }
+        }
+    }
+    let pointer = matches!(desc, TypeDesc::Ptr(_));
+    let name = match &desc {
+        TypeDesc::Struct { name, .. } => name.clone(),
+        TypeDesc::Ptr(_) if rhs.is_class_like() || matches!(rhs, TypeDesc::Unknown) => {
+            class_name_of_desc(&desc).unwrap_or_default()
+        }
+        // Neither operand is a class value: preserve built-in binding.
+        _ => return None,
+    };
+    let mut targets = if pointer {
+        Vec::new()
+    } else {
+        member_targets_upward(
+            program,
+            &name,
+            &trace_ir::MethodKind::Named("operator->*".into()),
+        )
+    };
+    // Use the shared ADL policy for both operands, including a pointer's
+    // pointee and a temporary Tag{} whose namespace supplies the operator.
+    let operands = [desc, rhs];
+    for fid in resolve_cpp_name_candidates(program, ctx, "operator->*", &operands) {
+        let f = program.symbols.function(fid);
+        if is_member_function(program, fid) {
+            continue;
+        }
+        let Some(params) = program
+            .symbols
+            .explicit_params(f)
+            .filter(|params| params.len() == 2)
+        else {
+            continue;
+        };
+        // Pointer receivers use ordinary two-argument viability/ranking,
+        // which retains uncertain conversions. For a class receiver,
+        // admit the same class conversions as ordinary overload ranking,
+        // distinguishing a reference from a pointer to that class.
+        let receiver_admitted = pointer
+            || params.get(0).is_none_or(|ty| {
+                let param = program.types.get(ty).desc.as_ref();
+                let parameter = if f.reference_params.first() == Some(&true) {
+                    param.pointee().unwrap_or(param)
+                } else {
+                    param
+                };
+                if matches!(parameter, TypeDesc::Ptr(_)) {
+                    class_may_convert(program, &operands[0])
+                } else {
+                    matches!(parameter, TypeDesc::Unknown)
+                        || trace_ir::spelled_alike(
+                            &program.types,
+                            &operands[0],
+                            parameter,
+                            trace_ir::SpellingTolerance::Ranking,
+                        )
+                        || class_conversion_possible(program, &operands[0], parameter)
+                }
+            });
+        if receiver_admitted && !targets.contains(&fid) {
+            targets.push(fid);
+        }
+    }
+    targets.retain(|&fid| {
+        let f = program.symbols.function(fid);
+        let Some(params) = program.symbols.explicit_params(f) else {
+            return true;
+        };
+        let args = if is_member_function(program, fid) {
+            &operands[1..]
+        } else {
+            &operands[..]
+        };
+        args.iter().enumerate().all(|(i, arg)| {
+            params.get(i).is_none_or(|ty| {
+                let param = program.types.get(ty).desc.as_ref();
+                let param = if f.reference_params.get(i) == Some(&true) && arg.is_class_like() {
+                    param.pointee().unwrap_or(param)
+                } else {
+                    param
+                };
+                known_class_argument_viable(program, arg, param)
+            })
+        })
+    });
+    let targets = if pointer {
+        narrow_overloads(
+            program,
+            targets,
+            &operands,
+            &[
+                is_null_constant(source, object),
+                is_null_constant(source, member),
+            ],
+            OverloadChoice::Edges,
+        )
+    } else {
+        // Align a free operator's first explicit parameter with the member's
+        // implicit receiver before comparing their RHS signatures.
+        narrow_overloads_with_offsets(
+            program,
+            targets,
+            &[known_arg_type(program, ctx, source, member)],
+            &[is_null_constant(source, member)],
+            OverloadChoice::Edges,
+            |fid| usize::from(!is_member_function(program, fid)),
+        )
+    };
+    (!targets.is_empty()).then_some((name, targets))
+}
+
+fn callable_data_member(program: &Program, ctx: &LowerContext, source: &str, member: Node) -> bool {
+    receiver_desc(program, ctx, source, member)
+        .is_some_and(|desc| desc.member_pointer().is_some() && !desc.is_member_function_pointer())
+}
+
+fn bound_data_member_cell(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<(VarId, trace_ir::TypeId)> {
+    let (object, member, arrow) = member_pointer_access(ctx, source, node)?;
+    if arrow_star_overload(program, ctx, source, object, member, arrow).is_some() {
+        return None;
+    }
+    let desc = receiver_desc(program, ctx, source, member)?;
+    let (_, data) = desc.member_pointer()?;
+    if desc.is_member_function_pointer() {
+        return None;
+    }
+    let ty = program.types.intern(data.clone());
+    let cell = if peel_expression(member).cached_kind() == "subscript_expression" {
+        resolve_callee_with_loads(program, ctx, source, member).2
+    } else {
+        receiver_value(program, ctx, source, member, program.types.unknown())
+    }?;
+    Some((cell, ty))
+}
+
+fn member_pointer_receiver(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    object: Node,
+    arrow: bool,
+) -> Option<VarId> {
+    let unknown = program.types.unknown();
+    if arrow {
+        return receiver_value(program, ctx, source, object, unknown);
+    }
+    let object = peel_expression(object);
+    if let Some(inner) = deref_operand(source, object) {
+        return receiver_value(program, ctx, source, inner, unknown);
+    }
+    if names_instance_member(program, ctx, source, object) {
+        return member_cell(program, ctx, source, object).map(|(address, _)| address);
+    }
+    let var = resolve_lvalue_var(program, ctx, source, object)
+        .or_else(|| receiver_value(program, ctx, source, object, unknown))?;
+    Some(if ctx.reference_bindings.contains(&var) {
+        var
+    } else {
+        addr_of_temp(program, ctx, object, var)
+    })
 }
 
 fn resolve_callee_var(
@@ -20328,9 +21431,199 @@ fn resolve_callee_with_loads(
     source: &str,
     node: Node,
 ) -> CalleeRef {
+    let original = peel_expression(node);
+    if let Some(desc) = callable_cast_type(program, ctx, source, original) {
+        if let Some(cached) = ctx.callee_load_cache.borrow().get(&original.id()) {
+            return cached.clone();
+        }
+        let ty = program.types.intern(desc);
+        let value = receiver_value(program, ctx, source, original, ty);
+        let result = (operation_expression(ctx, source, original), false, value);
+        ctx.callee_load_cache
+            .borrow_mut()
+            .insert(original.id(), result.clone());
+        return result;
+    }
     // `((cb_t)s.ops[i])()` calls the element as `s.ops[i]()` does.
     // Also peel pointer dereferences so `(*obj->handler)()` loads the field.
     let node = peel_derefs_and_casts(source, node);
+    if let Some((object, member, arrow)) = member_pointer_access(ctx, source, node) {
+        if let Some(cached) = ctx.callee_load_cache.borrow().get(&node.id()) {
+            return cached.clone();
+        }
+        if let Some((class, targets)) =
+            arrow_star_overload(program, ctx, source, object, member, arrow)
+        {
+            let first_ty = program.symbols.function(targets[0]).return_type;
+            let ty = if targets
+                .iter()
+                .all(|&fid| program.symbols.function(fid).return_type == first_ty)
+            {
+                first_ty
+            } else {
+                program.types.unknown()
+            };
+            let value = alloc_load_temp(program, ctx, node, ty);
+            if let Some(caller) = ctx.current_fn {
+                let (member_targets, free_targets): (Vec<_>, Vec<_>) = targets
+                    .into_iter()
+                    .partition(|&fid| is_member_function(program, fid));
+                let receiver = if member_targets.is_empty() {
+                    Receiver::Unnamed
+                } else {
+                    member_pointer_receiver(program, ctx, source, object, false)
+                        .map_or(Receiver::Unnamed, Receiver::Bound)
+                };
+                // The free form evaluates both operands. Reuse that argument
+                // list for members so nested RHS calls are lowered once.
+                let free_args = (!free_targets.is_empty())
+                    .then(|| collect_call_arg_nodes(program, ctx, source, [object, member]));
+                let member_args = (!member_targets.is_empty()).then(|| {
+                    free_args
+                        .as_ref()
+                        .map(|args| args.clone().drop_leading(1))
+                        .unwrap_or_else(|| collect_call_arg_nodes(program, ctx, source, [member]))
+                });
+                // Operand evaluation owns its nested calls; claim only the
+                // operator sites emitted after those evaluations.
+                let first_site = program.symbols.call_sites.len();
+                let token = node.cached_field("operator").unwrap_or(node);
+                let source_node = if node_has_expansion_location(ctx, token) {
+                    token
+                } else {
+                    node
+                };
+                let span = node_call_span(program, ctx, source_node);
+                let expansion = node_expansion_span(program, ctx, source_node);
+                if let Some(args) = member_args {
+                    emit_member_targets(
+                        program,
+                        ctx,
+                        caller,
+                        &class,
+                        &trace_ir::MethodKind::Named("operator->*".into()),
+                        receiver,
+                        args,
+                        span,
+                        expansion,
+                        member_targets,
+                        Some(value),
+                    );
+                }
+                if let Some(mut args) = free_args {
+                    let last = free_targets.len() - 1;
+                    for (index, target) in free_targets.into_iter().enumerate() {
+                        let args =
+                            args.take_for(index == last)
+                                .for_callee(program, ctx, Some(target));
+                        let id = program.symbols.alloc_call_id();
+                        let callee_name = program.symbols.function(target).name.clone();
+                        emit_call_return(program, ctx, node, value, callee_name.clone());
+                        let callee_name = program.symbols.intern_call_name(&callee_name);
+                        program.symbols.call_sites.push(CallSite {
+                            id,
+                            caller,
+                            callee_name,
+                            callee_var: None,
+                            callee_fn_id: Some(target),
+                            var_args: args.var_args,
+                            details: CallSiteDetails::boxed(
+                                args.fn_args,
+                                args.addr_of_member_args,
+                                args.addr_of_args,
+                                None,
+                            ),
+                            args_bound_past_this: false,
+                            span,
+                            expansion_span: expansion,
+                            is_direct: true,
+                            in_loop: false,
+                            unevaluated: false,
+                            receiver_class: None,
+                            exact_receiver: false,
+                            return_dst: Some(value),
+                            receiver: None,
+                            tu: program.symbols.function(caller).tu,
+                        });
+                    }
+                }
+                let expression = operation_expression(ctx, source, node);
+                record_call_expressions(program, first_site, &expression);
+                let occurrence = CallOccurrence {
+                    span: node_call_span(program, ctx, token),
+                    expansion_span: node_expansion_span(program, ctx, token),
+                    expansion_id: node_expansion_id(ctx, token),
+                };
+                for site in &mut program.symbols.call_sites[first_site..] {
+                    site.details_mut().occurrence = Some(occurrence);
+                }
+                ctx.record_cfg_sites(program, node, first_site);
+            }
+            let result = (node_text(source, &node).to_string(), false, Some(value));
+            ctx.callee_load_cache
+                .borrow_mut()
+                .insert(node.id(), result.clone());
+            return result;
+        }
+        if callable_data_member(program, ctx, source, member) {
+            let unknown = program.types.unknown();
+            let cell = if peel_expression(member).cached_kind() == "subscript_expression" {
+                resolve_callee_with_loads(program, ctx, source, member).2
+            } else {
+                receiver_value(program, ctx, source, member, unknown)
+            };
+            let value = cell.map(|cell| emit_load(program, ctx, node, cell, unknown));
+            let result = (node_text(source, &member).to_string(), false, value);
+            ctx.callee_load_cache
+                .borrow_mut()
+                .insert(node.id(), result.clone());
+            return result;
+        }
+        // Preserve expression results and the outer cast's invocation type.
+        let expression = peel_expression(member);
+        if matches!(
+            expression.cached_kind(),
+            "call_expression" | "cast_expression"
+        ) {
+            let desc = callable_cast_type(program, ctx, source, expression)
+                .or_else(|| receiver_desc(program, ctx, source, expression))
+                .unwrap_or(TypeDesc::Unknown);
+            let ty = program.types.intern(desc);
+            let value = receiver_value(program, ctx, source, expression, ty);
+            let result = (node_text(source, &member).to_string(), false, value);
+            ctx.callee_load_cache
+                .borrow_mut()
+                .insert(node.id(), result.clone());
+            return result;
+        }
+        // Bare names keep ordinary variable/implicit-field lookup precedence.
+        let address = peel_casts(source, member);
+        if address.cached_kind() != "pointer_expression"
+            || pointer_op(source, address).as_deref() != Some("&")
+        {
+            return resolve_callee_with_loads(program, ctx, source, member);
+        }
+        let Some(callee) = resolve_call_fn_arg(program, ctx, source, member) else {
+            return resolve_callee_with_loads(program, ctx, source, member);
+        };
+        // Inline `&B::f` is a value, as when assigned to a local first.
+        // Keep casts intact for overload selection, then let ordinary
+        // indirect handling bind the receiver and expand virtual targets.
+        let name = program.symbols.function(callee).name.clone();
+        let candidates = function_value_candidates(program, ctx, source, member, callee, None);
+        let unknown = program.types.unknown();
+        let value = alloc_load_temp(program, ctx, member, unknown);
+        for callee in candidates {
+            program
+                .flow
+                .push(FlowConstraint::AddrOfFn { dst: value, callee });
+        }
+        let result = (name, false, Some(value));
+        ctx.callee_load_cache
+            .borrow_mut()
+            .insert(node.id(), result.clone());
+        return result;
+    }
     // Only a name the member's class declares as a field can be one, and
     // only where the body does not hide it (`implicit_this`).
     let implicit_member = implicit_this(program, ctx, source, node).is_some();
@@ -20355,10 +21648,8 @@ fn resolve_callee_with_loads(
         // variable of its name outside the class; a local hides it. A field
         // whose path does not resolve leaves the call unresolved, as its
         // value is ([`Operand`]).
-        let field_load = member_cell(program, ctx, source, node).map(|(gep, _)| {
-            let int = program.types.int();
-            emit_load(program, ctx, node, gep, int)
-        });
+        let field_load = member_cell(program, ctx, source, node)
+            .map(|(gep, ty)| emit_load(program, ctx, node, gep, ty));
         let name = node_text(source, &node);
         let callee_text = format!("this->{name}");
         result = Some((callee_text, false, field_load));
@@ -20412,8 +21703,17 @@ fn load_table_element(
     span_node: Node,
     table: VarId,
 ) -> VarId {
-    let int = program.types.int();
-    emit_load(program, ctx, span_node, table, int)
+    let desc = program
+        .types
+        .get(program.symbols.variable(table).type_id)
+        .desc
+        .as_ref();
+    let element = match desc {
+        TypeDesc::Array { elem, .. } | TypeDesc::Ptr(elem) => elem.as_ref().clone(),
+        _ => TypeDesc::Unknown,
+    };
+    let ty = program.types.intern(element);
+    emit_load(program, ctx, span_node, table, ty)
 }
 
 fn field_callee_text(source: &str, node: Node) -> String {
@@ -20476,8 +21776,14 @@ fn emit_field_fn_ptr_load(
         let field_type_id = hf.type_id;
         type_id = peel_ptr_to_struct(program, field_type_id);
         if i + 1 == field_ids.len() {
-            let int = program.types.int();
-            return Some(emit_load(program, ctx, span_node, gep, int));
+            let ty = if let TypeDesc::Array { elem, .. } =
+                program.types.get(field_type_id).desc.as_ref()
+            {
+                program.types.intern(elem.as_ref().clone())
+            } else {
+                field_type_id
+            };
+            return Some(emit_load(program, ctx, span_node, gep, ty));
         }
         match program.types.get(field_type_id).desc.as_ref().clone() {
             TypeDesc::Ptr(inner) => {
@@ -20520,7 +21826,7 @@ fn resolve_callee(
 ) -> (String, bool, Option<VarId>) {
     let node = peel_expression(node);
     match node.cached_kind() {
-        "identifier" => {
+        "identifier" | "field_identifier" => {
             let name = node_text(source, &node).to_string();
             if let Some(v) = lookup_var(ctx, program, &name) {
                 return (name, false, Some(v));
@@ -21040,11 +22346,15 @@ fn type_desc_from_node(
 ) -> TypeDesc {
     let node = peel_cpp_type_node(node);
     if node.cached_kind() == "decltype" {
-        // The type of an expression is not deduced here, whether spelled
-        // natively or re-spelled from GNU `__typeof__` (docs/ANALYSIS.md,
-        // "C++ parse-input normalization"). Falling through would read the
-        // operand's text as a type name: `decltype(avoid_copy())` was Void,
-        // `decltype(charge())` Char, anything else Int.
+        // Preserve explicitly known member-pointer categories; other
+        // decltype operands keep the existing unknown-type approximation.
+        if let Some(value) = node.named_child(0) {
+            if let Some(desc) = receiver_desc(program, ctx, source, value)
+                .filter(|desc| desc.member_pointer().is_some())
+            {
+                return desc;
+            }
+        }
         return TypeDesc::Unknown;
     }
     if node.cached_kind() == "struct_specifier" || node.cached_kind() == "union_specifier" {
@@ -21085,8 +22395,8 @@ fn type_desc_from_node(
             // `std::function<...>` holds a function value; intern as FnPtr
             // so AddrOfFn stores are not rejected by the slot guard.
             return TypeDesc::FnPtr {
-                ret: Box::new(TypeDesc::Int),
-                params: Vec::new(),
+                ret: Box::new(TypeDesc::Unknown),
+                params: vec![TypeDesc::Unknown],
             };
         }
         // A smart-pointer instantiation keeps its arguments in its tag
@@ -21167,6 +22477,14 @@ fn type_desc_from_node(
                 fields: Vec::new(),
             };
         }
+    }
+    if let Some(class) =
+        declared_class_in_scope(program, ctx, &normalize_qualified(node_text(source, &node)))
+    {
+        return TypeDesc::Struct {
+            name: class,
+            fields: Vec::new(),
+        };
     }
     let text = node_text(source, &node);
     if text.contains("union") {
@@ -21387,7 +22705,265 @@ fn typedef_underlying_desc(
     let type_node = node.cached_field("type")?;
     let decl_node = node.cached_field("declarator")?;
     let base = type_desc_from_node(program, ctx, source, type_node);
-    Some(walk_declarator_shape(decl_node, base))
+    let mut desc = walk_declarator_shape(decl_node, base);
+    refine_callable_pointer(program, ctx, source, decl_node, &mut desc);
+    Some(desc)
+}
+
+/// Restore data-member owners at the pointer layers produced by their own
+/// declarators. Shape construction wraps from the type toward the name, so
+/// the reversed declarator chain walks the finished type from outside in.
+fn refine_data_member_layers(
+    program: &Program,
+    ctx: &LowerContext,
+    layers: &[Node],
+    function_stars: &[usize],
+    mut desc: &mut TypeDesc,
+) {
+    for node in layers.iter().rev() {
+        match node.cached_kind() {
+            "pointer_declarator" | "abstract_pointer_declarator" | "pointer_type_declarator" => {
+                if !function_stars.contains(&node.start_byte()) {
+                    if let Some(owner) = crate::parse::member_data_pointer_owner(
+                        &ctx.parse_spelling,
+                        node.start_byte(),
+                    ) {
+                        if matches!(desc, TypeDesc::Ptr(_)) {
+                            let TypeDesc::Ptr(member) = std::mem::replace(desc, TypeDesc::Unknown)
+                            else {
+                                unreachable!()
+                            };
+                            *desc = TypeDesc::MemberPointer {
+                                owner: qualify_class_name(
+                                    program,
+                                    ctx,
+                                    normalize_qualified(owner).trim_end_matches("::"),
+                                ),
+                                is_function: false,
+                                member,
+                            };
+                        }
+                    }
+                }
+                desc = match desc {
+                    TypeDesc::Ptr(inner) | TypeDesc::MemberPointer { member: inner, .. } => inner,
+                    _ => return,
+                };
+            }
+            "array_declarator" | "abstract_array_declarator" => {
+                let TypeDesc::Array { elem, .. } = desc else {
+                    return;
+                };
+                desc = elem;
+            }
+            "function_declarator" | "abstract_function_declarator" => {
+                if let TypeDesc::MemberPointer {
+                    is_function: true,
+                    member,
+                    ..
+                } = desc
+                {
+                    desc = member;
+                }
+                let TypeDesc::FnPtr { ret, .. } = desc else {
+                    return;
+                };
+                desc = ret;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Retain a callable pointer's signature in `FnPtr`. A member pointer adds
+/// its owner pointer as parameter zero; ordinary C++ pointers have only their
+/// explicit parameters.
+/// Only the declarator chain is visited, never a nested callback parameter.
+/// Returns whether the outer callable has a member-function owner.
+fn refine_callable_pointer(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    desc: &mut TypeDesc,
+) -> bool {
+    // Shape construction wraps the type while walking toward the name, so
+    // declarators appear in the reverse order of the layers in the finished
+    // type. Collect only that chain, never a callback parameter's declarator.
+    let mut layers = Vec::new();
+    let mut function_stars = Vec::new();
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if matches!(
+            n.cached_kind(),
+            "function_declarator" | "abstract_function_declarator"
+        ) {
+            if let Some(star) = n.cached_field("declarator").and_then(|inner| {
+                crate::parse::member_fn_pointer_star(&ctx.parse_spelling, inner.start_byte())
+            }) {
+                function_stars.push(star);
+            }
+        }
+        if matches!(
+            n.cached_kind(),
+            "pointer_declarator"
+                | "abstract_pointer_declarator"
+                | "pointer_type_declarator"
+                | "array_declarator"
+                | "abstract_array_declarator"
+                | "function_declarator"
+                | "abstract_function_declarator"
+        ) {
+            layers.push(n);
+        }
+        cur = match n.cached_kind() {
+            "parenthesized_declarator"
+            | "abstract_parenthesized_declarator"
+            | "reference_declarator"
+            | "abstract_reference_declarator" => n.named_child(0),
+            _ => n.cached_field("declarator"),
+        };
+    }
+    refine_data_member_layers(program, ctx, &layers, &function_stars, desc);
+    let mut outer_member = false;
+    let mut callable = desc;
+    for (index, n) in layers
+        .into_iter()
+        .rev()
+        .filter(|n| {
+            matches!(
+                n.cached_kind(),
+                "function_declarator" | "abstract_function_declarator"
+            )
+        })
+        .enumerate()
+    {
+        // Pointer and array layers do not introduce a new callable signature.
+        while let TypeDesc::Ptr(inner)
+        | TypeDesc::Array { elem: inner, .. }
+        | TypeDesc::MemberPointer {
+            is_function: false,
+            member: inner,
+            ..
+        } = callable
+        {
+            callable = inner;
+        }
+        let owner = n.cached_field("declarator").and_then(|inner| {
+            crate::parse::member_fn_pointer_owner(&ctx.parse_spelling, inner.start_byte())
+        });
+        if owner.is_some() && !matches!(callable, TypeDesc::MemberPointer { .. }) {
+            let function = std::mem::replace(callable, TypeDesc::Unknown);
+            let owner = qualify_class_name(
+                program,
+                ctx,
+                normalize_qualified(owner.unwrap()).trim_end_matches("::"),
+            );
+            *callable = TypeDesc::MemberPointer {
+                owner,
+                is_function: true,
+                member: Box::new(function),
+            };
+        }
+        if let TypeDesc::MemberPointer { member, .. } = callable {
+            callable = member;
+        }
+        let TypeDesc::FnPtr { params: slots, ret } = callable else {
+            break;
+        };
+        let owner = n.cached_field("declarator").and_then(|inner| {
+            crate::parse::member_fn_pointer_owner(&ctx.parse_spelling, inner.start_byte())
+        });
+        if index == 0 {
+            outer_member = owner.is_some();
+        }
+        let ordinary = ctx.is_cpp;
+        if owner.is_some() || ordinary {
+            let mut params = Vec::new();
+            if let Some(owner) = owner {
+                let owner = normalize_qualified(owner);
+                let owner = qualify_class_name(program, ctx, owner.trim_end_matches("::"));
+                params.push(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+                    name: owner,
+                    fields: Vec::new(),
+                })));
+            }
+            if let Some(list) = n.cached_field("parameters") {
+                let shape = param_list_shape(program, ctx, source, list);
+                for param in list
+                    .named_children(&mut list.walk())
+                    .filter(|p| is_parameter_node(p.cached_kind()))
+                {
+                    if let Some(declared) = parameter_type(program, ctx, source, param) {
+                        let ty = stand_in_parameter(program, ctx, source, param, declared.type_id)
+                            .unwrap_or(declared.type_id);
+                        let mut desc = program.types.get(ty).desc.as_ref().clone();
+                        if let Some(type_node) = param.cached_field("type") {
+                            let name = normalize_qualified(node_text(source, &type_node));
+                            if is_unresolved_integral_name(&name)
+                                && local_alias(ctx, &name).is_none()
+                                && scoped_type_desc(program, ctx, &name).is_none()
+                                && program.types.resolve_alias(&name).is_none()
+                            {
+                                let (inner, layers) = desc.innermost();
+                                if matches!(inner, TypeDesc::Int | TypeDesc::Unknown)
+                                    || program.types.is_guessed_class(inner)
+                                {
+                                    desc = (0..layers).fold(TypeDesc::SizeT, |inner, _| {
+                                        TypeDesc::Ptr(Box::new(inner))
+                                    });
+                                }
+                            }
+                        }
+                        params.push(desc);
+                    }
+                }
+                // FnPtr has no variadic tail. A pack's eventual arity
+                // is unknown; keep the coarse signature rather than
+                // excluding every concrete function with arguments.
+                if shape.variadic {
+                    params.truncate(usize::from(owner.is_some()));
+                    params.push(TypeDesc::Unknown);
+                }
+            }
+            let declaration = enclosing_decl(
+                n,
+                &[
+                    "type_descriptor",
+                    "type_definition",
+                    "declaration",
+                    "field_declaration",
+                    "parameter_declaration",
+                    "optional_parameter_declaration",
+                ],
+            );
+            if let Some(decl) = declaration {
+                if let Some(ty) = decl.cached_field("type") {
+                    let name = normalize_qualified(node_text(source, &ty));
+                    if is_unresolved_integral_name(&name)
+                        && local_alias(ctx, &name).is_none()
+                        && program.types.resolve_alias(&name).is_none()
+                        && scoped_type_desc(program, ctx, &name).is_none()
+                        && (matches!(ret.as_ref(), TypeDesc::Int | TypeDesc::Unknown)
+                            || program.types.is_guessed_class(ret.as_ref()))
+                    {
+                        **ret = TypeDesc::SizeT;
+                    }
+                }
+            }
+            let ret_type = program.types.intern(ret.as_ref().clone());
+            if let Some(ty) = declaration
+                .and_then(|decl| stand_in_parameter(program, ctx, source, decl, ret_type))
+            {
+                **ret = program.types.get(ty).desc.as_ref().clone();
+            }
+            *slots = params;
+        }
+        // The next syntax declarator describes a callback in this return
+        // type, never another parameter list of the outer function.
+        callable = ret;
+    }
+    outer_member
 }
 
 fn walk_declarator_shape(node: Node, base: TypeDesc) -> TypeDesc {
@@ -21397,7 +22973,14 @@ fn walk_declarator_shape(node: Node, base: TypeDesc) -> TypeDesc {
     // array of function pointers, `typedef void (*Name)(..)` a pointer to a
     // function and `typedef int f_t(int)` a bare function type.
     let (inner, shaped) = match node.cached_kind() {
-        "pointer_declarator" => (
+        "qualified_identifier"
+            if node
+                .cached_field("name")
+                .is_some_and(|n| n.cached_kind() == "pointer_type_declarator") =>
+        {
+            (node.cached_field("name"), base)
+        }
+        "pointer_declarator" | "pointer_type_declarator" => (
             node.cached_field("declarator"),
             TypeDesc::Ptr(Box::new(base)),
         ),
@@ -21412,7 +22995,7 @@ fn walk_declarator_shape(node: Node, base: TypeDesc) -> TypeDesc {
             node.cached_field("declarator"),
             TypeDesc::FnPtr {
                 ret: Box::new(base),
-                params: Vec::new(),
+                params: vec![TypeDesc::Unknown],
             },
         ),
         "parenthesized_declarator" => (node.named_child(0), base),
@@ -21453,21 +23036,7 @@ fn extract_tag_name(source: &str, node: &Node, keyword: &str) -> String {
 /// operator's target type is part of the name, not a qualification, so
 /// `operator ns::S` names no scope while `Cls::operator ns::S` names `Cls`.
 fn scope_part(name: &str) -> &str {
-    let mut from = 0;
-    while let Some(rel) = name[from..].find("operator") {
-        let at = from + rel;
-        from = at + "operator".len();
-        // `operators::f` merely starts with the keyword; `operator ns::S`,
-        // `operator=` and `operator new` are the real thing.
-        let continues_identifier = name[from..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if (at == 0 || name[..at].ends_with("::")) && !continues_identifier {
-            return &name[..at];
-        }
-    }
-    name
+    trace_ir::function_scope_spelling(name)
 }
 
 /// The name a conversion operator declares, taken from its `operator_cast`
@@ -21705,12 +23274,13 @@ fn conversion_target_type(
     op: Node,
 ) -> Option<trace_ir::TypeId> {
     let desc = type_desc_from_node(program, ctx, source, op.cached_field("type")?);
-    let desc = abstract_declarator_shape(
+    let mut desc = abstract_declarator_shape(
         desc,
         op.cached_field("declarator"),
         false,
         ReferenceLayer::Pointer,
     );
+    refine_callable_pointer(program, ctx, source, op, &mut desc);
     Some(program.types.intern(desc))
 }
 
@@ -21769,14 +23339,13 @@ fn abstract_declarator_shape(
                 // nameable sits in there and adds its `Ptr` on the way down.
                 // Recording a bare `Ptr(Void)` here left the target
                 // indistinguishable from a pointer to `void`, so nothing
-                // downstream could see it as callable. Parameters stay empty
-                // to match every other `FnPtr` this lowering builds, which is
-                // what makes this agree with the `typedef void (*FP)();`
-                // spelling of the same type.
+                // downstream could see it as callable. The initial signature
+                // stays coarse until declarator refinement supplies its
+                // parameters, including a known empty list.
                 Some(inner) => {
                     desc = TypeDesc::FnPtr {
                         ret: Box::new(desc),
-                        params: Vec::new(),
+                        params: vec![TypeDesc::Unknown],
                     };
                     Some(inner)
                 }
@@ -21786,7 +23355,7 @@ fn abstract_declarator_shape(
                     if bare_function_is_type {
                         desc = TypeDesc::FnPtr {
                             ret: Box::new(desc),
-                            params: Vec::new(),
+                            params: vec![TypeDesc::Unknown],
                         };
                     }
                     break;
@@ -21839,6 +23408,15 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
         // hangs its `operator_cast` off the `name` field; the whole-node text
         // would glue the declarator's `()` and cv-qualifiers onto the name.
         "qualified_identifier" => {
+            if let Some(pointer) = node
+                .cached_field("name")
+                .filter(|n| n.cached_kind() == "pointer_type_declarator")
+            {
+                return pointer
+                    .named_child(pointer.named_child_count().saturating_sub(1))
+                    .map(|n| parse_declarator_name(source, n))
+                    .unwrap_or_default();
+            }
             // An unknown attribute macro in front of an out-of-class
             // conversion operator costs it its `operator_cast`: the keyword
             // is stranded in an `ERROR` and the target type takes the `name`
@@ -24142,6 +25720,7 @@ mod qualified_variable_lookup_tests {
         locals: HashMap<String, VarId>,
     ) -> LowerContext {
         LowerContext {
+            parse_spelling: Arc::default(),
             recorded_flow_origins: Vec::new(),
             flow_origin_indices: HashMap::default(),
             original_sources: HashMap::default(),
