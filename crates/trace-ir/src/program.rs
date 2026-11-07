@@ -530,7 +530,8 @@ pub struct ClassMemberImport {
     pub class: String,
     /// The imported name, `member`.
     pub member: String,
-    /// The spelling after `using`, `Base::member`.
+    /// The spelling after `using`, `Base::member`, template arguments kept
+    /// (`enable_shared_from_this<B>::shared_from_this` binds `B`).
     pub target: String,
 }
 

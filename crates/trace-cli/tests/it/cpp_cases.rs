@@ -11196,6 +11196,209 @@ void Nearer(D3 *p) { auto x = p->f(); x->Good(); }
     assert!(has_any_edge(&program, &analysis, "Nearer", "R::Good"));
 }
 
+/// The member a class-body `using` selects decides the call: an imported
+/// callable data member is a field call, an import re-exported by the
+/// imported class is followed, an inherited class name heads the import,
+/// and the selected base binds the held class.
+#[test]
+fn shared_from_this_follows_the_selected_member_import() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct FieldBase { std::shared_ptr<S> (*shared_from_this)(); };
+struct ImportsField : std::enable_shared_from_this<ImportsField>, FieldBase {
+    using FieldBase::shared_from_this;
+    void Good();
+    void Run() { auto x = this->shared_from_this(); x->Good(); }
+};
+void ImportsField::Good() {}
+struct Own { std::shared_ptr<S> shared_from_this(); };
+struct Chained;
+struct Mid : std::enable_shared_from_this<Chained>, Own { using Own::shared_from_this; };
+struct Chained : Mid {
+    using Mid::shared_from_this;
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void Chained::Good() {}
+struct HA : std::enable_shared_from_this<HA> { void Good(); };
+void HA::Good() {}
+struct HB : std::enable_shared_from_this<HB> { void Good(); };
+void HB::Good() {}
+struct PicksB : HA, HB {
+    using HB::shared_from_this;
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+struct PicksBase : HA, HB {
+    using std::enable_shared_from_this<HB>::shared_from_this;
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+struct NonViable : std::enable_shared_from_this<NonViable> {
+    using std::enable_shared_from_this<NonViable>::shared_from_this;
+    std::shared_ptr<S> shared_from_this(int);
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void NonViable::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let this = common::local_variable(&program, "ImportsField::Run", "this");
+    let x = common::local_variable(&program, "ImportsField::Run", "x");
+    assert!(
+        !value_reaches(&program, this, x),
+        "an imported data member is no intrinsic"
+    );
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "ImportsField::Run",
+        "ImportsField::Good"
+    ));
+    assert!(has_any_edge(&program, &analysis, "Chained::Run", "S::Good"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "Chained::Run",
+        "Chained::Good"
+    ));
+    for caller in ["PicksB::Run", "PicksBase::Run"] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(type_name(&program, x), "std::shared_ptr<HB>", "{caller}");
+        assert!(
+            has_any_edge(&program, &analysis, caller, "HB::Good"),
+            "{caller}"
+        );
+        assert!(
+            must_not_have_edge(&program, &analysis, caller, "HA::Good"),
+            "{caller}"
+        );
+    }
+    let this = common::local_variable(&program, "NonViable::Run", "this");
+    let x = common::local_variable(&program, "NonViable::Run", "x");
+    assert!(
+        value_reaches(&program, this, x),
+        "a nonviable overload hides nothing"
+    );
+    assert_eq!(type_name(&program, x), "std::shared_ptr<NonViable>");
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "NonViable::Run",
+        "NonViable::Good"
+    ));
+}
+
+/// A class name an import or an explicit member qualifier writes is looked up
+/// in the class first: a base's injected name, or an alias a base declares.
+#[test]
+fn member_qualifiers_resolve_in_the_class_scope_first() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct R { void Good(); };
+void R::Good() {}
+struct S { void Good(); };
+void S::Good() {}
+struct A { R *f(); };
+using Alias = A;
+namespace a { struct A { S *f(); using Alias = A; }; }
+struct Injected : a::A { using A::f; };
+struct Aliased : a::A { using Alias::f; };
+void ViaInjected(Injected *p) { auto x = p->f(); x->Good(); }
+void ViaAliased(Aliased *p) { auto x = p->f(); x->Good(); }
+struct B : std::enable_shared_from_this<B> { void Good(); };
+void B::Good() {}
+namespace n {
+struct B : std::enable_shared_from_this<n::B> {
+    using E = std::enable_shared_from_this<n::B>;
+    void Good();
+};
+void B::Good() {}
+struct D : B {};
+}
+void ViaBase(n::D *p) { auto x = p->B::shared_from_this(); x->Good(); }
+void ViaAlias(n::D *p) { auto x = p->E::shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for caller in ["ViaInjected", "ViaAliased"] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, "S::Good"),
+            "{caller}"
+        );
+        assert!(
+            must_not_have_edge(&program, &analysis, caller, "R::Good"),
+            "{caller}"
+        );
+    }
+    for caller in ["ViaBase", "ViaAlias"] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(type_name(&program, x), "std::shared_ptr<n::B>", "{caller}");
+        assert!(
+            has_any_edge(&program, &analysis, caller, "n::B::Good"),
+            "{caller}"
+        );
+        assert!(
+            must_not_have_edge(&program, &analysis, caller, "B::Good"),
+            "{caller}"
+        );
+    }
+}
+
+/// An implicit member object's address reaches the result, and a held class
+/// written `const M` in a concrete base is `M`.
+#[test]
+fn shared_from_this_on_member_objects_and_cv_held_classes() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> { void Handle(); };
+void M::Handle() {}
+struct Holder {
+    M m;
+    void Run() { auto x = m.shared_from_this(); x->Handle(); }
+};
+struct C { void Good() const; };
+void C::Good() const {}
+struct ConstHeld : C, std::enable_shared_from_this<const C> {
+    void Good() const;
+    void Run() { shared_from_this()->Good(); }
+};
+void ConstHeld::Good() const {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let this = common::local_variable(&program, "Holder::Run", "this");
+    let x = common::local_variable(&program, "Holder::Run", "x");
+    assert!(
+        flows_in(&program, "Holder::Run").any(|flow| matches!(
+            flow,
+            trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "m"
+        )),
+        "the implicit member's address is taken"
+    );
+    assert!(value_reaches(&program, this, x), "m's address reaches x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>");
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "Holder::Run",
+        "M::Handle"
+    ));
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "ConstHeld::Run",
+        "C::Good"
+    ));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "ConstHeld::Run",
+        "ConstHeld::Good"
+    ));
+}
+
 /// The source of the one receiver copy into `result` in `func`.
 fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
     let result = common::local_variable(program, func, result);
