@@ -520,6 +520,20 @@ pub struct ArrowReturn {
     pub pointer: bool,
 }
 
+/// One `using Base::member;` written in a class body. The target is resolved
+/// from the class body's own scope (`class`), never from a caller's, so a
+/// header's import keeps its meaning in every unit that includes it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClassMemberImport {
+    /// The class whose body declares the import, spelled as lowering names it
+    /// (`ns::D`). Its enclosing scopes are the import's declaration scope.
+    pub class: String,
+    /// The imported name, `member`.
+    pub member: String,
+    /// The spelling after `using`, `Base::member`.
+    pub target: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkTarget {
     pub id: crate::TargetId,
@@ -616,6 +630,10 @@ pub struct Program {
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
+    /// Class-body `using` declarations (docs/ANALYSIS.md, "`shared_from_this`"),
+    /// merged with a unit's symbols so a header's imports outlive header-unit
+    /// lowering and reach every source unit that includes it.
+    pub class_member_imports: Vec<ClassMemberImport>,
     /// Class -> full member name -> return substitutions. Ordered keys keep
     /// header merges deterministic; lookups never scan unrelated functions.
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<TemplateReturn>>>,
@@ -946,6 +964,15 @@ impl Program {
     /// The substitution facts recorded for `member` of class `cls`.
     pub fn template_returns_of(&self, cls: &str, member: &str) -> Option<&[TemplateReturn]> {
         Some(self.template_returns.get(cls)?.get(member)?.as_slice())
+    }
+
+    /// Record a class body's `using Base::member;` once. Every unit merging
+    /// the declaring header re-adds the header's facts, so the common case is
+    /// a hit.
+    pub fn add_class_member_import(&mut self, import: &ClassMemberImport) {
+        if !self.class_member_imports.contains(import) {
+            self.class_member_imports.push(import.clone());
+        }
     }
 
     /// Whether `cls` is a class template any of whose members substitutes a

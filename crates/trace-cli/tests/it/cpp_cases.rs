@@ -10618,16 +10618,25 @@ void ViaObject() {
         ("ViaQualified", "qr"),
         ("ViaObject", "obj"),
     ] {
-        let from = if func == "ViaObject" {
+        let base = if func == "ViaObject" {
             common::local_variable(&program, func, receiver)
         } else {
             common::only_variable(&program, receiver)
         };
+        // A named object is reached through its address; a reference's value
+        // already is the referent's address.
         let to = common::local_variable(&program, func, "self");
-        assert!(
-            value_reaches(&program, from, to),
-            "{func}: {receiver} -> self"
-        );
+        let reaches = if func == "ViaObject" {
+            flows_in(&program, func)
+                .filter_map(|flow| match *flow {
+                    trace_ir::FlowConstraint::AddrOfVar { dst, src } if src == base => Some(dst),
+                    _ => None,
+                })
+                .any(|from| value_reaches(&program, from, to))
+        } else {
+            value_reaches(&program, base, to)
+        };
+        assert!(reaches, "{func}: {receiver} -> self");
     }
 }
 
@@ -10867,6 +10876,324 @@ fn shared_from_this_without_standard_bodies_flows_through_lock() {
         value_reaches(&program, this, strong),
         "this -> weak -> strong"
     );
+}
+
+/// The class a pointer-typed local points to.
+fn pointee_name(program: &Program, var: trace_ir::VarId) -> String {
+    match program
+        .types
+        .get(program.symbols.variable(var).type_id)
+        .desc
+        .as_ref()
+    {
+        trace_ir::TypeDesc::Ptr(inner) => match inner.as_ref() {
+            trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
+            other => panic!("not a class pointee: {other:?}"),
+        },
+        other => panic!("not a pointer type: {other:?}"),
+    }
+}
+
+/// A class body's `using` resolves in the scope its declaration is written
+/// in, not in the caller's: a global caller must not make `n::D`'s
+/// `using A::f;` name the global `A`.
+#[test]
+fn shared_from_this_import_resolves_in_its_declaration_scope() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Bad(); };
+void S::Bad() {}
+struct R { void Bad(); };
+void R::Bad() {}
+struct A { R *f(); };
+namespace n {
+struct A { S *f(); };
+struct D : A { using A::f; };
+}
+void Run(n::D *p) {
+    auto x = p->f();
+    x->Bad();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "S", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "n::A::f"));
+    assert!(has_any_edge(&program, &analysis, "Run", "S::Bad"));
+    assert!(
+        must_not_have_edge(&program, &analysis, "Run", "R::Bad"),
+        "the global A's f must not answer for n::D's import"
+    );
+}
+
+/// A class body's `using B::f;` is a declaration in the derived class, so it
+/// selects the function before an inherited field of the same name hides it.
+#[test]
+fn member_import_selects_a_function_past_an_inherited_field() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"struct R { void Good(); };
+void R::Good() {}
+struct A { int f; };
+struct B { R *f(); };
+struct D : A, B { using B::f; };
+void Run(D *p) { auto x = p->f(); x->Good(); }
+"#,
+    )]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "R", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "B::f"));
+    assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
+}
+
+/// Class-body import facts survive shared-header lowering: the header's unit
+/// and each including translation unit must see the same `using`.
+#[test]
+fn shared_from_this_import_survives_shared_header_lowering() {
+    let (program, analysis) = common::analyze_source(&[
+        (
+            "api.h",
+            r#"namespace std {
+template <class T> class shared_ptr { public: T *operator->() const; };
+template <class T> class weak_ptr { public: shared_ptr<T> lock(); };
+template <class T> class enable_shared_from_this {
+public:
+    shared_ptr<T> shared_from_this();
+    weak_ptr<T> weak_from_this() noexcept;
+};
+}
+struct S { void Bad(); };
+struct A { std::shared_ptr<S> shared_from_this(); };
+struct D : std::enable_shared_from_this<D>, A {
+    using A::shared_from_this;
+    void Run();
+};
+"#,
+        ),
+        (
+            "api.cpp",
+            "#include \"api.h\"\nvoid S::Bad() {}\nvoid D::Run() { auto x = shared_from_this(); x->Bad(); }\n",
+        ),
+        (
+            "other.cpp",
+            "#include \"api.h\"\nvoid Other(D *d) { d->Run(); }\n",
+        ),
+    ]);
+    let x = common::local_variable(&program, "D::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<S>", "D::Run::x");
+    assert!(has_any_edge(&program, &analysis, "D::Run", "S::Bad"));
+    assert!(must_not_have_edge(&program, &analysis, "D::Run", "D::Bad"));
+}
+
+/// The base an explicit qualifier instantiates decides the held class, even
+/// when the receiver's ancestry reaches another holder first.
+#[test]
+fn from_this_qualified_base_instantiation_selects_the_held_class() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct A : std::enable_shared_from_this<A> { void Good(); };
+struct B : std::enable_shared_from_this<B> { void Good(); };
+struct D : A, B {
+    void Run() {
+        auto x = std::enable_shared_from_this<B>::weak_from_this().lock();
+        x->Good();
+    }
+};
+void A::Good() {}
+void B::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "D::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<B>", "D::Run::x");
+    assert!(has_any_edge(&program, &analysis, "D::Run", "B::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "D::Run", "A::Good"));
+}
+
+/// A `using` that positively selects the standard member is authoritative: an
+/// unselected inherited declaration of the same name does not cancel it.
+#[test]
+fn standard_member_import_overrides_another_inherited_member() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct A { std::shared_ptr<S> shared_from_this(); };
+struct D : A, std::enable_shared_from_this<D> {
+    using std::enable_shared_from_this<D>::shared_from_this;
+    void Run() { auto self = shared_from_this(); }
+};
+"#
+    );
+    let (program, _) = common::analyze_source(&[("main.cpp", &source)]);
+    let self_var = common::local_variable(&program, "D::Run", "self");
+    assert_eq!(
+        type_name(&program, self_var),
+        "std::shared_ptr<D>",
+        "D::Run::self"
+    );
+    assert!(
+        value_reaches(
+            &program,
+            common::local_variable(&program, "D::Run", "this"),
+            self_var
+        ),
+        "the selected standard member still aliases `this`"
+    );
+}
+
+/// A function-local alias of an instantiation names its template's class, for
+/// the base itself and for a holder template.
+#[test]
+fn local_alias_instantiations_resolve_to_their_template() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> {
+    void Good();
+    void Run() { using E = std::enable_shared_from_this<M>; auto self = E::shared_from_this(); self->Good(); }
+};
+void M::Good() {}
+template <class T> struct H : std::enable_shared_from_this<T> {};
+struct N : H<N> {
+    void Good();
+    void Run() { using E = H<N>; auto self = E::shared_from_this(); self->Good(); }
+};
+void N::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for (func, wrapper, callee) in [
+        ("M::Run", "std::shared_ptr<M>", "M::Good"),
+        ("N::Run", "std::shared_ptr<N>", "N::Good"),
+    ] {
+        let self_var = common::local_variable(&program, func, "self");
+        assert_eq!(type_name(&program, self_var), wrapper, "{func}::self");
+        assert!(has_any_edge(&program, &analysis, func, callee), "{func}");
+    }
+}
+
+/// A named object and a non-reference object member carry their address, so
+/// the result aliases the object's storage and the member's.
+#[test]
+fn from_this_named_objects_and_member_objects_carry_their_address() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> { void Handle(); };
+void M::Handle() {}
+struct Holder { M m; };
+void ViaObject() {
+    M obj;
+    auto self = obj.shared_from_this();
+    self->Handle();
+}
+void ViaMember(Holder *h) {
+    auto member = h->m.shared_from_this();
+    member->Handle();
+}
+"#
+    );
+    let dir = common::scratch(&[("main.cpp", &source)]);
+    let program = build_program(dir.path(), &common::default_opts(dir.path())).expect("build");
+    let opts = trace_analysis::AnalyzeOptions {
+        retain_points_to: true,
+        ..Default::default()
+    };
+    let (pag, analysis) = trace_analysis::analyze_with_options(&program, opts);
+    let obj = common::local_variable(&program, "ViaObject", "obj");
+    let self_var = common::local_variable(&program, "ViaObject", "self");
+    let address: Vec<_> = flows_in(&program, "ViaObject")
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::AddrOfVar { dst, src } if src == obj => Some(dst),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(address.len(), 1, "ViaObject takes obj's address once");
+    assert!(
+        value_reaches(&program, address[0], self_var),
+        "the address of obj reaches self"
+    );
+    // The address is not only copied syntactically: the result holds the
+    // object's location in its points-to set.
+    let self_node = *pag.var_node.get(&self_var).expect("self's PAG node");
+    assert!(
+        analysis
+            .points_to
+            .get(&self_node)
+            .is_some_and(|locs| !locs.is_empty()),
+        "self points to obj's location"
+    );
+    let h = common::local_variable(&program, "ViaMember", "h");
+    let member = common::local_variable(&program, "ViaMember", "member");
+    assert!(
+        flows_in(&program, "ViaMember").any(|flow| matches!(
+            flow,
+            trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "m"
+        )),
+        "the object member's address is taken"
+    );
+    assert!(
+        value_reaches(&program, h, member),
+        "the member's address reaches the result"
+    );
+    let member_node = *pag.var_node.get(&member).expect("member's PAG node");
+    assert!(
+        analysis
+            .points_to
+            .get(&member_node)
+            .is_some_and(|locs| !locs.is_empty()),
+        "the member's result points to the field's location"
+    );
+    assert_eq!(type_name(&program, member), "std::shared_ptr<M>");
+    assert!(has_any_edge(&program, &analysis, "ViaMember", "M::Handle"));
+}
+
+/// A class's imports union with its own declarations, and a nearer own
+/// declaration hides the imports an ancestor makes.
+#[test]
+fn member_imports_union_and_nearer_declarations_hide_them() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        r#"struct R { void Good(); };
+void R::Good() {}
+struct S { void Other(); };
+void S::Other() {}
+struct A { S *f(); };
+struct D : A { using A::f; R *f(int); };
+void OwnOverload(D *p) { auto x = p->f(1); x->Good(); }
+struct A2 { R *f(int); };
+struct B2 { S *f(); };
+struct D2 : A2, B2 { using A2::f; using B2::f; };
+void Union(D2 *p) {
+    auto with_arg = p->f(1);
+    with_arg->Good();
+    auto without_arg = p->f();
+    without_arg->Other();
+}
+struct A3 { S *f(); };
+struct B3 : A3 { using A3::f; };
+struct D3 : B3 { R *f(); };
+void Nearer(D3 *p) { auto x = p->f(); x->Good(); }
+"#,
+    )]);
+    let own = common::local_variable(&program, "OwnOverload", "x");
+    assert_eq!(pointee_name(&program, own), "R", "OwnOverload::x");
+    assert!(has_any_edge(&program, &analysis, "OwnOverload", "D::f"));
+    assert!(has_any_edge(&program, &analysis, "OwnOverload", "R::Good"));
+    let with_arg = common::local_variable(&program, "Union", "with_arg");
+    assert_eq!(pointee_name(&program, with_arg), "R", "Union::with_arg");
+    let without_arg = common::local_variable(&program, "Union", "without_arg");
+    assert_eq!(
+        pointee_name(&program, without_arg),
+        "S",
+        "Union::without_arg"
+    );
+    assert!(has_any_edge(&program, &analysis, "Union", "R::Good"));
+    assert!(has_any_edge(&program, &analysis, "Union", "S::Other"));
+    let nearer = common::local_variable(&program, "Nearer", "x");
+    assert_eq!(pointee_name(&program, nearer), "R", "Nearer::x");
+    assert!(has_any_edge(&program, &analysis, "Nearer", "D3::f"));
+    assert!(has_any_edge(&program, &analysis, "Nearer", "R::Good"));
 }
 
 /// The source of the one receiver copy into `result` in `func`.

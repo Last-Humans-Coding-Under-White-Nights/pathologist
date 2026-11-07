@@ -53,6 +53,9 @@ pub struct UnitIndex {
     pub template_bases: Vec<TemplateBase>,
     /// Per-unit declared `operator->` returns (C++), merged in every mode.
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
+    /// Per-unit class-body `using Base::member;` declarations (C++), merged in
+    /// every mode so a header's imports reach the source units including it.
+    pub class_member_imports: Vec<trace_ir::ClassMemberImport>,
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<trace_ir::TemplateReturn>>>,
     /// Per-unit class template parameters and dependent bases (C++).
     pub class_templates: BTreeMap<String, trace_ir::ClassTemplate>,
@@ -99,6 +102,7 @@ impl UnitIndex {
         self.inheritance.shrink_to_fit();
         self.template_bases.shrink_to_fit();
         self.arrow_returns.shrink_to_fit();
+        self.class_member_imports.shrink_to_fit();
         self.final_classes.shrink_to_fit();
         self.cfgs.shrink_to_fit();
         self.merge_descs.shrink_to_fit();
@@ -455,6 +459,9 @@ fn merge_unit(
         if !program.arrow_returns.contains(fact) {
             program.arrow_returns.push(fact.clone());
         }
+    }
+    for import in &unit.class_member_imports {
+        program.add_class_member_import(import);
     }
     for (class, methods) in &unit.template_returns {
         for (name, facts) in methods {
