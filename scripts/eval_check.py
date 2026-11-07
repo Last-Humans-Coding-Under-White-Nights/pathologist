@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression checker for the trace pipeline on the production eval corpora.
 
-Re-analyzes each corpus (HDF, hiview, camera) fresh with the release binary,
+Re-analyzes each pinned corpus fresh with the release binary,
 after verifying the checkout is clean and at the revision pinned in
 eval_expected.json (corpus base: --corpus-base, $TRACE_CORPUS_BASE, or ~),
 then asserts:
@@ -113,7 +113,8 @@ def analyze(trace_bin, corpus, expected, root, outdir, env):
     db = Path(outdir) / f"eval_check_{corpus}.db"
     log("info", f"analyzing {expected['name']} -> {db}")
     proc = run(
-        [trace_bin, "analyze", str(root), "-o", str(db), "--jobs", str(expected.get("jobs", 8))],
+        [trace_bin, "analyze", str(root), "-o", str(db), "--jobs", str(expected.get("jobs", 8)),
+         *expected.get("analyze_args", [])],
         root, env)
     if proc.returncode != 0 or not db.exists():
         global SETUP_ERRORS
@@ -241,7 +242,7 @@ def main():
     ap.add_argument("--allow-dirty", action="store_true",
                     help="warn instead of fail when a checkout has local changes or untracked files")
     ap.add_argument("corpora", nargs="*",
-                    help="subset of {hdf,hiview,camera}; default all")
+                    help="subset of corpora in the expectations file; default all")
     args = ap.parse_args()
 
     trace_bin = Path(os.path.expanduser(args.bin)).resolve()

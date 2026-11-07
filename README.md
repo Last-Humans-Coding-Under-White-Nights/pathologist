@@ -133,6 +133,13 @@ trace analyze [OPTIONS] <TARGET>
 | `--solve-budget-pops <N>` | Solver work budget in worklist pops. Default derives from the PAG constraint count (`800000 + 6×constraints`), so normal trees converge and huge ones finish instead of stopping at a partial result; `0` = unlimited. `TRACE_SOLVE_BUDGET_POPS` overrides it for experimentation. A truncated run is recorded, not silent: `analysis_run.options_json.solver_partial`, an `analyze`-stage diagnostic, and a `trace inspect` warning. |
 | `--solve-budget-secs <N>` | Solver wall-clock budget in seconds (default: off; `0` = no time limit). Checked periodically, so lead time can overshoot by up to one checkpoint, and the stop point varies with machine load. |
 
+OpenHarmony IPC bridging recognizes proxy operations that send through
+`SendTransactCmd` helpers as well as direct `SendRequest` calls, including
+separately indexed proxy/stub repositories combined with `trace-merge`.
+Re-index older proxy-side databases to export the newly recognized senders.
+See the [IPC matching rules](docs/ANALYSIS.md#openharmony-ipc-bridges) and
+[ability-runtime verification](docs/EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
+
 Epoll event-data flow is modeled by default: registrations through `epoll_ctl`
 feed buffers returned by `epoll_wait`, `epoll_pwait` and `epoll_pwait2`, so
 indirect dispatch and upward value tracing can cross the registration/wait

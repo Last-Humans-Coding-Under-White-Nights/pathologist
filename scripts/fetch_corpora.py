@@ -16,7 +16,7 @@ Uses only git and the stdlib.
 
 Usage:
     python3 scripts/fetch_corpora.py [--base DIR] [--expected scripts/eval_expected.json]
-        [--update] [hdf hiview camera]
+        [--update] [corpus ...]
 """
 
 import argparse
@@ -86,7 +86,7 @@ def main():
     ap.add_argument("--expected", default="scripts/eval_expected.json")
     ap.add_argument("--update", action="store_true",
                     help="move an existing checkout to the pinned revision")
-    ap.add_argument("corpora", nargs="*", help="subset of {hdf,hiview,camera}; default all")
+    ap.add_argument("corpora", nargs="*", help="subset of corpora in the expectations file; default all")
     args = ap.parse_args()
 
     with open(args.expected) as fh:

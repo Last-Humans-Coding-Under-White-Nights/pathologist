@@ -3,6 +3,9 @@
 This document records the original design. Current detection rules, IDL support
 and configurable summaries for absent framework sources (including DataShare
 `OpenFile`) are specified in [OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges).
+Verification of `SendTransactCmd` wrappers, including the shared scheduler
+transport call at `ability_scheduler_proxy.cpp:1222`, is recorded in the
+[evaluation report](EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
 
 ## Problem statement
 
@@ -384,9 +387,9 @@ so a constructor-only `*Stub` class does not enable interface fallback.
 
 **Proxy detection** — a C++ class is a proxy if its qualified class name
 ends in `Proxy` or `Client`. Its methods count as IPC sends if their body
-calls a function whose final callable name segment is exactly `SendRequest`;
-qualified, `remote->SendRequest`, `remote.SendRequest`, and unqualified
-spellings all match without admitting `SendRequest*` family names.
+calls a recognized IPC send function; see
+[OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges) for the
+authoritative send-name and spelling rules.
 
 **Matching** — proxy methods are matched to stub handlers by:
 1. **Interface name**: strip `Proxy`/`Client` suffix from proxy class →
@@ -521,7 +524,7 @@ by the same suffix rules.
 |---------|-------------------|-------|
 | Switch dispatch in stub | Not needed — stub detected by class name, handlers by class membership | Opcode resolution deferred to v2 |
 | if/else-if dispatch in stub | Not needed — same as above | Same |
-| Proxy `SendRequest` call | Proxy detected by class name + `SendRequest` presence in body | Confirms it's a proxy |
+| Proxy send call | Proxy detected by class name + a recognized send in the body | Includes transport helpers; see [current rules](ANALYSIS.md#openharmony-ipc-bridges) |
 | Enum/macro opcodes | Not resolved in v1 — edge wired by name matching | Opcode resolution in v2 via IDL |
 | Descriptor string | Optional: `GetDescriptor()` return or `DECLARE_INTERFACE_DESCRIPTOR` | Used for logging, not matching |
 | Callback interfaces | Same name-based matching in reverse direction | Proxy class ↔ stub class |
@@ -541,6 +544,7 @@ targets" below).
 | `ipc_macro_opcodes/` | Opcodes as `#define` constants (synthetic — not found in repos) | No real match |
 | `ipc_callback/` | Reverse callback: stub holds client proxy, calls back | Example 3 |
 | `ipc_stub_suffix/` | Stub handlers named with a `Stub` suffix only | Example 2 (`OnThermalLevelChangedStub`) |
+| `ipc_transact_cmd/` | Helper-based sends, isolated `this->` calls, template-keyword calls, duplicate sends, service overrides, exact-name exclusions and cross-repository reconstruction | `ability_ability_runtime` proxy helpers |
 | `ipc_idl_generated/` | IDL-generated stub/proxy (simulated output) | Example 6 |
 | `ipc_arg_flow/` | Parameter marshalling: WriteInt32/ReadInt32 positional matching | Example 1 proxy |
 | `ipc_nested/` | Nested IPC: proxy calls stub which calls another proxy | — |
@@ -552,7 +556,8 @@ targets" below).
   the IPC boundary is not wired (deferred to Phase 3).
 - Name-based matching can produce false positives when a proxy/stub class
   name pattern collides with unrelated classes (e.g. a `*Proxy*` class that
-  is not an IPC proxy). The `SendRequest` call presence check mitigates this.
+  is not an IPC proxy). The recognized-send presence check mitigates this;
+  see [current rules](ANALYSIS.md#openharmony-ipc-bridges).
 - `HandleX` prefix-stripping fallback is heuristic — a `FooProxy::Bar`
   method may not map to `FooStub::HandleBar` if the stub uses a different
   naming convention.
