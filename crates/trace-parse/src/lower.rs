@@ -315,6 +315,9 @@ struct LowerContext {
 struct ClassCtx {
     /// Fully qualified class name (`ns::Cls`) — matches function/type names.
     qual_name: String,
+    /// The body being lowered is a `const` member: its implicit object is
+    /// const, so a non-const overload cannot be selected for it.
+    is_const: bool,
 }
 
 impl LowerContext {
@@ -2315,6 +2318,7 @@ fn finalize_extern_callees(program: &mut Program) {
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
+            is_const_member: false,
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -2421,6 +2425,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
+            is_const_member: false,
             is_static_member: false,
             default_args: 0,
             reference_params: Vec::new(),
@@ -5772,6 +5777,7 @@ fn lower_class_definitions(
     // finds a member the class defines further down, overloads included (#96).
     let saved = ctx.class_ctx.replace(ClassCtx {
         qual_name: cls_qual.to_string(),
+        is_const: false,
     });
     // A static data member's own VarId was already registered by the
     // field-layout pass (`register_static_data_member`); an in-class
@@ -6339,6 +6345,52 @@ fn is_member_function_template(node: Node) -> bool {
     false
 }
 
+/// Whether a function declaration or definition spells `const` among its
+/// trailing qualifiers (`R f() const;`), so the implicit object argument a
+/// non-const receiver supplies matches it worse than a non-const overload.
+fn function_is_const_qualified(source: &str, node: Node) -> bool {
+    // A conversion operator's `const` hangs off its `operator_cast`
+    // declarator, not a `function_declarator`.
+    let is_const = |qualifier: Node| {
+        qualifier.cached_kind() == "type_qualifier"
+            && node_text(source, &qualifier)
+                .split_whitespace()
+                .any(|word| word == "const")
+    };
+    let declarator =
+        find_function_declarator(node).or_else(|| find_declarator_of_kind(node, "operator_cast"));
+    declarator.is_some_and(|declarator| {
+        declarator
+            .children(&mut declarator.walk())
+            .any(is_const)
+            // A conversion operator's qualifier sits on its abstract
+            // declarator (`operator int() const`).
+            || declarator
+                .children(&mut declarator.walk())
+                .filter(|child| child.cached_kind() == "abstract_function_declarator")
+                .any(|abstract_declarator| {
+                    abstract_declarator
+                        .children(&mut abstract_declarator.walk())
+                        .any(is_const)
+                })
+    })
+}
+
+/// The first node of `kind` below `node`, declaration declarators only.
+fn find_declarator_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    if node.cached_kind() == kind {
+        return Some(node);
+    }
+    if matches!(
+        node.cached_kind(),
+        "compound_statement" | "translation_unit"
+    ) {
+        return None;
+    }
+    node.children(&mut node.walk())
+        .find_map(|child| find_declarator_of_kind(child, kind))
+}
+
 fn register_member_prototype(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -6424,6 +6476,7 @@ fn register_member_prototype(
             defaulted_in_class: false,
             declared_in_class: true,
             is_member_template: is_member_function_template(node),
+            is_const_member: function_is_const_qualified(source, node),
             is_static_member: declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
@@ -6753,6 +6806,7 @@ fn lower_function_signature(
                 }),
             declared_in_class: ctx.class_ctx.is_some(),
             is_member_template: ctx.class_ctx.is_some() && is_member_function_template(node),
+            is_const_member: eff_class.is_some() && function_is_const_qualified(source, node),
             is_static_member: ctx.class_ctx.is_some() && declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
@@ -6857,13 +6911,15 @@ fn lower_function_body(
     // Out-of-class definitions still resolve implicit `this->` members.
     let saved_class = ctx.class_ctx.clone();
     if let Some(cls) = &eff_class {
+        let is_const = function_is_const_qualified(source, node);
         let needs_set = match &ctx.class_ctx {
-            Some(c) => c.qual_name != *cls,
+            Some(c) => c.qual_name != *cls || c.is_const != is_const,
             None => true,
         };
         if needs_set {
             ctx.class_ctx = Some(ClassCtx {
                 qual_name: cls.clone(),
+                is_const,
             });
         }
     }
@@ -8525,16 +8581,24 @@ fn from_this_result(
         // A qualifier names a class in the receiver's class scope first (a
         // base's injected name, an alias a base declares), then in the
         // call's: `p->B::shared_from_this()` is the `B` the receiver sees.
-        let (class, instance) =
+        let (class, instance, scope) =
             match qualifier_in_class_scope(program, &receiver_class, raw_qualifier) {
                 // An injected class name is the current specialization:
-                // `p->H::` on an `H<M> *p` is `H<M>`.
+                // `p->H::` on an `H<M> *p` is `H<M>`, and on a concrete
+                // receiver (`M : H<M>`) the base fact supplies it.
                 Some((class, None)) => {
                     let instance =
-                        instantiation_reaching(program, ctx, receiver_instance.as_deref(), &class);
-                    (class, instance)
+                        instantiation_reaching(program, ctx, receiver_instance.as_deref(), &class)
+                            .map(|instance| (instance, None))
+                            .or_else(|| {
+                                concrete_base_instantiation(program, &receiver_class, &class)
+                            });
+                    match instance {
+                        Some((instance, scope)) => (class, Some(instance), scope),
+                        None => (class, None, None),
+                    }
                 }
-                Some(found) => found,
+                Some((class, instance)) => (class, instance, None),
                 None => {
                     // An alias of an instantiation keeps the arguments the
                     // written qualifier omits (`using E = enable_shared_from_this<M>;`).
@@ -8542,13 +8606,13 @@ fn from_this_result(
                         .contains('<')
                         .then(|| raw_qualifier.to_owned())
                         .or_else(|| aliased_instantiation(program, ctx, &qualifier));
-                    (class_seen_from(program, ctx, &qualifier)?, instance)
+                    (class_seen_from(program, ctx, &qualifier)?, instance, None)
                 }
             };
         FromThisStart {
             class,
             instance,
-            scope: None,
+            scope,
         }
     };
     // The member lookup selects decides which base binds the held class:
@@ -8556,11 +8620,17 @@ fn from_this_result(
     let start = if names_base {
         start
     } else {
+        // A member body's implicit object is const when the member is; no
+        // non-const overload can then be selected for it.
+        let object_is_const = matches!(receiver, FromThisReceiver::This)
+            && ctx.class_ctx.as_ref().is_some_and(|c| c.is_const);
         let mut memo = HashMap::default();
-        match from_this_selection(program, ctx, &start, method, 0, &mut memo) {
+        match from_this_selection(program, ctx, &start, method, object_is_const, &mut memo) {
             FromThisSelection::Standard => start,
             FromThisSelection::Imported(imported) => imported,
-            FromThisSelection::Hidden | FromThisSelection::NotViable => return None,
+            FromThisSelection::Hidden
+            | FromThisSelection::NotViable
+            | FromThisSelection::Template => return None,
         }
     };
     // An explicit base qualifier names the base itself, namespace included
@@ -8615,6 +8685,11 @@ enum FromThisSelection {
     /// The standard member, selected through a class body's
     /// `using Base::member;`: lookup of the held class starts at `Base`.
     Imported(FromThisStart),
+    /// The name resolves only to member function templates the zero-argument
+    /// call can take. A non-template selected at the same level (an imported
+    /// standard member) wins, and when nothing else is selected the call is
+    /// an ordinary one, not the intrinsic.
+    Template,
     /// Something else: a function the zero-argument call selects that hides
     /// the standard member (`shared_ptr<Derived> shared_from_this()` casting
     /// the base's result), or a callable data member of that name.
@@ -8630,19 +8705,21 @@ enum FromThisSelection {
 /// would among the declarations a zero-argument call can take: an own
 /// non-template there hides the standard member unless it is the base's own
 /// (or on a class the base derives from, an internal base a library may
-/// declare the members on); an import is followed into the class it names,
-/// re-exports included, and an import that selects the standard member binds
-/// the held class from the base it names, its arguments substituted from the
-/// start's instantiation where they name the importing template's
-/// parameters; an own member template loses to an imported non-template.
-/// `memo` holds each start already decided, so a hierarchy re-exporting the
-/// name on every path is walked once per class.
+/// declare the members on), or it is `const` and a non-const standard
+/// overload matches the receiver's non-const implicit object better; an
+/// import is followed into the class it names, re-exports included, and an
+/// import that selects the standard member binds the held class from the
+/// base it names, its arguments substituted from the start's instantiation
+/// where they name the importing template's parameters; an own member
+/// template loses to an imported non-template. `memo` holds each start
+/// already decided, so a hierarchy re-exporting the name on every path is
+/// walked once per class, and only cycles stop the walk.
 fn from_this_selection(
     program: &Program,
     ctx: &LowerContext,
     start: &FromThisStart,
     method: &str,
-    depth: usize,
+    object_is_const: bool,
     memo: &mut HashMap<(String, Option<String>), FromThisSelection>,
 ) -> FromThisSelection {
     use FromThisSelection::*;
@@ -8652,12 +8729,10 @@ fn from_this_selection(
     }
     // A start reached again while it is decided adds nothing.
     memo.insert(key.clone(), NotViable);
-    let selection = if depth > MAX_IMPORT_DEPTH
-        || member_is_hidden_by_field(program, ctx, &start.class, method)
-    {
+    let selection = if member_is_hidden_by_field(program, ctx, &start.class, method) {
         Hidden
     } else {
-        select_from_this_level(program, ctx, start, method, depth, memo)
+        select_from_this_level(program, ctx, start, method, object_is_const, memo)
     };
     memo.insert(key, selection.clone());
     selection
@@ -8669,7 +8744,7 @@ fn select_from_this_level(
     ctx: &LowerContext,
     start: &FromThisStart,
     method: &str,
-    depth: usize,
+    object_is_const: bool,
     memo: &mut HashMap<(String, Option<String>), FromThisSelection>,
 ) -> FromThisSelection {
     use FromThisSelection::*;
@@ -8691,16 +8766,28 @@ fn select_from_this_level(
             .filter(|&id| takes_no_arguments(program, id))
             .collect();
         let member_template = |id: FnId| program.symbols.function(id).is_member_template;
-        if viable
+        let hiding: Vec<FnId> = viable
             .iter()
-            .any(|&id| !standard(id) && !member_template(id))
-        {
+            .copied()
+            .filter(|&id| !standard(id) && !member_template(id))
+            .collect();
+        // An own `const` overload matches a non-const receiver's implicit
+        // object worse than the inherited non-const standard member, so it
+        // only hides the standard member when no import selects that one.
+        let deferred = !object_is_const
+            && !hiding.is_empty()
+            && hiding
+                .iter()
+                .all(|&id| program.symbols.function(id).is_const_member)
+            && standard_member_has_nonconst(program, &start.class, method);
+        if !hiding.is_empty() && !deferred {
             return Hidden;
         }
         if viable.iter().any(|&id| standard(id)) {
             return Standard;
         }
         let mut selected = None;
+        let mut template_selected = false;
         let mut not_viable = false;
         for import in imports {
             let Some(target) = imported_start(program, ctx, start, cur, import) else {
@@ -8714,7 +8801,7 @@ fn select_from_this_level(
                     None => Standard,
                 }
             } else {
-                match from_this_selection(program, ctx, &target, method, depth + 1, memo) {
+                match from_this_selection(program, ctx, &target, method, object_is_const, memo) {
                     Standard => Imported(target),
                     other => other,
                 }
@@ -8722,6 +8809,7 @@ fn select_from_this_level(
             match found {
                 Hidden => return Hidden,
                 NotViable => not_viable = true,
+                Template => template_selected = true,
                 found => {
                     selected.get_or_insert(found);
                 }
@@ -8732,8 +8820,13 @@ fn select_from_this_level(
         if let Some(found) = selected {
             return found;
         }
-        if !viable.is_empty() {
+        if !hiding.is_empty() {
+            // Deferred for a non-const standard member, which no import
+            // selected after all.
             return Hidden;
+        }
+        if template_selected || viable.iter().any(|&id| member_template(id)) {
+            return Template;
         }
         if !own.is_empty() || not_viable {
             return NotViable;
@@ -8741,6 +8834,26 @@ fn select_from_this_level(
         // Imports naming no indexed class: look past them.
     }
     Standard
+}
+
+/// Whether the `enable_shared_from_this` base `cls` reaches declares a
+/// non-const `method` a zero-argument call can take.
+fn standard_member_has_nonconst(program: &Program, cls: &str, method: &str) -> bool {
+    let Some((_, base)) = from_this_base(program, cls) else {
+        return false;
+    };
+    let kind = trace_ir::MethodKind::Named(method.to_owned());
+    program.ancestor_closure(&base).into_iter().any(|(cur, _)| {
+        program
+            .symbols
+            .functions_named(&kind.name_on(cur))
+            .into_iter()
+            .any(|id| {
+                !program.symbols.function(id).is_const_member
+                    && takes_no_arguments(program, id)
+                    && is_standard_from_this_declaration(program, &base, id)
+            })
+    })
 }
 
 /// Where member lookup continues for `import`, written in class `level` of
@@ -8785,7 +8898,12 @@ fn imported_start(
         level,
     ));
     let instance = substituted.and_then(|(t, level_instance)| {
-        let arguments = template_arguments(&level_instance);
+        // Fixed names keep the scope the `using` is written in; the
+        // arguments the receiver supplies are named where `start`'s are.
+        let instance =
+            import_instance_in_declaration_scope(program, &import.class, &instance, &t.parameters);
+        let arguments =
+            crate::template_bases::bound_arguments(t, template_arguments(&level_instance));
         crate::template_bases::substitute_parameters(&instance, &t.parameters, t.pack, &arguments)
     });
     Some(FromThisStart {
@@ -8793,6 +8911,60 @@ fn imported_start(
         scope: instance.as_ref().and(start.scope.clone()),
         instance,
     })
+}
+
+/// The template arguments of an import's instance with the names that do not
+/// mention the importing template's parameters qualified where the `using` is
+/// written. Those names keep their meaning in an unrelated caller's scope
+/// (`using n::H<T, A>::f;` in `n` names `n::A`), while the parameters are
+/// left for the receiver's arguments.
+fn import_instance_in_declaration_scope(
+    program: &Program,
+    scope: &str,
+    instance: &str,
+    parameters: &[Option<String>],
+) -> String {
+    let Some(open) = instance.find('<') else {
+        return instance.to_owned();
+    };
+    let args = template_arguments(instance)
+        .into_iter()
+        .map(|arg| qualify_fixed_import_argument(program, scope, &arg, parameters))
+        .collect::<Vec<_>>();
+    if args.is_empty() {
+        return instance.to_owned();
+    }
+    format!(
+        "{}<{}>{}",
+        &instance[..open],
+        args.join(", "),
+        template_tail(instance)
+    )
+}
+
+/// One template argument of an import: a fixed name is qualified in the
+/// import's declaration scope, unless it mentions a parameter or is not a
+/// simple class spelling.
+fn qualify_fixed_import_argument(
+    program: &Program,
+    scope: &str,
+    arg: &str,
+    parameters: &[Option<String>],
+) -> String {
+    if crate::template_bases::mentions_parameters(arg, parameters) {
+        return arg.to_owned();
+    }
+    let trimmed = arg.trim();
+    // A qualified or nested class spelling resolves as a whole; cv-qualified
+    // ones are left for the held-class lookup to strip.
+    let (base, suffix) = split_pointer_suffix(trimmed);
+    if !suffix.is_empty() || base.contains(' ') || base.contains(['*', '&']) {
+        return arg.to_owned();
+    }
+    match held_class_in_declaration_scope(program, scope, base) {
+        Some(name) => format!("{name}{suffix}"),
+        None => arg.to_owned(),
+    }
 }
 
 /// The instantiation of class `class` that `instance` is or reaches through
@@ -8816,6 +8988,31 @@ fn instantiation_reaching(
     )
     .into_iter()
     .find(|base| receiver_lookup_name(base) == class)
+}
+
+/// The concrete base fact of `receiver` that names `class` with arguments
+/// (`H<M>` for `M : H<M>`), and the scope those arguments are named in. A
+/// receiver spelled without an instantiation (`M *p`) still determines its
+/// template base's arguments.
+fn concrete_base_instantiation(
+    program: &Program,
+    receiver: &str,
+    class: &str,
+) -> Option<(String, Option<String>)> {
+    program
+        .ancestor_closure(receiver)
+        .into_iter()
+        .find_map(|(cur, _)| {
+            program
+                .template_bases_of(cur)
+                .into_iter()
+                .find(|fact| {
+                    !fact.is_dependent
+                        && fact.spelling.contains('<')
+                        && receiver_lookup_name(&fact.spelling) == class
+                })
+                .map(|fact| (fact.spelling.clone(), Some(fact.declaration_scope.clone())))
+        })
 }
 
 /// Whether function `id` can be called with no arguments.
@@ -8844,20 +9041,13 @@ fn from_this_base(program: &Program, cls: &str) -> Option<(String, String)> {
         })
 }
 
-/// How far a member import is followed into the class it names
-/// (`using Mid::f;` where `Mid` itself writes `using A::f;`).
-const MAX_IMPORT_DEPTH: usize = 8;
-
 /// The imports of `name` the body of class `cls` writes.
 fn class_imports<'p>(
     program: &'p Program,
     cls: &'p str,
     name: &'p str,
 ) -> impl Iterator<Item = &'p trace_ir::ClassMemberImport> {
-    program
-        .class_member_imports
-        .iter()
-        .filter(move |i| i.member == name && i.class == cls)
+    program.class_member_imports_of(cls, name)
 }
 
 /// The declarations member lookup of `name` from `cls` finds: the nearest
@@ -8866,11 +9056,7 @@ fn class_imports<'p>(
 /// imports included). A nearer declaration hides the imports of the classes
 /// above it; a level with none passes to its bases.
 fn class_member_declarations(program: &Program, cls: &str, name: &str) -> Vec<FnId> {
-    if !program
-        .class_member_imports
-        .iter()
-        .any(|i| i.member == name)
-    {
+    if program.class_member_imports_named(name).next().is_none() {
         return declared_members_upward(
             program,
             cls,
@@ -8977,7 +9163,11 @@ fn qualifier_in_class_scope(
             return Some((class, spelled_instantiation(program, &candidate, name)));
         }
         if !bare.contains("::") && last_type_segment(&receiver_lookup_name(cur)) == bare {
-            return Some((cur.to_owned(), name.contains('<').then(|| name.to_owned())));
+            // An injected name spells no scope; the resolved class supplies
+            // it, so substitution finds the template from any caller
+            // (`p->H<M>::` on an `n::H<M> *p` is `n::H<M>`).
+            let instance = name.find('<').map(|open| format!("{cur}{}", &name[open..]));
+            return Some((cur.to_owned(), instance));
         }
     }
     None
@@ -12114,6 +12304,7 @@ fn lower_function_decl(
         defaulted_in_class: false,
         declared_in_class: false,
         is_member_template: false,
+        is_const_member: false,
         is_static_member: false,
         is_virtual: false,
         is_final: false,
@@ -16162,6 +16353,7 @@ fn lower_member_initializer_expression(
     }
     let saved_class = ctx.class_ctx.replace(ClassCtx {
         qual_name: class.to_owned(),
+        is_const: false,
     });
     let saved_ns = std::mem::replace(&mut ctx.ns_stack, initializer.namespaces.clone());
     let saved_using = std::mem::replace(&mut ctx.using_nss, initializer.using_namespaces.clone());
@@ -16726,6 +16918,7 @@ fn lower_lambda_expression(
         defaulted_in_class: false,
         declared_in_class: false,
         is_member_template: false,
+        is_const_member: false,
         is_static_member: false,
         is_virtual: false,
         is_final: false,
@@ -16916,8 +17109,17 @@ fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKi
         kind.is_destructor() || own.iter().any(|t| program.symbols.function(*t).is_virtual);
     if virtual_dispatch {
         // Expand from the *static* type so `final` classes/methods cut off
-        // sibling and descendant overrides.
-        program.method_targets(cls, kind)
+        // sibling and descendant overrides. The dispatched set names the same
+        // method without class imports, so the imported candidates the call
+        // can still select are unioned back in; their arities are ranked with
+        // the rest by the caller.
+        let mut targets = program.method_targets(cls, kind);
+        for id in own {
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+        targets
     } else {
         own
     }

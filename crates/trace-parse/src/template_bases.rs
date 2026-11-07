@@ -426,6 +426,28 @@ fn walk_dependent_bases(
     }
 }
 
+/// The arguments `template` binds from `written`, with omitted arguments
+/// taking their defaults. The defaults were qualified in the template's own
+/// scope when recorded.
+pub(crate) fn bound_arguments(template: &ClassTemplate, written: Vec<String>) -> Vec<String> {
+    let mut arguments = written;
+    for default in template.defaults.iter().skip(arguments.len()) {
+        match default {
+            Some(default) => arguments.push(default.clone()),
+            None => break,
+        }
+    }
+    arguments
+}
+
+/// Whether `spelling` mentions one of `parameters` as a whole identifier.
+pub(crate) fn mentions_parameters(spelling: &str, parameters: &[Option<String>]) -> bool {
+    parameters
+        .iter()
+        .flatten()
+        .any(|parameter| mentions_word(spelling, parameter))
+}
+
 /// Whether `base`'s class is itself a parameter (`I`, or `B` in `B<T>`).
 fn names_parameter(base: &str, parameters: &[Option<String>]) -> bool {
     let head = normalize_qualified(base);
@@ -485,13 +507,7 @@ fn innermost_arguments(spelling: &str) -> Vec<String> {
 /// argument in one list, for [`substitute_parameters`] to expand; one that is
 /// a base itself (`Is...`) binds each in turn, one list per element.
 fn argument_lists(template: &ClassTemplate, base: &str, written: Vec<String>) -> Vec<Vec<String>> {
-    let mut arguments = written;
-    for default in template.defaults.iter().skip(arguments.len()) {
-        match default {
-            Some(default) => arguments.push(default.clone()),
-            None => break,
-        }
-    }
+    let arguments = bound_arguments(template, written);
     let in_place = |pack: usize| {
         !names_parameter(base, &template.parameters)
             && template.parameters[pack].as_deref().is_some_and(|name| {

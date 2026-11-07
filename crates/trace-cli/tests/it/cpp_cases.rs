@@ -11547,6 +11547,231 @@ fn member_imports_on_every_inheritance_path_stay_linear() {
     assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
 }
 
+/// A base qualifier written as an injected class template name recovers the
+/// receiver's concrete base specialization (`p->H::...` on `M : H<M>`).
+#[test]
+fn shared_from_this_injected_qualifier_recovers_the_concrete_base() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"template <class T> struct H : std::enable_shared_from_this<T> {};
+struct M : H<M> { void Good(); };
+void M::Good() {}
+struct N : H<N> { void Good(); };
+void N::Good() {}
+void Run(M *p) { auto x = p->H::shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "M::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "N::Good"));
+}
+
+/// An injected class template qualifier keeps the namespace its class is
+/// declared in, so substitution finds it from the caller's scope.
+#[test]
+fn shared_from_this_injected_qualifier_keeps_its_namespace() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"namespace n {
+template <class T> struct H : std::enable_shared_from_this<T> {};
+}
+struct M { void Good(); };
+void M::Good() {}
+void Run(n::H<M> *p) { auto x = p->H<M>::shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "M::Good"));
+}
+
+/// A dependent import substitutes its caller-bound arguments, while the names
+/// written where the `using` is stay in its declaration scope.
+#[test]
+fn shared_from_this_dependent_import_keeps_its_declaration_scope() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct A { void Good(); };
+void A::Good() {}
+namespace n {
+struct A { void Good(); };
+void A::Good() {}
+template <class T, class V> struct H : std::enable_shared_from_this<V> {};
+template <class T> struct J : H<T, A> {
+    using n::H<T, A>::shared_from_this;
+};
+}
+struct M;
+void Run(n::J<M> *p) { auto x = p->shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<n::A>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "n::A::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "A::Good"));
+}
+
+/// An import substitutes through the omitted arguments' defaults, not only
+/// the ones the receiver spells.
+#[test]
+fn shared_from_this_import_substitutes_template_defaults() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct N { void Good(); };
+void N::Good() {}
+struct M { void Good(); };
+void M::Good() {}
+template <class T = N, class U = M>
+struct H : std::enable_shared_from_this<T>, std::enable_shared_from_this<U> {
+    using std::enable_shared_from_this<U>::shared_from_this;
+};
+void Run(H<> *p) { auto x = p->shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "M::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "N::Good"));
+}
+
+/// An imported member template loses the zero-argument call to the imported
+/// standard non-template.
+#[test]
+fn imported_member_template_loses_to_the_standard_member() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct A {
+    template <class U = void> std::shared_ptr<S> shared_from_this();
+};
+struct M : A, std::enable_shared_from_this<M> {
+    using A::shared_from_this;
+    using std::enable_shared_from_this<M>::shared_from_this;
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let this = common::local_variable(&program, "M::Run", "this");
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(
+        value_reaches(&program, this, x),
+        "the standard member's result aliases this"
+    );
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+}
+
+/// In a non-const member, the inherited non-const standard member wins over
+/// an own `const` overload, which the implicit object argument matches worse.
+#[test]
+fn non_const_standard_member_beats_an_own_const_overload() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<S> shared_from_this() const;
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let this = common::local_variable(&program, "M::Run", "this");
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(
+        value_reaches(&program, this, x),
+        "the selected standard member aliases this"
+    );
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "M::Run", "S::Good"));
+}
+
+/// A long re-export chain is followed to its end: only cycles stop lookup,
+/// not the number of classes it crosses.
+#[test]
+fn member_import_chain_longer_than_the_old_depth_guard_still_flows() {
+    let mut source = String::from(FROM_THIS_STUB);
+    source.push_str("struct M;\nstruct L0 : std::enable_shared_from_this<M> {};\n");
+    for level in 1..12 {
+        source.push_str(&format!(
+            "struct L{level} : L{} {{ using L{}::shared_from_this; }};\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    source.push_str(
+        "struct M : L11 {\n\
+         using L11::shared_from_this;\n\
+         void Good();\n\
+         void Run() { auto x = shared_from_this(); x->Good(); }\n\
+         };\n\
+         void M::Good() {}\n",
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let this = common::local_variable(&program, "M::Run", "this");
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(value_reaches(&program, this, x), "this reaches x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+}
+
+/// A virtual overload of another arity does not discard the imported target
+/// the call actually selects.
+#[test]
+fn member_import_targets_survive_a_virtual_overload() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    virtual std::shared_ptr<Other> shared_from_this(int);
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() {}
+struct R { void Good(); };
+void R::Good() {}
+struct A { R *f(); };
+struct D : A {
+    using A::f;
+    virtual std::shared_ptr<Other> f(int);
+};
+void Use(D *p) { auto x = p->f(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "M::Run",
+        "std::enable_shared_from_this::shared_from_this"
+    ));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "M::Run",
+        "M::shared_from_this"
+    ));
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+    let x = common::local_variable(&program, "Use", "x");
+    assert_eq!(pointee_name(&program, x), "R", "Use::x");
+    assert!(has_any_edge(&program, &analysis, "Use", "A::f"));
+    assert!(must_not_have_edge(&program, &analysis, "Use", "D::f"));
+    assert!(has_any_edge(&program, &analysis, "Use", "R::Good"));
+}
+
 /// The source of the one receiver copy into `result` in `func`.
 fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
     let result = common::local_variable(program, func, result);

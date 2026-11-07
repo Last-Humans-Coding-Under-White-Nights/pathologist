@@ -210,6 +210,11 @@ pub struct Function {
     /// apart. An out-of-class definition does not spell `static`, so it
     /// learns this from its in-class prototype when the two merge.
     pub is_static_member: bool,
+    /// Declared `const` in its class body. The implicit object argument of a
+    /// non-const receiver matches a non-const member better, so overload
+    /// resolution prefers the inherited non-const one over an own `const`
+    /// overload of the same name and arity.
+    pub is_const_member: bool,
     /// How many of those parameters declare a default argument, so a call
     /// may pass `explicit_arity - default_args` up to `explicit_arity`
     /// arguments. C++ puts the defaults on the first declaration, so a merge
@@ -589,6 +594,7 @@ fn absorb_redeclaration(
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
     existing.is_static_member |= func.is_static_member;
+    existing.is_const_member |= func.is_const_member;
     existing.is_member_template |= func.is_member_template;
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
@@ -1767,6 +1773,18 @@ impl SymbolTable {
                         if !ours.iter().any(|f| theirs.contains(f)) {
                             return false;
                         }
+                    }
+                    // `R f()` and `R f() const` are two overloads, not one
+                    // function redeclared: the implicit object argument tells
+                    // them apart at a call. Only a member declaration (or a
+                    // definition written as one) states the qualifier: a
+                    // definition recovered from a macro can lose it and must
+                    // still reach the declaration it belongs to.
+                    if existing.is_const_member != func.is_const_member
+                        && existing.declared_in_class
+                        && (func.declared_in_class || func.is_const_member)
+                    {
+                        return false;
                     }
                 }
                 if !func.is_cpp && !existing.is_cpp {
@@ -3971,6 +3989,7 @@ mod tests {
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
+            is_const_member: false,
             is_static_member: false,
             is_virtual: false,
             is_final: false,
