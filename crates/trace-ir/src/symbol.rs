@@ -199,6 +199,11 @@ pub struct Function {
     /// the only record that a parameterless entry is a member rather than a
     /// namespace function of the same qualified name.
     pub declared_in_class: bool,
+    /// Declared in its class body as a member function template
+    /// (`template <class U> R f();`). Overload resolution prefers a
+    /// non-template that is as good a match, so an inherited non-template a
+    /// class body imports can win over it.
+    pub is_member_template: bool,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
@@ -584,6 +589,7 @@ fn absorb_redeclaration(
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
     existing.is_static_member |= func.is_static_member;
+    existing.is_member_template |= func.is_member_template;
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
     existing.is_final |= func.is_final;
@@ -3964,6 +3970,7 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
             is_static_member: false,
             is_virtual: false,
             is_final: false,

@@ -10470,7 +10470,8 @@ void Use(D *p) { auto through = p->f(); through->G(); }
 fn shared_from_this_qualifier_aliases_keep_the_instantiation() {
     let source = format!(
         "{FROM_THIS_STUB}{}",
-        r#"using E = std::enable_shared_from_this<AM>;
+        r#"struct AM;
+using E = std::enable_shared_from_this<AM>;
 struct AM : E {
     void Handle();
     void ViaBaseAlias() {
@@ -11288,6 +11289,20 @@ void NonViable::Good() {}
         "NonViable::Run",
         "NonViable::Good"
     ));
+    // The call site records the member the call selects, not the own
+    // one-argument overload.
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "NonViable::Run",
+        "std::enable_shared_from_this::shared_from_this"
+    ));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "NonViable::Run",
+        "NonViable::shared_from_this"
+    ));
 }
 
 /// A class name an import or an explicit member qualifier writes is looked up
@@ -11397,6 +11412,139 @@ void ConstHeld::Good() const {}
         "ConstHeld::Run",
         "ConstHeld::Good"
     ));
+}
+
+/// The import selection binds dependent arguments from the receiver, names
+/// written arguments where the `using` is, lets a nonviable import or an own
+/// member template lose to the standard member, and an injected template
+/// qualifier or an explicit base qualifier keeps the specialization and the
+/// base's namespace.
+#[test]
+fn shared_from_this_import_arguments_overloads_and_qualified_bases() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct T { void Good(); };
+void T::Good() {}
+struct M { void Good(); };
+void M::Good() {}
+template <class T> struct H : std::enable_shared_from_this<T> {
+    using std::enable_shared_from_this<T>::shared_from_this;
+};
+void RunDependent(H<M> *p) { auto x = p->shared_from_this(); x->Good(); }
+struct Scoped : std::enable_shared_from_this<Scoped> { void Good(); };
+void Scoped::Good() {}
+namespace n {
+struct Scoped : std::enable_shared_from_this<Scoped> { void Good(); };
+void Scoped::Good() {}
+struct D : Scoped { using std::enable_shared_from_this<Scoped>::shared_from_this; };
+}
+void RunScoped(n::D *p) { auto x = p->shared_from_this(); x->Good(); }
+template <class U> struct HI : std::enable_shared_from_this<U> {};
+struct MI { void Good(); };
+void MI::Good() {}
+struct NI : HI<NI> { void Good(); };
+void NI::Good() {}
+void RunInjected(HI<MI> *p) { auto x = p->HI::shared_from_this(); x->Good(); }
+struct AV { std::shared_ptr<S> shared_from_this(int); };
+struct MV : AV, std::enable_shared_from_this<MV> {
+    using AV::shared_from_this;
+    using std::enable_shared_from_this<MV>::shared_from_this;
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void MV::Good() {}
+struct MT : std::enable_shared_from_this<MT> {
+    using std::enable_shared_from_this<MT>::shared_from_this;
+    template <class V = void> std::shared_ptr<S> shared_from_this();
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void MT::Good() {}
+namespace other {
+template <class W> class shared_ptr { public: W *operator->() const; };
+template <class W> class enable_shared_from_this { public: shared_ptr<W> shared_from_this(); };
+}
+struct AQ { void Good(); };
+void AQ::Good() {}
+struct BQ { void Good(); };
+void BQ::Good() {}
+struct DQ : BQ, other::enable_shared_from_this<AQ>, std::enable_shared_from_this<BQ> {
+    void Run() { auto x = std::enable_shared_from_this<BQ>::shared_from_this(); x->Good(); }
+};
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for (caller, held, good, wrong) in [
+        ("RunDependent", "std::shared_ptr<M>", "M::Good", "T::Good"),
+        (
+            "RunScoped",
+            "std::shared_ptr<n::Scoped>",
+            "n::Scoped::Good",
+            "Scoped::Good",
+        ),
+        ("RunInjected", "std::shared_ptr<MI>", "MI::Good", "NI::Good"),
+        ("DQ::Run", "std::shared_ptr<BQ>", "BQ::Good", "AQ::Good"),
+    ] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(type_name(&program, x), held, "{caller}");
+        assert!(
+            has_any_edge(&program, &analysis, caller, good),
+            "{caller} -> {good}"
+        );
+        assert!(
+            must_not_have_edge(&program, &analysis, caller, wrong),
+            "{caller} -/-> {wrong}"
+        );
+    }
+    for (class, held) in [("MV", "std::shared_ptr<MV>"), ("MT", "std::shared_ptr<MT>")] {
+        let caller = format!("{class}::Run");
+        let this = common::local_variable(&program, &caller, "this");
+        let x = common::local_variable(&program, &caller, "x");
+        assert!(value_reaches(&program, this, x), "{caller}: this reaches x");
+        assert_eq!(type_name(&program, x), held, "{caller}");
+        assert!(
+            has_any_edge(&program, &analysis, &caller, &format!("{class}::Good")),
+            "{caller}"
+        );
+    }
+}
+
+/// Re-exporting a name on every path of a wide virtual hierarchy is looked up
+/// once per class, not once per path.
+#[test]
+fn member_imports_on_every_inheritance_path_stay_linear() {
+    const WIDTH: usize = 8;
+    const LEVELS: usize = 7;
+    let mut source =
+        String::from("struct R { void Good(); };\nvoid R::Good() {}\nstruct L0_0 { R *f(); };\n");
+    let mut previous = vec!["L0_0".to_owned()];
+    for level in 1..=LEVELS {
+        let mut current = Vec::new();
+        for index in 0..WIDTH {
+            let name = format!("L{level}_{index}");
+            let bases: Vec<_> = previous
+                .iter()
+                .map(|b| format!("virtual public {b}"))
+                .collect();
+            let imports: String = previous.iter().map(|b| format!(" using {b}::f;")).collect();
+            source.push_str(&format!(
+                "struct {name} : {} {{{imports} }};\n",
+                bases.join(", ")
+            ));
+            current.push(name);
+        }
+        previous = current;
+    }
+    source.push_str(&format!(
+        "void Run({} *p) {{ auto x = p->f(); x->Good(); }}\n",
+        previous[0]
+    ));
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "R");
+    assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
 }
 
 /// The source of the one receiver copy into `result` in `func`.

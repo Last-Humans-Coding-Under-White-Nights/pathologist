@@ -109,6 +109,7 @@ pub fn link_graph_facts_in_targets(
             variadic: f.variadic,
             defaulted_in_class: false,
             declared_in_class: true,
+            is_member_template: false,
             is_static_member: f.static_member,
             default_args: 0,
             reference_params: vec![],
