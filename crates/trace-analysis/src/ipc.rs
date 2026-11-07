@@ -884,6 +884,8 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
+            is_const_member: false,
             is_static_member: false,
             is_virtual: true,
             is_final: false,

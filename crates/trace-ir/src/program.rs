@@ -520,6 +520,21 @@ pub struct ArrowReturn {
     pub pointer: bool,
 }
 
+/// One `using Base::member;` written in a class body. The target is resolved
+/// from the class body's own scope (`class`), never from a caller's, so a
+/// header's import keeps its meaning in every unit that includes it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClassMemberImport {
+    /// The class whose body declares the import, spelled as lowering names it
+    /// (`ns::D`). Its enclosing scopes are the import's declaration scope.
+    pub class: String,
+    /// The imported name, `member`.
+    pub member: String,
+    /// The spelling after `using`, `Base::member`, template arguments kept
+    /// (`enable_shared_from_this<B>::shared_from_this` binds `B`).
+    pub target: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkTarget {
     pub id: crate::TargetId,
@@ -616,6 +631,18 @@ pub struct Program {
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
+    /// Class-body `using` declarations (docs/ANALYSIS.md, "`shared_from_this`"),
+    /// merged with a unit's symbols so a header's imports outlive header-unit
+    /// lowering and reach every source unit that includes it.
+    pub class_member_imports: Vec<ClassMemberImport>,
+    /// `class_member_imports` by member, so a member call that no `using`
+    /// names reads this map instead of scanning every import in the program.
+    class_member_imports_by_member: FxHashMap<String, Vec<usize>>,
+    /// `class_member_imports` by declaring class, then member. Positional
+    /// indices keep the facts themselves in one place.
+    class_member_imports_by_class: FxHashMap<String, FxHashMap<String, Vec<usize>>>,
+    /// The facts already recorded, so `add_class_member_import` stays O(1).
+    class_member_import_set: rustc_hash::FxHashSet<ClassMemberImport>,
     /// Class -> full member name -> return substitutions. Ordered keys keep
     /// header merges deterministic; lookups never scan unrelated functions.
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<TemplateReturn>>>,
@@ -946,6 +973,54 @@ impl Program {
     /// The substitution facts recorded for `member` of class `cls`.
     pub fn template_returns_of(&self, cls: &str, member: &str) -> Option<&[TemplateReturn]> {
         Some(self.template_returns.get(cls)?.get(member)?.as_slice())
+    }
+
+    /// Record a class body's `using Base::member;` once. Every unit merging
+    /// the declaring header re-adds the header's facts, so the common case is
+    /// a hit.
+    pub fn add_class_member_import(&mut self, import: &ClassMemberImport) {
+        if !self.class_member_import_set.insert(import.clone()) {
+            return;
+        }
+        let index = self.class_member_imports.len();
+        self.class_member_imports.push(import.clone());
+        self.class_member_imports_by_member
+            .entry(import.member.clone())
+            .or_default()
+            .push(index);
+        self.class_member_imports_by_class
+            .entry(import.class.clone())
+            .or_default()
+            .entry(import.member.clone())
+            .or_default()
+            .push(index);
+    }
+
+    /// The class-body imports of `name`, whichever class writes them. Empty
+    /// for the common case, which lets member lookup skip the import walk.
+    pub fn class_member_imports_named(
+        &self,
+        name: &str,
+    ) -> impl Iterator<Item = &ClassMemberImport> {
+        self.class_member_imports_by_member
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(move |&index| &self.class_member_imports[index])
+    }
+
+    /// The imports of `name` the body of `class` writes.
+    pub fn class_member_imports_of<'a>(
+        &'a self,
+        class: &str,
+        name: &str,
+    ) -> impl Iterator<Item = &'a ClassMemberImport> + 'a {
+        self.class_member_imports_by_class
+            .get(class)
+            .and_then(|members| members.get(name))
+            .into_iter()
+            .flatten()
+            .map(move |&index| &self.class_member_imports[index])
     }
 
     /// Whether `cls` is a class template any of whose members substitutes a
@@ -1600,6 +1675,46 @@ mod tests {
         assert_eq!(fact.parameters, class_template(&["I", "D"], &[]).parameters);
         assert_eq!(fact.defaults, [None, Some("::IDef".to_string())]);
         assert_eq!(fact.dependent_bases, ["I", "D"]);
+    }
+
+    /// A member call asks the index, not the whole import vector, and the
+    /// index stays consistent when a fact is re-added by another unit.
+    #[test]
+    fn class_member_imports_are_indexed_by_member_and_class() {
+        let mut program = Program::default();
+        let first = ClassMemberImport {
+            class: "n::A".to_string(),
+            member: "f".to_string(),
+            target: "B::f".to_string(),
+        };
+        let second = ClassMemberImport {
+            class: "n::B".to_string(),
+            member: "f".to_string(),
+            target: "C::f".to_string(),
+        };
+        let other = ClassMemberImport {
+            class: "n::A".to_string(),
+            member: "g".to_string(),
+            target: "B::g".to_string(),
+        };
+        for import in [&first, &first, &second, &other] {
+            program.add_class_member_import(import);
+        }
+        assert_eq!(program.class_member_imports.len(), 3, "one fact each");
+        assert_eq!(
+            program.class_member_imports_named("f").collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+        assert_eq!(
+            program
+                .class_member_imports_of("n::A", "f")
+                .collect::<Vec<_>>(),
+            vec![&first]
+        );
+        assert!(program
+            .class_member_imports_named("missing")
+            .next()
+            .is_none());
     }
 
     /// Two stages can report the same text at the same position — a variant's
